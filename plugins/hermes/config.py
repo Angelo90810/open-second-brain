@@ -99,6 +99,18 @@ XDG_CONFIG_HOME_ENV = "XDG_CONFIG_HOME"
 LOCALAPPDATA_ENV = "LOCALAPPDATA"
 #: Per-request deadline of the MCP bridge, read by ``bridge.py``.
 REQUEST_TIMEOUT_ENV = "OPEN_SECOND_BRAIN_MCP_TIMEOUT"
+#: Per-turn recall (``prefetch``) knobs, read by ``provider.py``.
+#: ``OPEN_SECOND_BRAIN_PREFETCH``: ``false``/``0``/``off`` disables the
+#: per-turn ``brain_context_pack`` recall (the identity reminder stays).
+PREFETCH_ENV = "OPEN_SECOND_BRAIN_PREFETCH"
+#: Token budget of the per-turn recall slice (default 1024).
+PREFETCH_MAX_TOKENS_ENV = "OPEN_SECOND_BRAIN_PREFETCH_MAX_TOKENS"
+#: Drop preferences already rendered in ``Brain/active.md`` (default on):
+#: the session already carries them, so re-injecting them every turn only
+#: spends tokens.
+PREFETCH_SKIP_ACTIVE_ENV = "OPEN_SECOND_BRAIN_PREFETCH_SKIP_ACTIVE"
+#: Drop retired beliefs from the per-turn recall (default on).
+PREFETCH_SKIP_RETIRED_ENV = "OPEN_SECOND_BRAIN_PREFETCH_SKIP_RETIRED"
 
 #: The settings that belong to a Hermes profile rather than to the process.
 #: On a multiplexed gateway these come from the bound profile scope only.
@@ -110,6 +122,10 @@ PROFILE_SCOPED_ENV: tuple[str, ...] = (
     TIMEZONE_ENV,
     CONFIG_PATH_ENV,
     REQUEST_TIMEOUT_ENV,
+    PREFETCH_ENV,
+    PREFETCH_MAX_TOKENS_ENV,
+    PREFETCH_SKIP_ACTIVE_ENV,
+    PREFETCH_SKIP_RETIRED_ENV,
 )
 
 #: The config directories, which are scope-first on a multiplexed gateway.
@@ -753,3 +769,33 @@ def build_reminder() -> str | None:
     if agent == DEFAULT_AGENT:
         return None
     return render_reminder(agent)
+
+
+_FALSE_WORDS = frozenset({"0", "false", "no", "off"})
+
+
+def env_flag(name: str, default: bool) -> bool:
+    """A boolean profile-scoped setting; unset, empty or unscoped keeps ``default``."""
+    try:
+        raw = env_setting(name)
+    except ProfileScopeError:
+        return default
+    if raw is None:
+        return default
+    return raw.strip().lower() not in _FALSE_WORDS
+
+
+def env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    """A positive integer profile-scoped setting; unparseable or unscoped keeps ``default``."""
+    try:
+        raw = env_setting(name)
+    except ProfileScopeError:
+        return default
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    return value if value >= minimum else default

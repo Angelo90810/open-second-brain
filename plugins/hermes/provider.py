@@ -16,6 +16,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 from collections.abc import Callable
@@ -820,10 +821,17 @@ class OpenSecondBrainMemoryProvider(MemoryProvider):
             gate_args["session_id"] = sid
         if turn_id:
             gate_args["turn_id"] = turn_id
-        gate = self._structured(self._safe_call("brain_recall_gate", gate_args))
+        prefetch_on = config.env_flag(config.PREFETCH_ENV, True)
+        gate = (
+            self._structured(self._safe_call("brain_recall_gate", gate_args))
+            if prefetch_on
+            else {}
+        )
         if gate.get("retrieve"):
             pack_args: dict[str, Any] = {
-                "max_tokens": _PREFETCH_MAX_TOKENS,
+                "max_tokens": config.env_int(
+                    config.PREFETCH_MAX_TOKENS_ENV, _PREFETCH_MAX_TOKENS
+                ),
                 "receipt": True,
                 "receipt_host": _PREFETCH_RECEIPT_HOST,
                 "telemetry": True,
@@ -842,7 +850,7 @@ class OpenSecondBrainMemoryProvider(MemoryProvider):
                 pack_args["turn_id"] = turn_id
             pack = self._safe_call("brain_context_pack", pack_args)
             self._log_pack_warnings(pack)
-            recalled = self._context_pack_text(pack)
+            recalled = self._context_pack_text(self._filter_pack_items(pack))
             if recalled:
                 parts.append(recalled)
                 receipt_id = self._receipt_id(pack)
@@ -1026,6 +1034,60 @@ class OpenSecondBrainMemoryProvider(MemoryProvider):
             if isinstance(first, dict) and isinstance(first.get("text"), str):
                 return first["text"]
         return ""
+
+    @staticmethod
+    def _active_md_ids(brain_dir: Path) -> frozenset[str]:
+        """Preference ids already rendered in ``<brain_dir>/active.md``.
+
+        The session carries ``active.md`` through the system prompt, so a
+        per-turn recall that re-injects the same rules only spends tokens.
+        Unreadable or absent file -> empty set (nothing is filtered).
+        """
+        try:
+            text = (brain_dir / "active.md").read_text(encoding="utf-8")
+        except OSError:
+            return frozenset()
+        return frozenset(re.findall(r"`(pref-[A-Za-z0-9._-]+)`", text))
+
+    def _filter_pack_items(self, result: Any) -> Any:
+        """Drop pack items this session already carries or no longer believes.
+
+        Controlled by ``OPEN_SECOND_BRAIN_PREFETCH_SKIP_ACTIVE`` (preferences
+        listed in ``Brain/active.md``) and ``..._SKIP_RETIRED`` (``ret-*``
+        beliefs); both default on. ``active.md`` is located from each item's
+        own page path (``<vault>/Brain/preferences/<id>.md``), so the filter
+        reads the vault the server answered from. Results without structured
+        ``items`` pass through unchanged.
+        """
+        structured = self._structured(result)
+        items = structured.get("items")
+        if not isinstance(items, list):
+            return result
+        skip_active = config.env_flag(config.PREFETCH_SKIP_ACTIVE_ENV, True)
+        skip_retired = config.env_flag(config.PREFETCH_SKIP_RETIRED_ENV, True)
+        if not (skip_active or skip_retired):
+            return result
+        active_cache: dict[Path, frozenset[str]] = {}
+        kept = []
+        for item in items:
+            if not isinstance(item, dict):
+                kept.append(item)
+                continue
+            item_id = str(item.get("id") or "")
+            if skip_retired and item_id.startswith("ret-"):
+                continue
+            page = str(item.get("path") or "")
+            if skip_active and item_id.startswith("pref-") and page:
+                brain_dir = Path(page).parent.parent
+                if brain_dir not in active_cache:
+                    active_cache[brain_dir] = self._active_md_ids(brain_dir)
+                if item_id in active_cache[brain_dir]:
+                    continue
+            kept.append(item)
+        filtered = {**structured, "items": kept}
+        if isinstance(result, dict) and isinstance(result.get("structuredContent"), dict):
+            return {**result, "structuredContent": filtered}
+        return {"structuredContent": filtered}
 
     @staticmethod
     def _context_pack_text(result: Any) -> str:

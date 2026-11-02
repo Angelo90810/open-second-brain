@@ -881,6 +881,67 @@ class ProviderLifecycleTests(unittest.TestCase):
         self.assertEqual(gate_args["turn_id"], "turn-7")
         self.assertEqual(gate_args["telemetry_host"], "hermes")
 
+    def _pack_bridge(self, items):
+        return FakeBrainBridge(
+            results={
+                "brain_recall_gate": {"structuredContent": {"retrieve": True}},
+                "brain_context_pack": {"structuredContent": {"items": items}},
+            }
+        )
+
+    def test_prefetch_skips_preferences_already_in_active_md_and_retired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "Brain"
+            (brain / "preferences").mkdir(parents=True)
+            (brain / "active.md").write_text(
+                "## Confirmed (1)\n\n- `pref-known` (scope: x) - Known rule.\n", encoding="utf-8"
+            )
+            items = [
+                {"id": "pref-known", "path": str(brain / "preferences" / "pref-known.md"), "body": "Known rule."},
+                {"id": "pref-new", "path": str(brain / "preferences" / "pref-new.md"), "body": "New rule."},
+                {"id": "ret-old", "path": str(brain / "retired" / "ret-old.md"), "body": "Old rule."},
+            ]
+            provider = self._init(self._pack_bridge(items), hermes_home="/tmp/hh")
+            out = provider.prefetch("anything")
+        self.assertIn("New rule.", out)
+        self.assertNotIn("Known rule.", out)
+        self.assertNotIn("Old rule.", out)
+
+    def test_prefetch_filters_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brain = Path(tmp) / "Brain"
+            (brain / "preferences").mkdir(parents=True)
+            (brain / "active.md").write_text("- `pref-known` - Known rule.\n", encoding="utf-8")
+            items = [
+                {"id": "pref-known", "path": str(brain / "preferences" / "pref-known.md"), "body": "Known rule."},
+                {"id": "ret-old", "path": str(brain / "retired" / "ret-old.md"), "body": "Old rule."},
+            ]
+            env = {
+                "OPEN_SECOND_BRAIN_PREFETCH_SKIP_ACTIVE": "false",
+                "OPEN_SECOND_BRAIN_PREFETCH_SKIP_RETIRED": "0",
+            }
+            with patch.dict(os.environ, env):
+                provider = self._init(self._pack_bridge(items), hermes_home="/tmp/hh")
+                out = provider.prefetch("anything")
+        self.assertIn("Known rule.", out)
+        self.assertIn("Old rule.", out)
+
+    def test_prefetch_can_be_switched_off_and_budget_configured(self):
+        bridge = self._pack_bridge([{"body": "some rule"}])
+        with patch.dict(os.environ, {"OPEN_SECOND_BRAIN_PREFETCH": "off"}):
+            provider = self._init(bridge, hermes_home="/tmp/hh")
+            out = provider.prefetch("anything")
+        self.assertNotIn("some rule", out)
+        self.assertNotIn("brain_context_pack", [name for name, _ in bridge.calls])
+        self.assertNotIn("brain_recall_gate", [name for name, _ in bridge.calls])
+
+        bridge = self._pack_bridge([{"body": "some rule"}])
+        with patch.dict(os.environ, {"OPEN_SECOND_BRAIN_PREFETCH_MAX_TOKENS": "256"}):
+            provider = self._init(bridge, hermes_home="/tmp/hh")
+            provider.prefetch("anything")
+        pack_args = next(a for n, a in bridge.calls if n == "brain_context_pack")
+        self.assertEqual(pack_args["max_tokens"], 256)
+
     def test_prefetch_keeps_the_server_receipt_as_sample_id(self):
         # The sample id an agent later posts an outcome against must be the
         # id the server wrote a receipt under, never a locally hashed

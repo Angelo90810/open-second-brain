@@ -503,10 +503,11 @@ const COVERED_TOOLS: ReadonlySet<string> = new Set(
  * queued while a transition did not, until the reach view joined its
  * owner view and its sources ran over the readable records.
  */
-const STILL_NAMED_AT_REMOTE: ReadonlySet<string> = new Set([
-  "brain_anticipatory_context",
-  "brain_context_pack",
-]);
+// Both former members (brain_anticipatory_context, brain_context_pack)
+// named reserved pages only through the `## Origin` wikilink trail of
+// dream-written preferences; the context pack now injects the principle
+// instead of that trail (renderBeliefBody), so neither names one any more.
+const STILL_NAMED_AT_REMOTE: ReadonlySet<string> = new Set([]);
 
 /**
  * How many recipes the fixture actually puts the reserved page in front

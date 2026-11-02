@@ -63,6 +63,25 @@ class RootPluginEntrypointTests(unittest.TestCase):
 
 
 class RegisterTests(unittest.TestCase):
+    def test_skips_proxy_that_answers_any_register_attribute(self):
+        # Hermes's memory-provider collector answers every `register_*` lookup
+        # through `__getattr__` and forwards it to a context without a
+        # health-check API (it logged a WARNING on every start). Only a method
+        # the context's class really defines may be called.
+        forwarded: list[str] = []
+
+        class Collector:
+            def register_memory_provider(self, provider):
+                pass
+
+            def __getattr__(self, attr):
+                if not attr.startswith("register_"):
+                    raise AttributeError(attr)
+                return lambda *a, **k: forwarded.append(attr)
+
+        register(Collector())
+        self.assertEqual(forwarded, [])
+
     def test_attaches_via_register_health_check(self):
         calls: list[tuple[str, object]] = []
 

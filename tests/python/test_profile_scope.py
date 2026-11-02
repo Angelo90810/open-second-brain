@@ -124,7 +124,7 @@ class ScopeTestCase(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
-    def test_scoped_names_are_the_five_profile_settings(self):
+    def test_scoped_names_are_the_profile_settings(self):
         self.assertEqual(
             cfg.PROFILE_SCOPED_ENV,
             (
@@ -133,6 +133,10 @@ class ContractTests(unittest.TestCase):
                 "VAULT_TIMEZONE",
                 "OPEN_SECOND_BRAIN_CONFIG",
                 "OPEN_SECOND_BRAIN_MCP_TIMEOUT",
+                "OPEN_SECOND_BRAIN_PREFETCH",
+                "OPEN_SECOND_BRAIN_PREFETCH_MAX_TOKENS",
+                "OPEN_SECOND_BRAIN_PREFETCH_SKIP_ACTIVE",
+                "OPEN_SECOND_BRAIN_PREFETCH_SKIP_RETIRED",
             ),
         )
         self.assertEqual(cfg.REQUEST_TIMEOUT_ENV, "OPEN_SECOND_BRAIN_MCP_TIMEOUT")

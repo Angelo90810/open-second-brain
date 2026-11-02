@@ -68,14 +68,19 @@ def _check_file(path: Path, *, executable: bool = False) -> dict[str, Any]:
 
 
 def _register_health_check(ctx: Any) -> None:
+    # Only call a registration method the context's class really defines.
+    # Hermes's memory-provider collector answers ANY `register_*` lookup via
+    # `__getattr__` and forwards it to a PluginContext that has no health-check
+    # API, which logged a WARNING on every gateway start.
     for method_name in ("register_health_check", "add_health_check", "register_check"):
-        method = getattr(ctx, method_name, None)
-        if callable(method):
-            try:
-                method(PLUGIN_NAME, check_health)
-            except TypeError:
-                method(check_health)
-            return
+        if not callable(getattr(type(ctx), method_name, None)):
+            continue
+        method = getattr(ctx, method_name)
+        try:
+            method(PLUGIN_NAME, check_health)
+        except TypeError:
+            method(check_health)
+        return
     health_checks = getattr(ctx, "health_checks", None)
     if isinstance(health_checks, dict):
         health_checks[PLUGIN_NAME] = check_health

@@ -135,6 +135,43 @@ export function isContextPackQueryMode(value: unknown): value is ContextPackQuer
 export { BELIEF_VECTORS_BACKFILL_COMMAND };
 
 /**
+ * Evidence-trail sections the dream pass writes into a belief page. They are
+ * wikilink lists that point at signals and artifacts; injected into a prompt
+ * they carry no rule, only tokens.
+ */
+const EVIDENCE_TRAIL_HEADINGS = new Set(["origin", "recent applications", "recent violations"]);
+
+/**
+ * The text a context pack injects for one belief page. Evidence-trail
+ * sections (`## Origin`, `## Recent applications`, `## Recent violations`)
+ * are dropped; when nothing else is left - the shape every dream-written
+ * preference has - the page's one-line `principle` is injected instead, so
+ * the agent receives the rule rather than a list of signal wikilinks. Pages
+ * without an evidence trail are returned byte-identical.
+ */
+export function renderBeliefBody(principle: string, body: string): string {
+  const kept: string[] = [];
+  let skipping = false;
+  let strippedTrail = false;
+  for (const line of body.split(/\r?\n/)) {
+    const heading = /^#{1,6}\s+(.*?)\s*$/.exec(line);
+    if (heading) skipping = EVIDENCE_TRAIL_HEADINGS.has(heading[1]!.toLowerCase());
+    if (skipping) strippedTrail = true;
+    else kept.push(line);
+  }
+  if (!strippedTrail) return body;
+  const rest = kept
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  // Dream-written pages carry nothing but the evidence trail; for those the
+  // one-line principle IS the rule, so it becomes the injected text. Pages
+  // with their own narrative keep it (minus the trail) unchanged.
+  if (rest) return rest;
+  return principle.trim();
+}
+
+/**
  * The relevance an unembedded candidate reads in `semantic` mode: below
  * any cosine, so it sorts after every scored candidate of its tier,
  * negative cosines included.
@@ -796,7 +833,7 @@ function collectCandidates(
           : null;
       const contextLane = normalizeContextLane(meta["context_lane"]);
       const epistemic = deriveEpistemicStatus(meta);
-      const guarded = guardBrainContextSnippet(body, {
+      const guarded = guardBrainContextSnippet(renderBeliefBody(principle, body), {
         source: { id, path: full, metadata: meta },
         ...(meta["context_safety"] === "trusted-instruction"
           ? { trust: "trusted-instruction" as const }
