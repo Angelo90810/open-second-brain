@@ -1,6 +1,6 @@
 # Fork pessoal (Angelo90810)
 
-Fork de [itechmeat/open-second-brain](https://github.com/itechmeat/open-second-brain) ajustado para uso no Hermes do Windows. `upstream` = itechmeat; as mudanças ficam na `main` deste fork.
+Fork de [itechmeat/open-second-brain](https://github.com/itechmeat/open-second-brain) ajustado para uso no Hermes do Windows. `upstream` = itechmeat; as mudanças ficam na `main` deste fork, junto com o upstream (merge de 25 commits em 2026-11-17, v1.98.0).
 
 ## Mudanças em relação ao upstream
 
@@ -18,6 +18,10 @@ Fork de [itechmeat/open-second-brain](https://github.com/itechmeat/open-second-b
 4. **Sem WARNING `register_health_check` no Hermes.** O coletor de provedores de memória do Hermes responde a qualquer `register_*` via `__getattr__`; o plugin agora só chama um método de health check que a classe do contexto realmente define.
 
 ## Atualizar a partir do upstream
+
+Automático: cron `o2b-upstream-sync` (diário às 9h) roda `scripts/o2b-upstream-sync.sh`, que só publica depois de `tsc` e dos testes TS/Python passarem — falhas herdadas do upstream não bloqueiam, falha nova bloqueia e desfaz.
+
+Manual:
 
 ```bash
 git fetch upstream
