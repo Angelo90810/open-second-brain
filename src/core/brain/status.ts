@@ -59,15 +59,22 @@
  *     requires; measured too expensive, not forgotten.
  */
 
+import { legacyVaultOf } from "./no-vault.ts";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { memorySource, signalPageRaw, storePagesIn } from "./memory-pages.ts";
 import { parseFrontmatter } from "../vault.ts";
-import { brainDirs } from "./paths.ts";
+import { brainDirs, snapshotsDir } from "./paths.ts";
+import type { BrainLogEntry } from "./log.ts";
+import { storeLogDays, withLogReadPass } from "./log-days.ts";
+import { withoutPrivateEntries } from "./log-events-at-reach.ts";
+import { readStoreLogEvents } from "../store/read/log-events.ts";
 import { listLogDates, readLogDay } from "./log-jsonl.ts";
 import { loadBrainConfig } from "./policy.ts";
-import { parseSignal } from "./signal.ts";
+import { parseSignal, parseStoreSignal } from "./signal.ts";
 import { BRAIN_LOG_EVENT_KIND, BRAIN_PREFERENCE_STATUS } from "./types.ts";
+import { lessonApprovalCounts, type LessonApprovalCounts } from "./lessons-promotion.ts";
 
 // ----- Public types --------------------------------------------------------
 
@@ -131,11 +138,63 @@ export interface BrainStatusSnapshot {
      */
     readonly signals_awaiting_dream: number;
   };
+  /**
+   * Lesson-promotion approval counts (t_1e952e43): the decisions
+   * currently in force plus how many approved rows went stale,
+   * carried by the snapshot the MCP status tool already returns -
+   * report-only, no new surface minted for them. Fail-soft: a
+   * damaged ledger answers zeros and names itself in `read_error`;
+   * doctor is the surface for the damage itself.
+   */
+  readonly lessons: LessonApprovalCounts & {
+    /** Present only when the approvals ledger could not be read. */
+    readonly read_error?: string;
+  };
+}
+
+/** The lessons counts block for a vault with no Brain layer. */
+const LESSONS_COUNTS_ABSENT: LessonApprovalCounts = Object.freeze({
+  approved: 0,
+  denied: 0,
+  stale: 0,
+});
+
+/**
+ * The fail-soft read_error the snapshot carries when the approvals
+ * ledger cannot be read. Deliberately a fixed, generalized sentence:
+ * the ledger reader's error messages embed the ledger's absolute path,
+ * and machine paths stay out of MCP output - doctor is the surface that
+ * names the cause and the recovery in operator-facing output.
+ */
+const LESSONS_LEDGER_READ_ERROR =
+  "lessons-approvals.json could not be read (the ledger is damaged or unusable); " +
+  "o2b doctor names the cause and the recovery";
+
+/**
+ * Read the lessons counts fail-soft: the doctor is the surface for a
+ * damaged ledger, the status snapshot answers with zeros and names
+ * itself, because an MCP consumer must not lose the whole brain block
+ * over one unreadable file.
+ */
+function lessonsCountsSafe(vault: string): LessonApprovalCounts & {
+  readonly read_error?: string;
+} {
+  try {
+    return lessonApprovalCounts(vault);
+  } catch {
+    return { ...LESSONS_COUNTS_ABSENT, read_error: LESSONS_LEDGER_READ_ERROR };
+  }
 }
 
 export interface ComputeBrainStatusOptions {
   /** Wall clock for staleness math. Defaults to `new Date()`. */
   readonly now?: Date;
+  /**
+   * The caller is below local reach: the log days, the last dream and
+   * apply-evidence times and the maintenance debt are computed as if the
+   * events of the store's `private` partition did not exist. Default false.
+   */
+  readonly withholdsPrivate?: boolean;
 }
 
 // ----- Public API ----------------------------------------------------------
@@ -144,10 +203,24 @@ export function computeBrainStatus(
   vault: string,
   opts: ComputeBrainStatusOptions = {},
 ): BrainStatusSnapshot {
+  // One read pass: the counts, the log timestamps and the maintenance debt
+  // each walk the log, and a store-only machine reads its log once.
+  return withLogReadPass(() => computeBrainStatusInPass(vault, opts));
+}
+
+function computeBrainStatusInPass(
+  vault: string,
+  opts: ComputeBrainStatusOptions,
+): BrainStatusSnapshot {
   const dirs = brainDirs(vault);
-  if (!existsSync(dirs.brain)) {
+  // A store-only machine keeps its memory records in the store (task
+  // 2.10): the brain is present when the store is, with or without the
+  // legacy tree.
+  const source = memorySource(vault);
+  if (source === "none" || (source === "legacy" && !existsSync(dirs.brain))) {
     return Object.freeze({
       present: false,
+      lessons: LESSONS_COUNTS_ABSENT,
       counts: {
         inbox: 0,
         inbox_processed: 0,
@@ -165,14 +238,20 @@ export function computeBrainStatus(
     });
   }
 
-  const counts = countArtifacts(vault);
-  const { lastDreamAt, lastApplyEvidenceAt } = scanLogTimestamps(vault);
-  const signalsAwaitingDream = countSignalsAwaitingDream(vault, opts.now ?? new Date());
-  const maintenanceDebt = computeMaintenanceDebt(vault, lastDreamAt);
+  const withholds = opts.withholdsPrivate === true;
+  const counts = source === "store" ? countStoreArtifacts(vault, withholds) : countArtifacts(vault);
+  const { lastDreamAt, lastApplyEvidenceAt } = scanLogTimestamps(vault, withholds);
+  const signalsAwaitingDream = countSignalsAwaitingDream(
+    vault,
+    opts.now ?? new Date(),
+    source === "store",
+  );
+  const maintenanceDebt = computeMaintenanceDebt(vault, lastDreamAt, withholds);
 
   return Object.freeze({
     present: true,
     counts,
+    lessons: lessonsCountsSafe(vault),
     last_dream_at: lastDreamAt,
     last_apply_evidence_at: lastApplyEvidenceAt,
     maintenance_debt: maintenanceDebt,
@@ -205,13 +284,18 @@ export function computeBrainStatus(
  * `maintenance_debt.log_events_since_dream` from `computeBrainStatus`
  * instead (`second_brain_status` / `osb://status`).
  */
-export function computeMaintenanceOverdueFlag(vault: string): boolean | null {
-  const dates = listLogDates(vault);
-  const newest = dates.at(-1);
+export function computeMaintenanceOverdueFlag(
+  vault: string | null,
+  opts: { readonly withholdsPrivate?: boolean } = {},
+): boolean | null {
+  const withholds = opts.withholdsPrivate === true;
+  const log = recentStatusLog(vault, withholds) ?? statusLog(vault, withholds);
+  if (log === null) return null;
+  const newest = log.dates.at(-1);
   if (newest === undefined) return null;
   let day;
   try {
-    day = readLogDay(vault, newest);
+    day = log.day(newest);
   } catch {
     // Same tolerance as `scanLogTimestamps`: an unreadable day is
     // reported as unknown, not silently folded into a boolean answer.
@@ -237,7 +321,7 @@ function countArtifacts(vault: string): BrainStatusCounts {
   const retired = countMd(dirs.retired);
   // Shard-aware: count distinct DAYS, not files (several shards share a day).
   const log_days = listLogDates(vault).length;
-  const snapshots = countZst(dirs.snapshots);
+  const snapshots = countZst(snapshotsDir(vault));
 
   // Per-status preference counts: read frontmatter line `status:` only
   // — no full parse — to keep this cheap. Unknown values bucket under
@@ -269,6 +353,114 @@ function countArtifacts(vault: string): BrainStatusCounts {
     log_days,
     snapshots,
   };
+}
+
+/**
+ * {@link countArtifacts} on a store-only machine: the fold's records
+ * counted by the folder their page sat in, the preferences bucketed by
+ * their status. The log days and the snapshots are not memory records
+ * and are counted where they are.
+ */
+function countStoreArtifacts(vault: string, withholdsPrivate: boolean): BrainStatusCounts {
+  const dirs = brainDirs(vault);
+  const inFolder = (dir: string): number => storePagesIn(vault, dir).length;
+  const preferences_by_status: Record<string, number> = {};
+  let preferences = 0;
+  for (const page of storePagesIn(vault, dirs.preferences)) {
+    if (!page.id.startsWith("pref-")) continue;
+    preferences++;
+    const value = page.meta["_status"];
+    const status = typeof value === "string" && value.trim() !== "" ? value.trim() : "unknown";
+    preferences_by_status[status] = (preferences_by_status[status] ?? 0) + 1;
+  }
+  for (const s of Object.values(BRAIN_PREFERENCE_STATUS)) {
+    preferences_by_status[s] = preferences_by_status[s] ?? 0;
+  }
+  return {
+    inbox: inFolder(dirs.inbox),
+    inbox_processed: inFolder(dirs.processed),
+    inbox_archived: inFolder(dirs.archived),
+    preferences,
+    preferences_by_status: Object.freeze(preferences_by_status),
+    retired: inFolder(dirs.retired),
+    log_days: statusLog(vault, withholdsPrivate)?.dates.length ?? 0,
+    // The snapshot module's folder: the device-local state once switched.
+    snapshots: countZst(snapshotsDir(vault)),
+  };
+}
+
+/** The log as the status readers walk it: dates, and one day's events with its warnings. */
+interface StatusLog {
+  readonly dates: ReadonlyArray<string>;
+  day(date: string): {
+    readonly entries: ReadonlyArray<BrainLogEntry>;
+    readonly warnings: ReadonlyArray<unknown>;
+  };
+}
+
+/** Days of the store log the overdue flag looks at before it reads the whole log. */
+const RECENT_LOG_DAYS = 31;
+
+/**
+ * The last {@link RECENT_LOG_DAYS} days of a store-only machine's log, or
+ * `null` when the machine reads day files or the window holds no event
+ * (the caller then reads the whole log), so the always-loaded overdue
+ * flag reads a bounded window, not the store's whole history. The window
+ * runs one day past today's UTC date: an entry is filed by the date its
+ * own timestamp spells, and one a device whose clock runs ahead wrote can
+ * already name tomorrow; the whole-log read has no upper bound either.
+ */
+function recentStatusLog(vault: string | null, withholdsPrivate: boolean): StatusLog | null {
+  const now = new Date();
+  const from = new Date(now.getTime() - RECENT_LOG_DAYS * 86_400_000);
+  const to = new Date(now.getTime() + 86_400_000);
+  const stored = readStoreLogEvents(
+    { from: from.toISOString().slice(0, 10), to: to.toISOString().slice(0, 10) },
+    { vault },
+  );
+  if (stored === null) return null;
+  // Below local reach a private event is not there, and a day it alone
+  // filled is not a log day.
+  const shown = withoutPrivateEntries(
+    stored.map((s) => s.entry),
+    withholdsPrivate,
+  );
+  if (shown.length === 0) return null;
+  const byDate = new Map<string, BrainLogEntry[]>();
+  for (const entry of shown) {
+    const date = entry.timestamp.slice(0, 10);
+    const day = byDate.get(date);
+    if (day === undefined) byDate.set(date, [entry]);
+    else day.push(entry);
+  }
+  return {
+    dates: [...byDate.keys()].toSorted(),
+    day: (date) => ({ entries: byDate.get(date) ?? [], warnings: [] }),
+  };
+}
+
+/**
+ * The log of `vault`: the day files on an unswitched machine (`null` when
+ * `Brain/log/` is absent), the store's `log-event` records on a store-only
+ * one (task 2.10), where a day carries no read warning.
+ */
+function statusLog(vault: string | null, withholdsPrivate = false): StatusLog | null {
+  const stored = storeLogDays(vault);
+  if (stored !== null) {
+    // Below local reach a private event is not there, and a day it alone
+    // filled is not a log day. Day files carry no mark.
+    const days = stored
+      .map((d) => ({ date: d.date, entries: withoutPrivateEntries(d.entries, withholdsPrivate) }))
+      .filter((d) => d.entries.length > 0 || !withholdsPrivate);
+    const byDate = new Map(days.map((d) => [d.date, d.entries] as const));
+    return {
+      dates: days.map((d) => d.date),
+      day: (date) => ({ entries: byDate.get(date) ?? [], warnings: [] }),
+    };
+  }
+  const root = legacyVaultOf(vault, "statusLog");
+  if (!existsSync(brainDirs(root).log)) return null;
+  return { dates: listLogDates(root), day: (date) => readLogDay(root, date) };
 }
 
 function countMd(dir: string): number {
@@ -305,13 +497,16 @@ function readFrontmatterStatus(path: string): string {
   }
 }
 
-function scanLogTimestamps(vault: string): {
+function scanLogTimestamps(
+  vault: string,
+  withholdsPrivate: boolean,
+): {
   lastDreamAt: string | null;
   lastApplyEvidenceAt: string | null;
 } {
-  const dirs = brainDirs(vault);
-  if (!existsSync(dirs.log)) return { lastDreamAt: null, lastApplyEvidenceAt: null };
-  const days = listLogDates(vault).toReversed(); // newest day first
+  const log = statusLog(vault, withholdsPrivate);
+  if (log === null) return { lastDreamAt: null, lastApplyEvidenceAt: null };
+  const days = log.dates.toReversed(); // newest day first
 
   let lastDreamAt: string | null = null;
   let lastApplyEvidenceAt: string | null = null;
@@ -320,7 +515,7 @@ function scanLogTimestamps(vault: string): {
     // both are set we can stop scanning older files.
     let entries;
     try {
-      entries = readLogDay(vault, date).entries;
+      entries = log.day(date).entries;
     } catch {
       continue;
     }
@@ -357,13 +552,17 @@ function scanLogTimestamps(vault: string): {
  * dream's own day, so the scan is bounded to "since the last dream",
  * not the whole log history, on every vault that HAS dreamed.
  */
-function computeMaintenanceDebt(vault: string, lastDreamAt: string | null): MaintenanceDebt {
-  const dirs = brainDirs(vault);
-  if (!existsSync(dirs.log)) return NEVER_DREAMED_DEBT;
+function computeMaintenanceDebt(
+  vault: string,
+  lastDreamAt: string | null,
+  withholdsPrivate: boolean,
+): MaintenanceDebt {
+  const log = statusLog(vault, withholdsPrivate);
+  if (log === null) return NEVER_DREAMED_DEBT;
 
   const cutoffMs = lastDreamAt !== null ? Date.parse(lastDreamAt) : null;
   const cutoffDate = lastDreamAt !== null ? lastDreamAt.slice(0, 10) : null;
-  const days = listLogDates(vault).toReversed(); // newest day first
+  const days = log.dates.toReversed(); // newest day first
 
   let count = 0;
   let complete = true;
@@ -373,7 +572,7 @@ function computeMaintenanceDebt(vault: string, lastDreamAt: string | null): Main
     if (cutoffDate !== null && date < cutoffDate) break;
     let entries;
     try {
-      const day = readLogDay(vault, date);
+      const day = log.day(date);
       entries = day.entries;
       // A shard that would not open, or a line that would not parse:
       // either way events this window contains are absent from `count`,
@@ -406,9 +605,9 @@ function computeMaintenanceDebt(vault: string, lastDreamAt: string | null): Main
   });
 }
 
-function countSignalsAwaitingDream(vault: string, now: Date): number {
+function countSignalsAwaitingDream(vault: string, now: Date, fromStore: boolean): number {
   const dirs = brainDirs(vault);
-  if (!existsSync(dirs.inbox)) return 0;
+  if (!fromStore && !existsSync(dirs.inbox)) return 0;
   let windowDays: number;
   try {
     windowDays = loadBrainConfig(vault).dream.unconfirmed_window_days;
@@ -417,6 +616,21 @@ function countSignalsAwaitingDream(vault: string, now: Date): number {
   }
   const cutoffMs = now.getTime() - windowDays * 24 * 3600 * 1000;
   let stale = 0;
+  if (fromStore) {
+    for (const page of storePagesIn(vault, dirs.inbox)) {
+      if (!page.id.startsWith("sig-")) continue;
+      let createdAtMs: number;
+      try {
+        createdAtMs = Date.parse(
+          parseStoreSignal(page.path, page.meta, signalPageRaw(page)).created_at,
+        );
+      } catch {
+        continue;
+      }
+      if (Number.isFinite(createdAtMs) && createdAtMs < cutoffMs) stale++;
+    }
+    return stale;
+  }
   for (const name of readdirSync(dirs.inbox)) {
     if (!name.endsWith(".md")) continue;
     if (!name.startsWith("sig-")) continue;

@@ -55,17 +55,17 @@ import {
   resolveRecallInjectEnabled,
   resolveRegroundPartChars,
   resolveRegroundPartsEnabled,
-  resolveVault,
 } from "../src/core/config.ts";
 import { healCliSymlinks } from "../src/cli/install-cli.ts";
 import { ensureVaultCurrent } from "../src/core/maintenance/ensure-current.ts";
 import { hookAuditDir } from "../src/core/brain/paths.ts";
 import { loadInjectContextFailOpen } from "../src/core/brain/inject-failopen.ts";
-import { armProcessCeiling, resolveHookCeilingMs } from "./lib/process-ceiling.ts";
+import { armProcessCeiling, decisionWaitMs, resolveHookCeilingMs } from "./lib/process-ceiling.ts";
 import { appendAuditRecord } from "../src/core/reliability/audit.ts";
 import { asHookPayload, readHookInput, type HookPayloadBase } from "./lib/stdin.ts";
 import { beginInjectionEpoch, digestNotePaths, isRealSessionId } from "./lib/injection-ledger.ts";
 import { LANE_BUDGETED, renderStandingBlock, type InjectionMeter } from "./lib/standing-block.ts";
+import { buildAgentContextBlocks } from "./lib/agent-context-blocks.ts";
 import {
   assembleActiveContext,
   BLOCK_SEPARATOR,
@@ -77,6 +77,7 @@ import {
   scopedSectionCap,
   SOURCE_ACTIVE_BODY,
   SOURCE_LESSONS_BODY,
+  type InjectionLimits,
 } from "./lib/active-context.ts";
 import { pruneHookStateFiles } from "./lib/session-state.ts";
 import { detectHookRuntime } from "./lib/detect.ts";
@@ -85,6 +86,7 @@ import { isContextEventName } from "./lib/context-events.ts";
 import { emitContextReceipt } from "../src/core/brain/context-receipts.ts";
 import { estimateTokens } from "../src/core/brain/text/tokenizer.ts";
 import type { InjectContextSource } from "../src/core/brain/inject-failopen.ts";
+import { resolveHookTarget } from "./lib/hook-vault.ts";
 
 /**
  * Best-effort hook audit line. Never throws: a failure to record must never
@@ -108,6 +110,7 @@ function auditHook(vault: string | null, action: string, details: Record<string,
 }
 
 async function main(): Promise<void> {
+  const hookStartedAtMs = Date.now();
   // Arm the process self-watchdog first so a hang anywhere below (vault
   // resolution, a stalled read, an overrunning assembly) still self-terminates
   // at the ceiling with a clean exit instead of orphaning the hook process.
@@ -153,8 +156,11 @@ async function main(): Promise<void> {
       }
     }
 
-    const vault = resolveVault();
-    if (vault === null) return;
+    // With no vault the hook injects what the store's folds render and
+    // skips the vault's own maintenance (design D14, task 2.10).
+    const target = resolveHookTarget();
+    if (target === null) return;
+    const { vault, hasVault } = target;
     auditVault = vault;
 
     // Hands-off post-upgrade maintenance on SessionStart: migrate a stale
@@ -162,7 +168,7 @@ async function main(): Promise<void> {
     // reindex runs detached so it survives this short-lived hook). Best-effort,
     // never blocks injection. In background mode the synchronous part (brain
     // upgrade + spawning the reindex) completes before this awaits.
-    if (hookEventName === "SessionStart") {
+    if (hookEventName === "SessionStart" && hasVault) {
       // Fire-and-forget: never put maintenance on the hook's critical path.
       // background:true spawns the reindex detached; we do not await the result.
       void ensureVaultCurrent(vault, { background: true }).catch(() => {
@@ -194,7 +200,26 @@ async function main(): Promise<void> {
     const workspaceDir =
       typeof payload.cwd === "string" && payload.cwd.length > 0 ? payload.cwd : process.cwd();
     const scopedBlock = renderScopedBlock(vault, workspaceDir, scopedSectionCap(limits), meter);
-    const memoryBudget = Math.max(0, limits.injectBudgetChars - scopedBlock.length);
+    // The topic heads and pinned context of this session (task 4.2): both
+    // charged against the injection budget, between the scoped rules and
+    // the memory context. Fail-open: without a store, a project, topics
+    // or pinned context the digest is byte-identical to before.
+    // The head_select wait ends at half the ceiling, so the memory
+    // context and the output still fit before the ceiling exits.
+    const remainingMs = decisionWaitMs(resolveHookCeilingMs(), Date.now() - hookStartedAtMs);
+    const agentBlocks = await buildAgentContextBlocks({
+      vault,
+      workspaceDir,
+      limits: agentContextLimits(limits, scopedBlock.length),
+      meter,
+      remainingMs,
+    });
+    const headsBlock = agentBlocks.headsBlock;
+    const pinnedBlock = agentBlocks.pinnedBlock;
+    const memoryBudget = Math.max(
+      0,
+      limits.injectBudgetChars - scopedBlock.length - headsBlock.length - pinnedBlock.length,
+    );
 
     // Fail-open context load: assemble the injected body inside a guard that
     // degrades to the last-good cache (or empty) on any error, never emitting
@@ -212,7 +237,7 @@ async function main(): Promise<void> {
     });
     // The early return now fires only when there are NEITHER standing rules
     // NOR memory - a vault with rules and a broken memory layer still speaks.
-    const blocks = [standingBlock, scopedBlock, memoryContext];
+    const blocks = [standingBlock, scopedBlock, headsBlock, pinnedBlock, memoryContext];
     const context = joinBlocks(blocks);
 
     // Only a SessionStart starts an injection epoch: the same hook run on
@@ -648,3 +673,24 @@ main().catch(() => {
   // Never crash the runtime; the session start should proceed
   // regardless of any hook misbehaviour.
 });
+
+/**
+ * The heads and pinned caps inside the injection budget: together they
+ * take at most half of what the budget leaves after the scoped rules, so
+ * the confirmed preferences keep the other half. When the two caps
+ * together exceed that half, both shrink in proportion (each block fits
+ * its cap whole, fence and cut line included). At the default budget the
+ * caps stay as configured while the scoped rules take at most 2400
+ * characters.
+ */
+function agentContextLimits(limits: InjectionLimits, scopedChars: number): InjectionLimits {
+  const room = Math.floor(Math.max(0, limits.injectBudgetChars - scopedChars) / 2);
+  const wanted = limits.topicHeadsMaxChars + limits.pinnedMaxChars;
+  if (wanted <= room) return limits;
+  const share = (cap: number): number => Math.floor((cap * room) / wanted);
+  return {
+    ...limits,
+    topicHeadsMaxChars: share(limits.topicHeadsMaxChars),
+    pinnedMaxChars: share(limits.pinnedMaxChars),
+  };
+}

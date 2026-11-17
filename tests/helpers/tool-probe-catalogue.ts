@@ -296,8 +296,17 @@ export const REASONS_REACHING_OWNER_CONTENT: ReadonlySet<string> = new Set([REAS
  * `docs/mcp.md` and the release notes. Equalities, not floors - see the
  * test that reads them.
  */
-export const PROBE_ENTRY_COUNT = 107;
-export const PROBE_RECIPE_COUNT = 250;
+// 106 -> 107 -> 108, the second hop the agent-presence wave (t_635e3e72):
+// brain_skill_rewrite_status joins driven beside brain_skill_proposals,
+// one ownerless recipe - ids and rates only, nothing owner-tagged to reach.
+// 108 -> 109, the brain store wave: brain_changes, one ownerless recipe -
+// record ids from the index, and store records carry no `owner:`.
+// 109 -> 110, the shared-settings change: brain_settings, one ownerless
+// recipe - settings are one value for every machine, never owner-tagged.
+// 110 -> 111, topics: brain_topic, one ownerless recipe - topics are store
+// records with no `owner:`, and their privacy is the partition's.
+export const PROBE_ENTRY_COUNT = 111;
+export const PROBE_RECIPE_COUNT = 254;
 export const PROBE_TWO_SIDED_COUNT = 32;
 
 /**
@@ -520,6 +529,25 @@ export const NON_CONTENT: ReadonlyArray<ProbeEntry> = [
         reason: REASON.ownerlessLane,
       },
     ],
+  },
+  {
+    // The brain store change probe answers record ids from the index; a
+    // store record envelope carries an `agent`, never an `owner:`, and the
+    // fixture vault holds no store at all, so the probe reports none.
+    name: "brain_changes",
+    calls: one({}, REASON.ownerlessLane),
+  },
+  {
+    // The shared brain settings carry no owner: a setting is one value for
+    // every machine and every agent, and the probe only lists them.
+    name: "brain_settings",
+    calls: one({ action: "list" }, REASON.ownerlessLane),
+  },
+  {
+    // Topics carry no owner: a topic is a store record family whose privacy
+    // is its partition, withheld whole below local reach.
+    name: "brain_topic",
+    calls: one({ action: "list" }, REASON.ownerlessLane),
   },
   {
     name: "brain_claims",
@@ -1063,6 +1091,13 @@ export const NON_CONTENT: ReadonlyArray<ProbeEntry> = [
         reason: REASON.ownerlessLane,
       },
     ],
+  },
+  {
+    // Benchmark-gated rewrite status (t_635e3e72): ids and rates over one
+    // skill's lane, the same ownerless discipline as the grade record the
+    // read answers from - no page path, title or body at any reach.
+    name: "brain_skill_rewrite_status",
+    calls: one({ skill_name: "probe-skill" }, REASON.ownerlessLane),
   },
   { name: "brain_sources", calls: one({}, REASON.signalAuthorship) },
   { name: "brain_stale_scan", calls: one({}, REASON.ownerFiltered) },

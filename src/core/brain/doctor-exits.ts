@@ -52,6 +52,172 @@ export interface DoctorExitExclusion {
 }
 
 const EXCLUSIONS: ReadonlyArray<DoctorExitExclusion> = [
+  // --- The brain store (task 1.11, a phase 1 trial) ------------------------
+  {
+    code: "store-dual-write-failures",
+    reason:
+      "a failed dual write names a cause outside the store itself (a full disk, a partition this " +
+      "machine does not hold, a refused root), and the legacy write it shadowed was kept; the " +
+      "fix is to remove that cause, which differs per failure and is named in the finding",
+  },
+  {
+    code: "store-write-fail-open",
+    reason:
+      "a fail-open store write (a hook, telemetry) names a cause outside the store itself (no " +
+      "store yet, no device id, a partition this machine does not hold), and its caller went on; " +
+      "the fix is to remove that cause, which differs per failure and is named in the finding",
+  },
+  {
+    code: "store-dual-write-skipped",
+    reason:
+      "the store needs a device id this machine has not been given; choosing one is a decision " +
+      "about how this machine is named among the user's devices, which no command can make for them",
+  },
+  {
+    code: "store-root-invalid",
+    reason:
+      "the configured store root cannot be used (inside the vault, or holding partitions of two " +
+      "stores); where the store should live, and which store is the real one, is the user's choice",
+  },
+  {
+    code: "store-partition-lost",
+    reason:
+      "a partition this machine has held lost its identity file while its records may still be " +
+      "there; the store id it must carry comes only from sync or a backup of that file, and " +
+      "writing a guessed one could join the records to the wrong store",
+  },
+  {
+    code: "store-digest-divergent",
+    reason:
+      "two machines folded identical records into different state, which is a defect in the " +
+      "release that computed one of them; repairing it by rewriting records would destroy the " +
+      "evidence, so the finding asks for both store folders to be kept and the bug reported",
+  },
+  {
+    code: "store-digest-silent",
+    reason:
+      "a device that stopped publishing digests is either offline, waiting for sync, or gone for " +
+      "good; only the user knows which, and only a human device-retire record takes it off the roster",
+  },
+  {
+    code: "store-device-retired-returned",
+    reason:
+      "a retired device wrote again, which is either a machine brought back on purpose or a " +
+      "device id reused by mistake; only the user knows which, and retiring it again would " +
+      "hide a machine that is alive",
+  },
+  {
+    code: "store-removed-awaiting-compaction",
+    reason:
+      "removed content stays in the append-only shards until store compaction exists, a later " +
+      "phase; no command shrinks it today, and the finding only says how many lines still wait",
+  },
+  {
+    code: "store-record-id-conflict",
+    reason:
+      "a record id arrived with two different contents, so a shard was edited or a writer is " +
+      "broken; every machine already keeps the same version, and deciding which content was " +
+      "meant needs a person reading both",
+  },
+  {
+    code: "store-dual-write-no-store",
+    reason:
+      "the skipped records never reached the store and no command can recreate them from the " +
+      "legacy tree; creating the store stops new skips, and the counter is reset by deleting a " +
+      "device-local file once the user has seen it",
+  },
+  {
+    code: "store-clock-ahead",
+    reason:
+      "the records carry the clock of the device that wrote them; the fix is the clock of that " +
+      "machine, which is outside the vault, and records already written are never rewritten",
+  },
+  {
+    code: "store-device-dir-reserved",
+    reason:
+      "a peer machine's device id is a name Windows reserves for a device, so its shard folder " +
+      "cannot exist on this Windows machine; the fix is that peer's device id, which is outside " +
+      "this machine",
+  },
+  {
+    code: "store-mode-loose",
+    reason:
+      "the looser mode was set outside Open Second Brain (a sync client, a restore, a manual " +
+      "chmod); the finding names the exact chmod command, and changing permissions on the " +
+      "user's files is left to the user",
+  },
+  {
+    code: "store-record-id-cross-partition",
+    reason:
+      "a record id appears in both partitions, so a peer copied or forged a record; the index " +
+      "keeps the first copy, and deciding which copy is genuine needs a person reading both",
+  },
+  {
+    code: "store-shard-tail-held",
+    reason:
+      "the held bytes are the unfinished last line of another device's shard; only that device's " +
+      "next append or a completed sync closes it, and no command on this machine can",
+  },
+  {
+    code: "store-shard-newer-format",
+    reason:
+      "the shard holds a record of a format this release does not know; upgrading Open Second " +
+      "Brain on this machine reads it, and setting the line aside would hide a valid record",
+  },
+  {
+    code: "store-shard-blob-pending",
+    reason:
+      "a record's body blob has not arrived yet; a sync tool may still deliver it, and setting " +
+      "the record aside is allowed only once it is old enough and never for a settings shard, " +
+      "which the finding itself says per record",
+  },
+  {
+    code: "store-shard-line-too-long",
+    reason:
+      "the bad line runs past the longest line a quarantine can name, so it cannot be set aside " +
+      "on this machine; only repairing or removing it in the shard of the device that wrote it " +
+      "resolves it",
+  },
+  {
+    code: "store-shard-unreadable",
+    reason:
+      "a shard file this machine holds could not be read (permissions, a disk error, a sync " +
+      "client holding a lock); the cause is named in the finding and differs per machine",
+  },
+  // --- The store migration (task 2.12) -------------------------------------
+  {
+    code: "machine-state-adopt-conflicts",
+    reason:
+      "a switch kept a fresh vault's file aside because the live folder held another copy; " +
+      "which of the two is still needed only the user can tell, so the remedy is to compare, " +
+      "copy over and delete the folder by hand",
+  },
+  {
+    code: "lane-folder-unimportable",
+    reason:
+      "which name each folder of the user's own legacy tree should take is the user's choice, " +
+      "and renaming a folder moves the user's files, so the remedy is a rename by hand",
+  },
+  {
+    code: "lane-id-misfiled",
+    reason:
+      "the repair runs only on a machine that holds the private partition, which may be " +
+      "another machine than the one running doctor, and on a store where none holds it the " +
+      "partition must first be added on one; the finding names which of the two applies",
+  },
+  {
+    code: "store-device-state-foreign",
+    reason:
+      "another machine's clock and locks reached this machine's device-local state because a " +
+      "sync tool was pointed at it; the fix is that tool's folder list, which is outside Open " +
+      "Second Brain, and which entries to delete afterwards depends on what the sync copied",
+  },
+  {
+    code: "store-partition-unreadable",
+    reason:
+      "a partition folder this machine holds could not be read (permissions, a disk error, a " +
+      "sync client holding a lock); the cause is named in the finding and differs per machine",
+  },
   // --- Judgements over content -------------------------------------------
   {
     code: "active-budget-pressure",
@@ -460,6 +626,57 @@ const EXCLUSIONS: ReadonlyArray<DoctorExitExclusion> = [
       "the signal file could not be parsed. A signal is a captured observation, so what it was " +
       "meant to say exists only in the source it was captured from - reconstructing it here " +
       "would be inventing the observation",
+  },
+  {
+    // The lessons-block readiness family (t_1e952e43, task C3). All four
+    // are operator advisories over derived state the refresh verb heals;
+    // each finding already names the exact verb (approve for a missing
+    // block, refresh for a stale or diverged one), so a registry command
+    // would repeat what the finding carries.
+    code: "lessons-block-absent",
+    reason:
+      "an approval names a rules file that carries no lessons block; creation sits behind the " +
+      "approve verb's consent ladder, which the finding itself names, so nothing here is healable " +
+      "without the operator's explicit consent and no single command belongs in the registry",
+  },
+  {
+    code: "lessons-block-drifted",
+    reason:
+      "a managed lessons block is behind the canonical body; the refresh verb converges it and " +
+      "the finding names that verb including the force wording for a hand-edited block, so a " +
+      "registry row would only duplicate what the finding already says",
+  },
+  {
+    code: "lessons-block-stale-lessons",
+    reason:
+      "a managed block still carries a lesson whose approval went stale; the refresh drops it " +
+      "until the operator approves the moved text again, which the finding names - the decision " +
+      "is the operator's own re-approval, not a command the doctor can carry",
+  },
+  {
+    code: "legacy-devices-pending",
+    reason:
+      "the remedy is on the other machines: each one upgrades and runs its own migration, or the " +
+      "user retires the ones that are gone; nothing this machine runs moves another machine",
+  },
+  {
+    code: "migration-done-twice",
+    reason:
+      "two first migrations already ran; the store keeps both imports and no command undoes one " +
+      "without losing the other, so the finding names the machines and the rule that prevents it",
+  },
+  {
+    code: "legacy-tree-reappeared",
+    reason:
+      "the directory is evidence of a writer that still follows the legacy layout; the user stops " +
+      "that writer and moves the directory out, and nothing here can tell what in it they want kept",
+  },
+  {
+    code: "lessons-approvals-unreadable",
+    reason:
+      "the approvals ledger is damaged; every approval is lifted only by the operator moving or " +
+      "deleting the file, which the finding spells out with the fail-closed direction - there is " +
+      "no mechanical repair a registry row could offer",
   },
 ];
 

@@ -50,7 +50,7 @@
  * are writable - keys on the operator's explicit `--trusted` instead.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, posix, relative, resolve } from "node:path";
 
 import { atomicWriteFileSync } from "../../fs-atomic.ts";
@@ -59,7 +59,6 @@ import {
   extractWikilinks,
   formatFrontmatter,
   parseFrontmatterText,
-  writeFrontmatterAtomic,
 } from "../../vault.ts";
 import type { FrontmatterMap, FrontmatterValue } from "../../types.ts";
 import {
@@ -77,11 +76,26 @@ import {
 } from "../paths.ts";
 import { isoSecond } from "../time.ts";
 import { vaultDisplayName } from "../templates.ts";
-import { assertVaultIdentityForWrite } from "../vault-identity.ts";
 import { ORIGIN_CHANNEL_FIELD, isOriginChannelStamp } from "../../origin-channel.ts";
 import { contentClassCreationStamp } from "../provenance/content-class.ts";
 import { KNOWLEDGE_PACK_FIELD, KNOWLEDGE_PACK_SHA_FIELD } from "./pack-stamp.ts";
 import { OPEN_SECOND_BRAIN_VERSION } from "../../version.ts";
+import {
+  assertLaneWrite,
+  laneEntryClockMs,
+  laneEntryInPrivate,
+  lanePageExists,
+  lanePagesInStore,
+  listLaneTree,
+  readLaneFile,
+  writeLanePage,
+} from "../../store/lane-pages.ts";
+import { assertNoteVaultForWrite } from "../../vault-adapter/index.ts";
+import { groupLogDays, WHOLE_LOG } from "../log-days.ts";
+import { readStoreLogEventsReport } from "../../store/read/log-events.ts";
+import { protectionStore } from "../../store/read/protection-store.ts";
+import { renderLogDayHeader, renderLogEntryBlock } from "../log.ts";
+import { pageVisibility, REMOTE_DENY_VISIBILITY_TOKEN } from "../../graph/visibility.ts";
 
 export const OKF_SCHEMA_VERSION = "1";
 export const OKF_PRODUCER = "open-second-brain";
@@ -303,6 +317,12 @@ export interface OkfManifest {
    * shards of one day are one day here, not two.
    */
   readonly log_days: number;
+  /**
+   * Log events the export left out of `log.md` for being private, counted
+   * before any content-class filtering. Zero on the legacy layout and for
+   * a machine that holds no `private` partition.
+   */
+  readonly log_private_omitted: number;
 }
 
 /** A single file in the in-memory bundle write-plan. */
@@ -380,16 +400,14 @@ function okfStatusOf(meta: FrontmatterMap): OkfStatus {
   return "stable";
 }
 
-function freshnessOf(meta: FrontmatterMap, absPath: string): string | null {
+function freshnessOf(vault: string, meta: FrontmatterMap, absPath: string): string | null {
   for (const field of FRESHNESS_FIELDS) {
     const stamp = stringField(meta, field);
     if (stamp !== null) return stamp;
   }
-  try {
-    return isoSecond(statSync(absPath).mtime);
-  } catch {
-    return null;
-  }
+  // A file's mtime, or a lane record's clock on a store-only machine.
+  const ms = laneEntryClockMs(vault, absPath);
+  return ms === null ? null : isoSecond(new Date(ms));
 }
 
 function producerMeta(meta: FrontmatterMap): Record<string, string> {
@@ -427,11 +445,12 @@ export function collectOkfPages(vault: string): ReadonlyArray<OkfPage> {
   const consider = (abs: string, forceClass?: OkfPageClass): void => {
     let raw: string;
     try {
-      raw = readFileSync(abs, "utf8");
+      raw = readLaneFile(vault, abs);
     } catch {
       return;
     }
-    const [meta, body] = parseFrontmatterText(raw);
+    const [parsed, body] = parseFrontmatterText(raw);
+    const meta = privateStamped(vault, abs, parsed);
     const kind = stringField(meta, "kind") ?? DEFAULT_KIND;
     const cls = forceClass ?? classifyKind(kind);
     const path = vaultRel(vault, abs);
@@ -453,7 +472,7 @@ export function collectOkfPages(vault: string): ReadonlyArray<OkfPage> {
       citations: collectCitations(meta, body),
       status: okfStatusOf(meta),
       aliases: aliasField(meta),
-      freshness: freshnessOf(meta, abs),
+      freshness: freshnessOf(vault, meta, abs),
       foreign_type: stringField(meta, FOREIGN_TYPE_KEY),
       producer_meta: producerMeta(meta),
       frontmatter: meta,
@@ -463,13 +482,33 @@ export function collectOkfPages(vault: string): ReadonlyArray<OkfPage> {
 
   // 1. User pages (outside Brain). listing is sorted by path below.
   for (const abs of listMarkdown(vault, [...EXCLUDED_DIRS, BRAIN_ROOT_REL])) consider(abs);
-  // 2. References: Brain/sources/*.md.
-  for (const abs of listMarkdown(join(vault, BRAIN_SOURCES_REL), [])) consider(abs, "reference");
-  // 3. Queries: Brain/reports/*.md.
-  for (const abs of listMarkdown(join(vault, BRAIN_REPORTS_REL), [])) consider(abs, "query");
+  // 2. References: Brain/sources/*.md (lane records once switched).
+  for (const abs of laneMarkdown(vault, join(vault, BRAIN_SOURCES_REL))) consider(abs, "reference");
+  // 3. Queries: Brain/reports/*.md (lane records once switched).
+  for (const abs of laneMarkdown(vault, join(vault, BRAIN_REPORTS_REL))) consider(abs, "query");
 
   out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   return out;
+}
+
+/**
+ * A page read from a lane entry of the `private` partition carries the
+ * remote-deny token in the bundle (review finding F333). Such an entry can
+ * be private by partition alone, with no `visibility:` of its own, and
+ * would otherwise land in another vault as an ordinary shared page. The
+ * token is added to the tokens the page already declares, never in place
+ * of them.
+ */
+function privateStamped(vault: string, abs: string, meta: FrontmatterMap): FrontmatterMap {
+  if (!laneEntryInPrivate(vault, abs)) return meta;
+  const tokens = pageVisibility(meta);
+  if (tokens.includes(REMOTE_DENY_VISIBILITY_TOKEN)) return meta;
+  return { ...meta, visibility: [...tokens, REMOTE_DENY_VISIBILITY_TOKEN] };
+}
+
+/** The `.md` pages under a `Brain/` lane folder, in both modes. */
+function laneMarkdown(vault: string, root: string): string[] {
+  return lanePagesInStore(vault) ? listLaneTree(vault, root) : listMarkdown(root, []);
 }
 
 /** Recursively list `.md` files under `root`, skipping `skipDirs` names. */
@@ -557,6 +596,12 @@ export interface OkfLog {
   readonly days: number;
   /** Entries the content-class filter dropped; zero without a filter. */
   readonly droppedEntries: number;
+  /**
+   * Log events the store held in its `private` partition, left out of
+   * `log.md` and counted before any content-class filtering; zero on the
+   * legacy layout.
+   */
+  readonly privateEntries: number;
 }
 
 /**
@@ -569,7 +614,44 @@ const LOG_BULLET_RE = /^-\s+([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/;
 export function buildLog(vault: string, filter?: OkfLogFilter): OkfLog {
   const bodiesByDate = new Map<string, string[]>();
   let droppedEntries = 0;
-  for (const shard of listLogShardFiles(vault)) {
+  // One read of the store log, counted by partition: a private event never
+  // reaches `log.md` (review finding F333), and the export refuses when a
+  // log shard cannot be read, so the bundle is never silently short of
+  // events and the private count is never a lower bound.
+  const report = readStoreLogEventsReport(WHOLE_LOG, { vault });
+  // A store-only machine whose store cannot be opened reads no events and
+  // no unreadable shard: refuse as a protection reader does, switched or
+  // not, rather than export an empty log that claims nothing private was
+  // left out.
+  if (report !== null) protectionStore(undefined, { openErrorFails: true, vault });
+  if (report !== null && report.unreadable.length > 0) {
+    throw new Error(
+      `okf export: cannot read log shard(s) ${report.unreadable.join(", ")}; the bundle would be short of their events`,
+    );
+  }
+  // Counted before the content-class filter: the partition rule and the
+  // class policy are independent, so the two counts never overlap.
+  const privateEntries = report?.events.filter((e) => e.partition === "private").length ?? 0;
+  // A store-only machine keeps no day files: the days of the shared events
+  // are rendered the way the day file renders it (header, then one block
+  // per entry), so the bundle's `log.md` reads the same.
+  const storedDays =
+    report === null
+      ? null
+      : groupLogDays(report.events.filter((e) => e.partition === "shared").map((e) => e.entry));
+  for (const day of storedDays ?? []) {
+    const body = [renderLogDayHeader(day.date), ...day.entries.map(renderLogEntryBlock)]
+      .join("\n")
+      .trimEnd();
+    const text =
+      filter === undefined || filter.includePromptDerived
+        ? body
+        : filterLogShard(body, filter, (dropped) => {
+            droppedEntries += dropped;
+          });
+    if (text.length > 0) bodiesByDate.set(day.date, [text]);
+  }
+  for (const shard of storedDays === null ? listLogShardFiles(vault) : []) {
     // The bundle is markdown; the JSONL sidecar of a day carries the same
     // entries in machine form and would duplicate every line.
     if (shard.ext !== "md") continue;
@@ -599,7 +681,12 @@ export function buildLog(vault: string, filter?: OkfLogFilter): OkfLog {
   const sections = [...bodiesByDate.keys()]
     .toSorted()
     .map((date) => `## ${date}\n\n${bodiesByDate.get(date)!.join("\n\n")}`);
-  return { contents: sections.join("\n\n"), days: bodiesByDate.size, droppedEntries };
+  return {
+    contents: sections.join("\n\n"),
+    days: bodiesByDate.size,
+    droppedEntries,
+    privateEntries,
+  };
 }
 
 /**
@@ -944,7 +1031,7 @@ export function buildOkfSubsetBundle(vault: string, pages: ReadonlyArray<OkfPage
 export function buildOkfBundleFromPages(
   vault: string,
   pages: ReadonlyArray<OkfPage>,
-  log: Pick<OkfLog, "contents" | "days"> = buildLog(vault),
+  log: Pick<OkfLog, "contents" | "days" | "privateEntries"> = buildLog(vault),
 ): OkfBundle {
   return assembleOkfBundle(vault, pages, log);
 }
@@ -952,7 +1039,7 @@ export function buildOkfBundleFromPages(
 function assembleOkfBundle(
   vault: string,
   pages: ReadonlyArray<OkfPage>,
-  log: Pick<OkfLog, "contents" | "days"> | null,
+  log: Pick<OkfLog, "contents" | "days" | "privateEntries"> | null,
 ): OkfBundle {
   // ONE instant for the whole bundle: the manifest's `generated_at` and
   // every page's `generated.at` share it, so whole-bundle byte equality
@@ -980,6 +1067,7 @@ function assembleOkfBundle(
       producer_meta: page.producer_meta,
     })),
     log_days: log?.days ?? 0,
+    log_private_omitted: log?.privateEntries ?? 0,
   };
 
   const files: OkfBundleFile[] = [
@@ -1052,6 +1140,7 @@ interface ManifestInput {
   readonly generated_at?: unknown;
   readonly vault_basename?: unknown;
   readonly log_days?: unknown;
+  readonly log_private_omitted?: unknown;
   readonly pages?: unknown;
 }
 
@@ -1205,6 +1294,7 @@ function readSpecOkfBundle(dir: string): ParsedOkfBundle {
       vault_basename: "",
       pages: entries,
       log_days: 0,
+      log_private_omitted: 0,
     },
     // No manifest, no own-producer claim to honour: the walk's output is
     // foreign by construction - stating it directly instead of resting
@@ -1315,6 +1405,11 @@ export function readOkfBundle(dir: string): ParsedOkfBundle {
       log_days:
         typeof parsed.log_days === "number" && Number.isFinite(parsed.log_days)
           ? parsed.log_days
+          : 0,
+      log_private_omitted:
+        typeof parsed.log_private_omitted === "number" &&
+        Number.isFinite(parsed.log_private_omitted)
+          ? parsed.log_private_omitted
           : 0,
     },
     foreign: producer !== OKF_PRODUCER,
@@ -1595,8 +1690,13 @@ export function importOkfBundle(
   bundle: ParsedOkfBundle,
   opts: OkfImportOptions = {},
 ): OkfImportResult {
-  // Vault-identity write guard (context-integrity-gates, Unit J).
-  assertVaultIdentityForWrite(vault);
+  // Lane write guard: the vault identity guard on an unswitched machine.
+  // Every page this import writes lands in the user's vault (OKF Review/
+  // or a trusted user path), so a store-only machine runs the vault
+  // adapter's guard once up front too: a frozen or swapped vault is
+  // refused before the walk, as it is unswitched.
+  assertLaneWrite(vault);
+  if (lanePagesInStore(vault)) assertNoteVaultForWrite(vault, "okf import");
   const trusted = opts.trusted === true;
   const nowIso = isoSecond(opts.now ?? new Date());
   const written: string[] = [];
@@ -1620,7 +1720,7 @@ export function importOkfBundle(
       errors.push({ path: targetRel, message: (exc as Error).message ?? String(exc) });
       continue;
     }
-    if (!trusted && existsSync(abs)) {
+    if (!trusted && lanePageExists(vault, abs)) {
       skipped.push(targetRel);
       continue;
     }
@@ -1629,11 +1729,12 @@ export function importOkfBundle(
       ...opts.provenance,
     };
     try {
-      mkdirSync(dirname(abs), { recursive: true });
       // overwrite: trusted closes the TOCTOU window in review mode: if a
-      // file appears between the existsSync check above and this write,
-      // the exclusive create throws EEXIST instead of clobbering it.
-      writeFrontmatterAtomic(abs, meta, page.body, { overwrite: trusted });
+      // file appears between the existence check above and this write,
+      // the exclusive create throws EEXIST instead of clobbering it. A
+      // `Brain/` page is a lane record once switched; a user page is a
+      // file, behind the vault adapter's guard.
+      writeLanePage(vault, abs, meta, page.body, { overwrite: trusted });
       written.push(targetRel);
     } catch (exc) {
       if (!trusted && (exc as NodeJS.ErrnoException).code === "EEXIST") {

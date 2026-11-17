@@ -15,7 +15,7 @@
  * than sinking the whole snapshot.
  */
 
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import { resolveSearchConfig } from "../search/index.ts";
@@ -30,10 +30,12 @@ import {
 } from "../maintenance/self-heal-upgrade-state.ts";
 import { runHygieneScan } from "./hygiene/scan.ts";
 import type { HygieneFinding } from "./hygiene/types.ts";
-import { brainConfigPath, brainDirs } from "./paths.ts";
+import { memoryFromStore, storePagesIn } from "./memory-pages.ts";
+import { brainConfigPath, brainDirsOf, brainManualPath, vaultRelative } from "./paths.ts";
 import { loadTemporalConfigSafe } from "./policy.ts";
 import { listProfiles } from "./portability/profiles.ts";
 import { buildReviewCandidates } from "./review-candidates.ts";
+import { describeManualRevisionAhead, manualRevisionAhead } from "./templates.ts";
 import { buildTimelineIndex } from "./temporal/build-index.ts";
 import { findStaleEntries } from "./temporal/stale-watch.ts";
 
@@ -205,6 +207,12 @@ export interface BuildOperatorSnapshotOptions {
    * so the two seams read as one pattern.
    */
   readonly writerLockHeldAt?: (dbPath: string) => boolean;
+  /**
+   * The caller is below local reach: the stale scan's timeline and the
+   * doctor pass leave out the log events of the store's `private`
+   * partition. Default false.
+   */
+  readonly withholdsPrivate?: boolean;
 }
 
 /**
@@ -212,7 +220,7 @@ export interface BuildOperatorSnapshotOptions {
  * source runs a dry-run dream (read-only). Never mutates the vault.
  */
 export async function buildOperatorSnapshot(
-  vault: string,
+  vault: string | null,
   opts: BuildOperatorSnapshotOptions = {},
 ): Promise<OperatorSnapshot> {
   const now = opts.now ?? new Date();
@@ -223,7 +231,9 @@ export async function buildOperatorSnapshot(
   };
 
   // --- State-file health ---
-  const configPresent = existsSync(brainConfigPath(vault));
+  // With no vault (design D14) the brain settings are store records with
+  // shipped defaults, so there is no settings file to miss.
+  const configPresent = vault === null || existsSync(brainConfigPath(vault));
   let searchDbPath: string | null = null;
   try {
     searchDbPath = resolveSearchConfig({ vault, configPath: opts.configPath ?? undefined }).dbPath;
@@ -239,9 +249,18 @@ export async function buildOperatorSnapshot(
   const store = readStoreGroup(searchDbPath, now, opts.writerLockHeldAt);
 
   // --- Automatic upgrade ---
-  const selfHealUpgradeFailure = readSelfHealUpgradeFailure(vault);
+  // Both read files a vault's upgrade writes; with no vault there are none.
+  const selfHealUpgradeFailure = vault === null ? null : readSelfHealUpgradeFailure(vault);
   if (selfHealUpgradeFailure !== null) {
     problem("self-heal-upgrade-failed", describeSelfHealUpgradeFailure(selfHealUpgradeFailure));
+  }
+  const manualAhead = vault === null ? null : readManualRevisionAhead(vault);
+  if (manualAhead !== null && vault !== null) {
+    problem(
+      "managed-file-from-newer-release",
+      `${describeManualRevisionAhead(vaultRelative(brainManualPath(vault), vault), manualAhead)}; ` +
+        "update Open Second Brain on this device",
+    );
   }
 
   // --- Doctor + semantic health ---
@@ -252,6 +271,7 @@ export async function buildOperatorSnapshot(
     const doctor = runDoctor(vault, {
       now,
       ...(searchDbPath !== null ? { dbPath: searchDbPath } : {}),
+      ...(opts.withholdsPrivate === true ? { withholdsPrivate: true } : {}),
     });
     if (doctor.errors.length > 0) {
       problem("doctor-errors", `${doctor.errors.length} invariant error(s)`);
@@ -270,34 +290,41 @@ export async function buildOperatorSnapshot(
   }
 
   // --- Hygiene ---
-  try {
-    const hy = runHygieneScan(vault, {
-      now,
-      ...(opts.readable !== undefined ? { readable: opts.readable } : {}),
-    });
-    const keepFinding = opts.keepFinding;
-    const findings =
-      keepFinding === undefined ? hy.findings : hy.findings.filter((f) => keepFinding(f));
-    if (findings.length > 0) {
-      problem("hygiene-findings", `${findings.length} hygiene finding(s)`);
+  // The hygiene and stale scans walk vault notes. With no vault they are
+  // not run (design D14): the snapshot says so below rather than reading
+  // as a clean scan.
+  if (vault !== null) {
+    try {
+      const hy = runHygieneScan(vault, {
+        now,
+        ...(opts.readable !== undefined ? { readable: opts.readable } : {}),
+      });
+      const keepFinding = opts.keepFinding;
+      const findings =
+        keepFinding === undefined ? hy.findings : hy.findings.filter((f) => keepFinding(f));
+      if (findings.length > 0) {
+        problem("hygiene-findings", `${findings.length} hygiene finding(s)`);
+      }
+    } catch {
+      problem("hygiene-findings", "hygiene scan failed to run");
     }
-  } catch {
-    problem("hygiene-findings", "hygiene scan failed to run");
   }
 
   // --- Stale scan ---
   let staleTotal = 0;
-  try {
-    const cfg = loadTemporalConfigSafe(vault);
-    const index = buildTimelineIndex(vault, {});
-    const stale = findStaleEntries(index, vault, cfg, { now });
-    staleTotal =
-      stale.stalePreferences.length + stale.staleSignals.length + stale.staleLogFiles.length;
-    if (staleTotal > 0) {
-      problem("stale-notes", `${staleTotal} stale entr${staleTotal === 1 ? "y" : "ies"}`);
+  if (vault !== null) {
+    try {
+      const cfg = loadTemporalConfigSafe(vault);
+      const index = buildTimelineIndex(vault, { withholdsPrivate: opts.withholdsPrivate === true });
+      const stale = findStaleEntries(index, vault, cfg, { now });
+      staleTotal =
+        stale.stalePreferences.length + stale.staleSignals.length + stale.staleLogFiles.length;
+      if (staleTotal > 0) {
+        problem("stale-notes", `${staleTotal} stale entr${staleTotal === 1 ? "y" : "ies"}`);
+      }
+    } catch {
+      problem("stale-notes", "stale scan failed to run");
     }
-  } catch {
-    problem("stale-notes", "stale scan failed to run");
   }
 
   // --- Review candidates (dry-run dream) ---
@@ -325,9 +352,9 @@ export async function buildOperatorSnapshot(
 
   return Object.freeze({
     counts: Object.freeze({
-      preferences: countMarkdown(brainDirs(vault).preferences),
-      retired: countMarkdown(brainDirs(vault).retired),
-      inbox: countMarkdown(brainDirs(vault).inbox),
+      preferences: countMarkdown(vault, brainDirsOf(vault).preferences),
+      retired: countMarkdown(vault, brainDirsOf(vault).retired),
+      inbox: countMarkdown(vault, brainDirsOf(vault).inbox),
     }),
     staleTotal,
     reviewQueue,
@@ -336,7 +363,7 @@ export async function buildOperatorSnapshot(
     healthVerdict,
     problems: Object.freeze(problems),
     healthy: problems.length === 0,
-    frozen: readFreezeMarker(vault),
+    frozen: vault === null ? null : readFreezeMarker(vault),
     selfHealUpgradeFailure,
     store,
   });
@@ -403,12 +430,11 @@ function lockAgeMs(dbPath: string, now: Date): number | null {
 }
 
 /**
- * The lock directory `proper-lockfile` creates for an index path: a bare
- * `${dbPath}.lock` directory whose only metadata is its mtime (`getLockFile`
- * in `proper-lockfile/lib/lockfile.js`; `writer-lock.ts` takes it with
- * `mkdir`). Spelled here because the age reads that directory's mtime, and
- * the state probe (`isWriterLockHeld`) asks the same path behind the same
- * library.
+ * The writer lock directory for an index path: a bare `${dbPath}.lock`
+ * directory whose only metadata is its mtime (the `proper-lockfile` on-disk
+ * protocol, which `writer-lock.ts` keeps; it takes the lock with `mkdir`).
+ * Spelled here because the age reads that directory's mtime, and the state
+ * probe (`isWriterLockHeld`) asks the same path.
  */
 const WRITER_LOCK_SUFFIX = ".lock";
 
@@ -470,8 +496,21 @@ export function renderOperatorSnapshot(snap: OperatorSnapshot): string {
   return out.join("\n");
 }
 
-/** Count `.md` files directly under `dir` (non-recursive). Missing dir = 0. */
-function countMarkdown(dir: string): number {
+/**
+ * Count `.md` files directly under `dir` (non-recursive). Missing dir = 0.
+ * On a store-only machine (task 2.10): the fold's records whose page sat
+ * in `dir`.
+ */
+function countMarkdown(vault: string | null, dir: string): number {
+  if (vault === null || memoryFromStore(vault)) {
+    // A failed probe degrades to 0 like the legacy branch, never rejects
+    // the whole snapshot.
+    try {
+      return storePagesIn(vault, dir).length;
+    } catch {
+      return 0;
+    }
+  }
   if (!existsSync(dir)) return 0;
   try {
     let n = 0;
@@ -520,5 +559,17 @@ function renderStoreLine(store: SnapshotStore): string {
       );
     case WRITER_LOCK_STATE.unknown:
       return `store: writer lock state unknown (${store.writerLockReason ?? "reason unavailable"}); ${caller}`;
+  }
+}
+
+/**
+ * The manual's template revision when a newer release wrote it, else null.
+ * Fail-soft like every source here: an unreadable manual reads as current.
+ */
+function readManualRevisionAhead(vault: string): number | null {
+  try {
+    return manualRevisionAhead(readFileSync(brainManualPath(vault), "utf8"));
+  } catch {
+    return null;
   }
 }

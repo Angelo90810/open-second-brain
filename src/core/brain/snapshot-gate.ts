@@ -41,7 +41,7 @@
 
 import { existsSync } from "node:fs";
 
-import { loadSnapshotRetentionSafe } from "./policy.ts";
+import { loadSnapshotRetentionSafe, type BrainDerivedStorePolicy } from "./policy.ts";
 import { isFileAlreadyExistsAt } from "../fs-atomic.ts";
 import {
   classifyRecoverability,
@@ -54,12 +54,15 @@ import {
   BrainSnapshotError,
   createSnapshot,
   pruneSnapshots,
+  liveStoreWorthPreserving,
   restoreSnapshot,
   type PruneSnapshotsResult,
   type RecoveryPointEvidence,
   type RestoreSnapshotOptions,
   type RestoreSnapshotResult,
+  type StoreLockToken,
 } from "./snapshot.ts";
+import type { WriteLane } from "./freeze-marker.ts";
 import { compactRunStamp } from "./time.ts";
 import { BRAIN_SNAPSHOT_REASON, type BrainSnapshotReason } from "./types.ts";
 
@@ -100,6 +103,8 @@ export interface WithDestructiveSnapshotResult<T> {
 
 /** Options of both entry points here, since both mint one run id. */
 export interface WithDestructiveSnapshotOptions {
+  /** The write lane the snapshot's guards check (`CreateSnapshotOptions.lane`). */
+  readonly lane?: WriteLane;
   /**
    * Injected clock. It decides the run-id stamp AND the `snapshot` audit
    * line's timestamp, so a caller whose output is byte-reproducible given
@@ -133,6 +138,12 @@ export interface WithDestructiveSnapshotOptions {
    * name.
    */
   readonly available?: (runId: string) => boolean;
+  /** Forwarded to {@link CreateSnapshotOptions.heldStoreLock}. */
+  readonly heldStoreLock?: StoreLockToken;
+  /** Forwarded to {@link SnapshotStoreOptions.derivedStorePath}. */
+  readonly derivedStorePath?: string;
+  /** Forwarded to {@link SnapshotStoreOptions.derivedStore}. */
+  readonly derivedStore?: BrainDerivedStorePolicy;
   /**
    * Archives the retention pass behind this snapshot must not remove, on
    * top of the snapshot itself (which is always protected).
@@ -296,7 +307,15 @@ export function takeSnapshot(
   const snapshot = createUniqueSnapshot(
     vault,
     baseRunId,
-    (runId) => createSnapshot(vault, runId, { reason, now }).path,
+    (runId) =>
+      createSnapshot(vault, runId, {
+        reason,
+        now,
+        ...(opts.lane ? { lane: opts.lane } : {}),
+        ...(opts.heldStoreLock !== undefined ? { heldStoreLock: opts.heldStoreLock } : {}),
+        ...(opts.derivedStorePath !== undefined ? { derivedStorePath: opts.derivedStorePath } : {}),
+        ...(opts.derivedStore !== undefined ? { derivedStore: opts.derivedStore } : {}),
+      }).path,
     MAX_SNAPSHOT_ID_ATTEMPTS,
     opts.available,
   );
@@ -308,6 +327,7 @@ export function takeSnapshot(
       // rollback is mid-restore and still reading the archive it is
       // restoring out of the same directory.
       protectRunIds: [snapshot.runId, ...(opts.protectRunIds ?? [])],
+      ...(opts.lane ? { lane: opts.lane } : {}),
     });
     if (prune.refusal !== null) {
       process.stderr.write(
@@ -454,9 +474,33 @@ export function restoreSnapshotWithRecoveryPoint(
   let recoveryPoint: DestructiveSnapshot | null = null;
   const result = restoreSnapshot(vault, runId, {
     ...opts,
-    beforeDiscard: (): RecoveryPointEvidence => {
+    beforeDiscard: ({ storeTarget, heldStoreLock }): RecoveryPointEvidence => {
       const point = takeSnapshot(vault, BRAIN_SNAPSHOT_REASON.manual, {
         ...opts,
+        // The recovery point archives exactly the store the swap replaces,
+        // under the restore's coverage policy (spread from `opts` above):
+        // left to resolve its own source, it would archive the configured
+        // store while a `derivedStorePath` override names another.
+        ...(storeTarget !== null ? { derivedStorePath: storeTarget } : {}),
+        // A sound store the swap replaces is always archived, whatever the
+        // vault's coverage policy or size cap: its only copy is about to be
+        // discarded. An absent store has nothing to keep, and a condemned
+        // one is what the restore heals, so for either the recovery point
+        // explicitly leaves the store out: left to the vault's policy, a
+        // policy that asks for coverage would refuse the absent store and
+        // fail the integrity scan on the condemned one, and the restore
+        // could never recreate or heal it. The restore refuses when a
+        // sound replaced store was left out.
+        ...(storeTarget !== null
+          ? {
+              derivedStore: liveStoreWorthPreserving(storeTarget)
+                ? { include: true, maxBytes: Number.MAX_SAFE_INTEGER }
+                : { include: false, maxBytes: 0 },
+            }
+          : {}),
+        // The restore holds the store writer lock from before this point
+        // through the swap; the snapshot writes its store archive under it.
+        ...(heldStoreLock !== null ? { heldStoreLock } : {}),
         protectRunIds: [runId, ...(opts.protectRunIds ?? [])],
       });
       recoveryPoint = point;

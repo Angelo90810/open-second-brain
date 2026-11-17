@@ -85,8 +85,9 @@ decision_model_uses: "<use>:shadow"
 - Never write the key into the config, the vault, a tracked file or the
   chat. Never echo it. Ask the user to set the variable themselves, then
   rerun `check`.
-- The config lives outside the vault (the machine config); a vault's
-  `Brain/_brain.yaml` can only turn the feature off, never on.
+- The config lives outside the vault (the machine config); the shared
+  brain setting `decision_model.enabled` can only turn the feature off,
+  never on.
 - Plain `http://` is accepted only on loopback. For another host without
   TLS, explain what `decision_model_allow_insecure_http` means (text and
   key cross the network unencrypted) before the user sets it.
@@ -116,8 +117,24 @@ Pick the use that matches what the user wants to improve:
 - `dedup`, `tension`, `labels`: advisory verdicts on proposals the
   deterministic detectors made (`brain_hygiene scan`, `brain_tension
   verify`, `brain_labels suggest`).
+- `topic_route`: which topic an unassigned record lands on in the dream
+  pass. Mention that the planner's word overlap stays the fallback.
+- `event_kind`: which item a record a topic holds derives.
+- `human_readable`: which notes stay in the weekly history page.
+- `topic_new`: whether a qualifying cluster becomes a topic this pass.
+- `topic_same`: which topic pairs the dream report proposes for a merge.
+- `question_resolved`: which open question a record answers (a proposal
+  only).
+- `milestone_done`: whether a milestone looks done (a proposal only).
+- `head_select`: which topic heads lead the session start digest.
+- `neighbour_relevant`: which neighbour records reach the agent before a
+  turn. The nine topic and agent-context uses are not covered by the
+  shipped baseline: `enforce` needs a thresholds-store entry first,
+  and the value set there is the threshold the use applies to that
+  model's answers.
 
-Each use has its own page under `docs/decision-models/`.
+Each use has its own page under `docs/decision-models/`; the nine new ones
+share one page, `docs/decision-models/topics-and-agent-context.md`.
 
 ## Step 5: measure, then decide
 
@@ -131,6 +148,11 @@ o2b search rerank-eval --dataset <queries.json> --kind decision-model --compare-
 `report` prints the calls, outcomes, latency, tokens and cost, plus the
 use's own evaluation metric. Recommend `enforce` only when that metric
 shows a gain against the deterministic baseline without a regression.
+The nine topic and agent-context uses (`head_select` among them) have no
+per-use metric yet: `report` prints only the generic summary for them, so
+keep them in shadow and do not recommend `enforce` from `report` alone.
+Their shadow records are written to the vault's log, so a store-only
+machine records none.
 For `extract_prefilter`, `enforce` needs zero regret (no committed signal
 from a turn the filter would have dropped); otherwise stay in shadow.
 Switching to `enforce` is the user's decision, one use at a time:
@@ -145,12 +167,14 @@ Any one of these:
 
 1. remove the use from `decision_model_uses` (or set it to `off`);
 2. set `decision_model_enabled: "false"` in the machine config;
-3. add the vault opt-out to `Brain/_brain.yaml`:
-
-   ```yaml
-   decision_model:
-     enabled: false
-   ```
+3. set the shared brain setting `decision_model.enabled` to `false`,
+   which turns the feature off on every machine of this brain:
+   `o2b brain settings set decision_model.enabled false`. That is the
+   operator's command, and only the operator can run it: the key is
+   operator-only, so the `brain_settings` tool refuses an agent's write
+   to it with `operator_only_setting` on every machine, switched or not.
+   Ask the operator to run the command; never try to turn the feature
+   back on.
 
 Unsetting the key variable also stops every request, except to a keyless
 loopback `laya` or `openjev` server, which needs none.
@@ -187,5 +211,5 @@ loopback `laya` or `openjev` server, which needs none.
 - Does not switch a use to `enforce` without the user's decision and the
   shadow numbers.
 - Does not install servers or download model weights.
-- Does not edit a vault's `_brain.yaml` except to add the opt-out when
-  the user asks for it.
+- Does not change the shared brain settings except to add the opt-out
+  when the user asks for it.

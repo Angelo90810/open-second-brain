@@ -64,6 +64,7 @@ import {
 import { ATTESTATION_CHECK_CODE } from "./doctor/attestation-check.ts";
 import { RECEIPT_CONTENT_DRIFT_CODE } from "./doctor/receipt-content-drift-check.ts";
 import { GIT_TRACKED_DERIVED_STATE_CODE } from "./doctor/git-tracked-state-check.ts";
+import { STORE_SHARD_CORRUPT_LINE_CODE } from "./doctor/store-gap-check.ts";
 import { scanDanglingWorkruns, WORKRUN_PHASE } from "./dream-workrun.ts";
 import { extractWikilinkRichBodies, parseWikilinkRich } from "./link-graph/parse-wikilink.ts";
 import { LINT_CONSOLIDATE_KIND } from "./lint-consolidate.ts";
@@ -179,6 +180,27 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         code: "config-missing",
         issueClass: "missing Brain config",
         nextCommand: "o2b brain init",
+        autoRepairable: false,
+      },
+      {
+        code: "store-missing",
+        issueClass: "brain store not created yet",
+        nextCommand: "o2b store init",
+        autoRepairable: false,
+      },
+      {
+        code: "view-writer-silent",
+        issueClass: "the human view writer has published nothing for days",
+        nextCommand: "o2b view writer --here",
+        autoRepairable: false,
+      },
+      {
+        // The dry run is the first step whether or not the store exists:
+        // it reads the legacy tree alone. The finding names `o2b store
+        // init` before it when no store exists yet.
+        code: "migration-available",
+        issueClass: "brain store migration available",
+        nextCommand: "o2b brain migrate-store --dry-run",
         autoRepairable: false,
       },
       {
@@ -338,6 +360,15 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         // backing off; the dry run shows the pending change and the error.
         code: "self-heal-upgrade-failed",
         issueClass: "automatic Brain upgrade failed",
+        nextCommand: "o2b brain upgrade --dry-run",
+        autoRepairable: false,
+      },
+      {
+        // A synced managed file carries a newer template revision than this
+        // release ships: another device runs a newer release. This device
+        // keeps the file as it is; updating Open Second Brain here clears it.
+        code: "managed-file-from-newer-release",
+        issueClass: "Brain manual written by a newer release",
         nextCommand: "o2b brain upgrade --dry-run",
         autoRepairable: false,
       },
@@ -662,6 +693,17 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         // definition.
         code: "permissions-agent-denied",
         issueClass: "permissions document denies the locally configured agent's write",
+        nextCommand: WRITE_REFUSAL_NEXT_COMMAND,
+        autoRepairable: false,
+      },
+      {
+        // Review finding F461. A store-only machine reads its permissions
+        // document from the `permissions.document` shared setting; a
+        // legacy file with deny rules the setting does not hold is a
+        // policy the operator believes in force and is not. The exit is the
+        // same `show` loop: it names the document the gates read now.
+        code: "permissions-legacy-only",
+        issueClass: "deny rules in a legacy permissions file no reader sees once switched",
         nextCommand: WRITE_REFUSAL_NEXT_COMMAND,
         autoRepairable: false,
       },
@@ -1007,6 +1049,14 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         code: "vault-walk-entry-skipped",
         issueClass: "subtree the doctor could not read",
         nextCommand: "o2b brain doctor",
+        autoRepairable: false,
+      },
+      {
+        // The structural form; the finding's message carries the concrete
+        // command with the shard as `<partition>/<shard>` and its offset.
+        code: STORE_SHARD_CORRUPT_LINE_CODE,
+        issueClass: "a bad line in the middle of a held store shard",
+        nextCommand: "o2b store shard quarantine <partition-shard> --offset <n>",
         autoRepairable: false,
       },
       // --- Skill-accept transaction refusals (no-dead-ends, phase 3) ---
@@ -1512,7 +1562,7 @@ export interface PlanRepairOptions {
  * the same findings, each with its next-command hint.
  */
 export function planRepair(vault: string, opts: PlanRepairOptions = {}): RepairPlan {
-  const issues = opts.issues ?? collectDoctorIssues(vault, opts.readable, opts.dbPath);
+  const issues = opts.issues ?? collectDoctorIssues(vault, opts.readable, opts.dbPath, false);
 
   const fixes: RepairItem[] = [];
   for (const fixer of FIXERS) {
@@ -1549,10 +1599,12 @@ function collectDoctorIssues(
   vault: string,
   readable: ((rel: string) => boolean) | undefined,
   dbPath: string | undefined,
+  withholdsPrivate: boolean,
 ): ReadonlyArray<DoctorIssue> {
   const doctor = runDoctor(vault, {
     ...(readable !== undefined ? { readable } : {}),
     ...(dbPath !== undefined ? { dbPath } : {}),
+    withholdsPrivate,
   });
   return [...doctor.errors, ...doctor.warnings];
 }
@@ -1711,7 +1763,7 @@ export interface DoctorIssueNaming {
  * `pref-x` names the reserved `ret-x` it became.
  */
 export function doctorIssueRefs(
-  vault: string,
+  vault: string | null,
   issue: DoctorIssueNaming,
 ): ReadonlyArray<ArtifactRef> {
   return [
@@ -1725,8 +1777,8 @@ export function doctorIssueRefs(
 }
 
 /** The in-vault form of a path, or the path itself when it lies outside. */
-function vaultRelativeOrSelf(vault: string, path: string): string {
-  return pathIsInside(path, vault) ? vaultRelative(path, vault) : path;
+function vaultRelativeOrSelf(vault: string | null, path: string): string {
+  return vault !== null && pathIsInside(path, vault) ? vaultRelative(path, vault) : path;
 }
 
 /**
@@ -1769,8 +1821,9 @@ export function applyRepair(vault: string, opts: ApplyRepairOptions): RepairOutc
         ...(opts.dbPath !== undefined ? { dbPath: opts.dbPath } : {}),
       })
     : planRepair(vault, {
-        issues: view.keep(collectDoctorIssues(vault, opts.readable, opts.dbPath), (i) =>
-          doctorIssueRefs(vault, i),
+        issues: view.keep(
+          collectDoctorIssues(vault, opts.readable, opts.dbPath, view.withholdsPrivate === true),
+          (i) => doctorIssueRefs(vault, i),
         ),
       });
   const fixes = view.keep(plan.fixes, repairRefs);

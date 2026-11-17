@@ -22,7 +22,7 @@
  * the next does not.
  */
 
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -39,8 +39,22 @@ import { acquireLogLock, appendLogEvent } from "../../src/core/brain/log.ts";
 import { brainDirs } from "../../src/core/brain/paths.ts";
 import { attestationsDir } from "../../src/core/brain/attestation/record.ts";
 import { writeVaultIdentity } from "../../src/core/brain/vault-identity.ts";
-import { runCli } from "../helpers/run-cli.ts";
+import { runCli as runCliRaw, type RunCliOptions } from "../helpers/run-cli.ts";
+
+/**
+ * keygen and sign read a passphrase from stdin when stdin is not a
+ * terminal. Run in process they would read the test runner's own stdin,
+ * which a runner started from a background shell holds open forever, so
+ * every run here gets an explicit stdin: empty unless the test pipes one
+ * (the operator who pipes nothing, the raw seed).
+ */
+const runCli = (args: ReadonlyArray<string>, opts: RunCliOptions = {}) =>
+  runCliRaw(args, { stdin: "", ...opts });
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
 import { fakeCredential } from "../helpers/fake-credentials.ts";
+
+// Every test here runs the CLI, most of them several times.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 /**
  * Passphrases assembled at runtime so no source line carries a literal

@@ -34,7 +34,7 @@
  */
 
 import { homedir } from "node:os";
-import { join, win32 } from "node:path";
+import { join, posix, win32 } from "node:path";
 
 /** Injected view of the environment the resolvers read. */
 export interface PlatformDirsEnv {
@@ -99,7 +99,9 @@ function baseDir(kind: BaseKind, source: PlatformDirsEnv): string {
   const xdg = nonEmpty(source.env[XDG_VARIABLE[kind]]);
   if (xdg) return xdg;
   if (isWindows(source)) return windowsLocalAppData(source);
-  return join(source.home, ...POSIX_DEFAULT[kind]);
+  // A POSIX layout keeps POSIX separators even when resolved on a Windows
+  // host (an injected source), so callers joining onto it stay consistent.
+  return posix.join(source.home, ...POSIX_DEFAULT[kind]);
 }
 
 /**
@@ -163,4 +165,14 @@ export function describeBaseDir(kind: BaseKind, platform: string = process.platf
   const xdg = XDG_VARIABLE[kind];
   if (platform === "win32") return `%${xdg}% if set, else %LOCALAPPDATA%`;
   return `\${${xdg}:-~/${POSIX_DEFAULT[kind].join("/")}}`;
+}
+
+/**
+ * The stand-in vault path of a machine with no vault (task 2.10): a path
+ * below the state root that is never created. Code that takes a vault
+ * string is handed it so every store-only branch runs; a resolver of
+ * machine state treats it as no vault at all.
+ */
+export function noVaultRoot(): string {
+  return join(stateRootDir(processDirsEnv()), "no-vault");
 }

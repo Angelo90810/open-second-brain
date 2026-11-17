@@ -30,8 +30,9 @@
 
 import { listContinuityRecords } from "./continuity/store.ts";
 import { HOST_MEMORY_WRITE_KIND } from "./host-memory-write.ts";
-import { listLogDates, readLogDay } from "./log-jsonl.ts";
 import { summarizeRecallTelemetry, type RecallTelemetryMode } from "./recall-telemetry.ts";
+import { logDayReader } from "./log-days.ts";
+import { withoutPrivateEntries } from "./log-events-at-reach.ts";
 
 /** Countable memory-write categories the meter folds against reads. */
 export type MemoryWriteKind = "feedback" | "apply_evidence" | "note" | "host_memory_write";
@@ -53,6 +54,11 @@ export interface MemoryWriteFilter {
   readonly since?: string;
   /** Inclusive upper ISO-8601 timestamp bound. */
   readonly until?: string;
+  /**
+   * The caller is below local reach: a write logged by an event of the
+   * store's `private` partition is not counted. Default false.
+   */
+  readonly withholdsPrivate?: boolean;
 }
 
 export interface MemoryWriteSummary {
@@ -81,10 +87,15 @@ export function summarizeMemoryWrites(
   // before reading them, then bound each entry by its exact timestamp.
   const sinceDay = filter.since?.slice(0, 10);
   const untilDay = filter.until?.slice(0, 10);
-  for (const date of listLogDates(vault)) {
+  // The day files, or the store's log events once switched.
+  const log = logDayReader(vault);
+  for (const date of log.dates) {
     if (sinceDay !== undefined && date < sinceDay) continue;
     if (untilDay !== undefined && date > untilDay) continue;
-    for (const entry of readLogDay(vault, date).entries) {
+    for (const entry of withoutPrivateEntries(
+      log.day(date).entries,
+      filter.withholdsPrivate === true,
+    )) {
       const kind = LOG_EVENT_TO_WRITE_KIND[entry.eventType];
       if (kind === undefined) continue;
       if (!withinBounds(entry.timestamp, filter)) continue;
@@ -127,6 +138,8 @@ export interface MemoryCostMeterOptions {
   readonly weights?: Partial<MemoryCostWeights>;
   /** Ratio above which the period is flagged write-heavy. Default 1. */
   readonly writeHeavyRatio?: number;
+  /** See {@link MemoryWriteFilter.withholdsPrivate}. Default false. */
+  readonly withholdsPrivate?: boolean;
 }
 
 export interface MemoryCostMeter {
@@ -165,7 +178,10 @@ export function computeMemoryCostMeter(
     ...(options.since !== undefined ? { since: options.since } : {}),
     ...(options.until !== undefined ? { until: options.until } : {}),
   };
-  const writes = summarizeMemoryWrites(vault, filter);
+  const writes = summarizeMemoryWrites(vault, {
+    ...filter,
+    withholdsPrivate: options.withholdsPrivate === true,
+  });
   const readSummary = summarizeRecallTelemetry(vault, filter);
   const reads = { total: readSummary.total, by_mode: readSummary.by_mode };
 

@@ -20,6 +20,7 @@ import {
   cmdBrainTension,
   cmdBrainDream,
   cmdBrainApplyEvidence,
+  cmdBrainLessons,
   cmdBrainDigest,
   cmdBrainIntentReview,
   cmdBrainRetention,
@@ -72,6 +73,7 @@ import {
   cmdBrainCodec,
   cmdBrainSources,
   cmdBrainSchema,
+  cmdBrainSettings,
   cmdBrainGraphExport,
   cmdBrainGraphImport,
   cmdBrainBankExport,
@@ -109,6 +111,8 @@ import {
   cmdBrainPayload,
   cmdBrainReceipts,
   cmdBrainStorage,
+  cmdBrainChanges,
+  cmdBrainMigrateStore,
   cmdBrainSessionSummary,
   cmdBrainIdeaLineage,
   cmdBrainNoteHistory,
@@ -283,6 +287,8 @@ export async function handleBrainSubcommand(argv: ReadonlyArray<string>): Promis
         return await cmdBrainPin(rest);
       case "unpin":
         return await cmdBrainUnpin(rest);
+      case "lessons":
+        return await cmdBrainLessons(rest);
       case "state":
         return await cmdBrainState(rest);
       case "set-primary":
@@ -359,6 +365,8 @@ export async function handleBrainSubcommand(argv: ReadonlyArray<string>): Promis
         return await cmdBrainSources(rest);
       case "schema":
         return await cmdBrainSchema(rest);
+      case "settings":
+        return await cmdBrainSettings(rest);
       case "graph-export":
         return await cmdBrainGraphExport(rest);
       case "graph-import":
@@ -415,6 +423,10 @@ export async function handleBrainSubcommand(argv: ReadonlyArray<string>): Promis
         return await cmdBrainReceipts(rest);
       case "storage":
         return await cmdBrainStorage(rest);
+      case "changes":
+        return await cmdBrainChanges(rest);
+      case "migrate-store":
+        return await cmdBrainMigrateStore(rest);
       case "session-summary":
         return await cmdBrainSessionSummary(rest);
       case "idea-lineage":

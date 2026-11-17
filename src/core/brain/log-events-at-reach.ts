@@ -91,6 +91,9 @@ function trimTransitions<K extends string>(
  * is the reason this per-event rule exists.
  */
 export function eventAtReach(refs: ArtifactRefView, ev: TemporalEvent): TemporalEvent | null {
+  // An event of the store's `private` partition is withheld below local
+  // reach whatever it names, as in `logEntryAtReach`.
+  if (refs.withholdsPrivate === true && ev.fromPrivatePartition === true) return null;
   if (refs.filtersNothing) return ev;
   if (!isBrainLogRel(ev.source.path) && !refs.visible(ev.source.path)) return null;
   if (ev.kind === BRAIN_LOG_EVENT_KIND.applyEvidence) {
@@ -156,6 +159,9 @@ export function dreamEntryAtReach(
  * page once `ret-x` was the reserved page on disk, and passed.
  */
 export function logEntryAtReach(refs: ArtifactRefView, entry: BrainLogEntry): BrainLogEntry | null {
+  // An event of the store's `private` partition is withheld below local
+  // reach whatever it names, as a private page is (review finding F333).
+  if (refs.withholdsPrivate === true && entry.fromPrivatePartition === true) return null;
   if (refs.filtersNothing) return entry;
   const shown = dreamEntryAtReach(refs, entry);
   if (shown === null) return null;
@@ -170,6 +176,23 @@ export function logEntriesAtReach(
   refs: ArtifactRefView,
   entries: ReadonlyArray<BrainLogEntry>,
 ): ReadonlyArray<BrainLogEntry> {
-  if (refs.filtersNothing) return entries;
-  return entries.flatMap((entry) => logEntryAtReach(refs, entry) ?? []);
+  // An event of the store's `private` partition is withheld below local
+  // reach whatever it names, as a private page is (review finding F333).
+  const shown = withoutPrivateEntries(entries, refs.withholdsPrivate === true);
+  if (refs.filtersNothing) return shown;
+  return shown.flatMap((entry) => logEntryAtReach(refs, entry) ?? []);
+}
+
+/**
+ * The entries without those of the store's `private` partition when
+ * `withholds` is set (a caller below local reach), all of them otherwise:
+ * the one filter every counting reader applies before it counts, so a
+ * number or timestamp shown to a remote caller reads as if the withheld
+ * events did not exist.
+ */
+export function withoutPrivateEntries<T extends { readonly fromPrivatePartition?: true }>(
+  entries: ReadonlyArray<T>,
+  withholds: boolean,
+): ReadonlyArray<T> {
+  return withholds ? entries.filter((e) => e.fromPrivatePartition !== true) : entries;
 }

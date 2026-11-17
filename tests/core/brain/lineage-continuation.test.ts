@@ -13,7 +13,7 @@
  * never reaches a recorded field.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -44,6 +44,10 @@ import {
 import { captureSessionLifecycleEvent } from "../../../src/core/brain/session-lifecycle.ts";
 import { bootstrapBrain } from "../../../src/core/brain/init.ts";
 import { tempDirs } from "../../helpers/temp-dir.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 // Every test's throwaway workspace is minted through the tracked helper
 // so a directory is owned twice over: the afterEach removes the current
@@ -57,6 +61,8 @@ let tmp: string;
 
 beforeEach(() => {
   tmp = mkTemp("o2b-continuation-");
+  // A legacy Brain/ tree: an unswitched machine (a vault without one is store-only).
+  mkdirSync(join(tmp, "Brain"), { recursive: true });
 });
 
 afterEach(() => {
@@ -640,7 +646,8 @@ describe("captureSessionLifecycleEvent — fail-closed, fail-soft, credential-fr
 
   beforeEach(() => {
     vault = join(tmp, "vault");
-    mkdirSync(vault, { recursive: true });
+    // A legacy Brain/ tree: an unswitched machine (a vault without one is store-only).
+    mkdirSync(join(vault, "Brain"), { recursive: true });
     bootstrapBrain(vault);
     repo = initRepo(join(tmp, "repo"), { remote: SECRET_REMOTE });
   });
@@ -723,7 +730,7 @@ describe("captureSessionLifecycleEvent — fail-closed, fail-soft, credential-fr
     );
     expect("lineage" in result).toBe(false);
     // The refusal is not merely silent-and-flat: it is on the record.
-    const audit = readFileSync(result.audit_path, "utf8");
+    const audit = readFileSync(result.audit_path!, "utf8");
     expect(audit).toContain(DEGRADATION_CODE.sessionLinkAbstained);
     expect(audit).toContain(CRUTCH_ABSTENTION.ambiguous);
   });
@@ -744,7 +751,7 @@ describe("captureSessionLifecycleEvent — fail-closed, fail-soft, credential-fr
       handle.release();
     }
     const audit = JSON.parse(
-      readFileSync(result.audit_path, "utf8").trim().split("\n").at(-1)!,
+      readFileSync(result.audit_path!, "utf8").trim().split("\n").at(-1)!,
     ) as { details: Record<string, unknown> };
     const dropped = audit.details["lineage_dropped"] as string[];
     expect(dropped).toBeDefined();
@@ -758,6 +765,6 @@ describe("captureSessionLifecycleEvent — fail-closed, fail-soft, credential-fr
       { hook_event_name: "UserPromptSubmit", session_id: "d-2", cwd: repo, prompt: "hi" },
       { agent: "tester", now: new Date(T0) },
     );
-    expect(readFileSync(result.audit_path, "utf8")).not.toContain("lineage_dropped");
+    expect(readFileSync(result.audit_path!, "utf8")).not.toContain("lineage_dropped");
   });
 });

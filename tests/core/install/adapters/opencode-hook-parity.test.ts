@@ -67,6 +67,8 @@ const DECLARED_OPENCODE_DIVERGENCES: Readonly<Record<string, string>> = Object.f
     "opencode exposes no session-start hook to a loaded plugin; the opt-in backlog nudge shim has no carrier outside Claude Code / Codex",
   "SessionStart:log-catchup":
     "opencode exposes no session-start hook to a loaded plugin; the opt-in log catch-up shim has no carrier outside Claude Code / Codex",
+  "SessionStart:view-render":
+    "opencode exposes no session-start hook to a loaded plugin; the human view render runs there at the end of every dream pass instead",
   "SessionEnd:gap-promote":
     "opencode exposes no session-end hook; gap promotion runs only where the Claude Code lane fires it",
   "SubagentStop:session-capture":
@@ -110,6 +112,7 @@ const COVERAGE_FAMILIES: ReadonlyArray<{
     rows: [
       "UserPromptSubmit:recall-inject",
       "UserPromptSubmit:nav-inject",
+      "UserPromptSubmit:neighbour-updates",
       "UserPromptSubmit:counterparty-brief",
       "UserPromptSubmit:reground-deliver",
     ],
@@ -117,6 +120,10 @@ const COVERAGE_FAMILIES: ReadonlyArray<{
       /chat\.message|session\.hook\("prompt"/,
       /"recall-inject"/,
       /"nav-inject"/,
+      // Default-on on every host: the relay entry must carry the
+      // default-on form, or opencode would never spawn it unset. The
+      // behaviour itself is pinned in tests/plugins/opencode-plugin.test.ts.
+      /name: "neighbour-updates",[^}]*defaultOn: true/,
       /"counterparty-brief"/,
       /"reground-deliver"/,
     ],
@@ -255,6 +262,7 @@ describe("opencode plugin carries the plugin's hooks", () => {
       "PreToolUse:pretool-host-backup",
       "UserPromptSubmit:recall-inject",
       "UserPromptSubmit:nav-inject",
+      "UserPromptSubmit:neighbour-updates",
       "UserPromptSubmit:counterparty-brief",
       "UserPromptSubmit:reground-deliver",
       "SessionStart:active-inject",

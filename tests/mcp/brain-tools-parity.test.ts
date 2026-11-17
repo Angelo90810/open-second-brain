@@ -78,7 +78,12 @@
  * `brain_intake_pledges` (the agent-executed extraction intake over the
  * same family: typed pledge extractions posted against a source page,
  * validated whole before any write, counterparty names anchored
- * server-side against the canonical entity registry).
+ * server-side against the canonical entity registry); the brain store
+ * release added `brain_changes` (the change probe: record ids new since a
+ * watermark, grouped by partition, stream, scope and topic, answered from
+ * the index after catch-up, local reach only); the shared-settings change
+ * added `brain_settings` (get, list, set or unset one shared brain setting;
+ * a write carries agent authority and never outvotes the operator).
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -105,6 +110,7 @@ const FROZEN_BRAIN_TOOL_NAMES = [
   "brain_benchmark",
   "brain_bridges",
   "brain_brief",
+  "brain_changes",
   "brain_claims",
   "brain_clusters",
   "brain_codegraph_report",
@@ -176,7 +182,11 @@ const FROZEN_BRAIN_TOOL_NAMES = [
   "brain_session_expand",
   "brain_session_grep",
   "brain_session_summary",
+  "brain_settings",
   "brain_skill_proposals",
+  // benchmark-gated rewrite status (t_635e3e72, agent-presence): read-only
+  // ids-and-rates status beside brain_skill_proposals; never accepts, never scores
+  "brain_skill_rewrite_status",
   "brain_sources",
   "brain_stale_scan",
   "brain_status",
@@ -185,6 +195,7 @@ const FROZEN_BRAIN_TOOL_NAMES = [
   "brain_tension",
   "brain_tiers",
   "brain_token_impact",
+  "brain_topic",
   "brain_trigger",
   "brain_truth",
   "brain_tune",
@@ -305,11 +316,13 @@ const FROZEN_BRAIN_WRITE_TOOL_NAMES = [
   "brain_secrets",
   "brain_session_checkpoint",
   "brain_session_summary",
+  "brain_settings",
   "brain_skill_proposals",
   "brain_switch_vault",
   "brain_tension",
   "brain_tiers",
   "brain_token_impact",
+  "brain_topic",
   "brain_trigger",
   "brain_truth",
   "brain_tune",

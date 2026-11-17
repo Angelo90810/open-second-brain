@@ -1,5 +1,13 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +33,10 @@ import { brainGapTasksDir } from "../../src/core/brain/paths.ts";
 import { RETRIEVAL_DEGRADATION } from "../../src/core/search/retrieval-trail.ts";
 import { writeFrontmatterAtomic } from "../../src/core/vault.ts";
 import { homeEnv } from "../helpers/platform.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 const HOOKS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "hooks");
 
@@ -33,6 +45,8 @@ let configHome: string;
 
 beforeEach(() => {
   vault = mkdtempSync(join(tmpdir(), "o2b-hook-gap-vault-"));
+  // A legacy Brain/ tree: an unswitched machine (a vault without one is store-only).
+  mkdirSync(join(vault, "Brain"), { recursive: true });
   configHome = mkdtempSync(join(tmpdir(), "o2b-hook-gap-cfg-"));
 });
 

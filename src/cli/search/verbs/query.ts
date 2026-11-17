@@ -29,10 +29,12 @@ import {
   resolveConfig,
   resolveConfigPath,
   VAULT_FLAGS,
+  requireSearchVault,
 } from "../helpers.ts";
 import { CLI_TRANSPORT_REACH } from "../../transport-reach.ts";
 import { FTS_MATCH_MODES, isFtsMatchMode } from "../../../core/search/fts-match-mode.ts";
 import { SEARCH_KINDS, isSearchKind } from "../../../core/search/property-pushdown.ts";
+import { SEARCH_SOURCES, isSearchSource } from "../../../core/search/brain-store/constants.ts";
 import {
   DISCLOSURE_MODE,
   DISCLOSURE_MODES,
@@ -128,8 +130,17 @@ export async function cmdSearchQuery(argv: ReadonlyArray<string>): Promise<numbe
     throw new CliError(`--kind must be one of ${SEARCH_KINDS.join(", ")}`);
   }
   const kind = kindRaw;
+  const sourceRaw = flagString(flags, "source");
+  if (sourceRaw !== undefined && !isSearchSource(sourceRaw)) {
+    throw new CliError(`--source must be one of ${SEARCH_SOURCES.join(", ")}`);
+  }
+  const source = sourceRaw;
 
   const cfg = resolveConfig(flags);
+  // `--global` needs the vault: refused before the refresh or any search.
+  const globalVault = flagBoolean(flags, "global")
+    ? requireSearchVault(cfg, "search query --global")
+    : null;
 
   if (flagBoolean(flags, "auto-refresh")) {
     try {
@@ -172,6 +183,7 @@ export async function cmdSearchQuery(argv: ReadonlyArray<string>): Promise<numbe
     keywordOnly: flagBoolean(flags, "keyword-only"),
     pathPrefix: flagString(flags, "path"),
     ...(kind !== undefined ? { kind } : {}),
+    ...(source !== undefined ? { source } : {}),
     ...(matchMode !== undefined ? { matchMode } : {}),
     ...(properties !== undefined ? { properties } : {}),
     ...(degreeFilters !== undefined ? { degreeFilters } : {}),
@@ -202,9 +214,10 @@ export async function cmdSearchQuery(argv: ReadonlyArray<string>): Promise<numbe
   };
   // Cross-vault union (t_72a22658): explicit per-call opt-in fans the
   // query out over profiles and read-only sources with origin labels.
-  const outcome = isGlobal
-    ? await searchAcrossVaults(resolveConfigPath(flags), cfg.vault, searchOpts, cfg)
-    : await search(cfg, searchOpts);
+  const outcome =
+    globalVault !== null
+      ? await searchAcrossVaults(resolveConfigPath(flags), globalVault, searchOpts, cfg)
+      : await search(cfg, searchOpts);
 
   // Retrieval receipts (what-the-index-already-knew, task F): --explain
   // appends the decision trace and the trust assessment the search

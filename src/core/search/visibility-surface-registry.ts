@@ -176,7 +176,7 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
     kind: K.mcpTool,
     category: C.covered,
     reason:
-      "queryByPreference / queryByTopic (core/brain/query.ts) return Brain records by id, so this " +
+      "queryByPreference / queryByRuleTopic (core/brain/query.ts) return Brain records by id, so this " +
       "is root C over reference-shaped rows. The topic mode carries the reach into the SELECTION, " +
       "because a topic resolves to exactly one preference and filtering afterwards would report a " +
       "topic as having no rule whenever a reserved one sorted first; the signals, the log events " +
@@ -481,7 +481,8 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
     kind: K.mcpTool,
     category: C.excluded,
     reason:
-      "swept into population because admin-tools.ts (its home file) also imports parseFrontmatter " +
+      "swept into population because admin-policy-tools.ts, which admin-tools.ts (its home file) " +
+      "imports, also imports parseFrontmatter " +
       "and Store for brain_labels/brain_tiers/brain_maintenance beside it - the handler itself " +
       "returns only secret names and run results, never a note path, title, or body. Listed for " +
       "completeness of the file-level population rule rather than as a real disclosure.",
@@ -780,6 +781,17 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
       "lists are filtered at the handler and `pages_scanned` is recomputed from them whenever a " +
       "rule is live, because a corpus size taken before the filter states how many pages were " +
       "withheld.",
+  },
+  {
+    surface: "brain_skill_rewrite_status",
+    kind: K.mcpTool,
+    category: C.excluded,
+    reason:
+      "reads one skill's benchmark-gated rewrite lane status: the frozen benchmark receipt, " +
+      "the grade ledger's verdict-and-rate rows for that skill, and the slug of a staged " +
+      "proposal awaiting a human accept. It names no note path, title or body at any reach - " +
+      "the same ids-and-rates discipline as the grade record itself - so there is no page " +
+      "content for a read root to withhold, and MCP never accepts or scores regardless.",
   },
   {
     surface: "brain_procedural_memory",
@@ -1408,7 +1420,7 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
       "reach, named for the resolved page's own derived provenance; local keeps the bytes.",
   },
   {
-    surface: "osb://topic/{slug}",
+    surface: "osb://rule-topic/{slug}",
     kind: K.mcpResource,
     category: C.covered,
     reason:
@@ -1418,6 +1430,16 @@ export const VISIBILITY_SURFACE_REGISTRY: ReadonlyArray<VisibilitySurfaceEntry> 
       "one happened to sort ahead of it. Delivery shaping (delivery-trust, lane A): the " +
       "synthesis is fenced at remote reach, named for the governing rule's derived provenance " +
       "(the absent-rule probe, fail closed); local keeps the bytes.",
+  },
+  {
+    surface: "osb://topic/{id}",
+    kind: K.mcpResource,
+    category: C.covered,
+    reason:
+      "a topic is a store record family with no owner line: its privacy is its partition. A read " +
+      "below local reach folds the shared partition alone, so a private topic answers byte for " +
+      "byte as an absent one (topic ids are ULIDs, not guessable, and still never confirmed), and " +
+      "a private item of a shared topic is left off the page.",
   },
   {
     surface: "osb://log/{date}",
@@ -1533,16 +1555,6 @@ const D = DIRECT_VAULT_READ_CATEGORY;
  */
 export const DIRECT_VAULT_READ_REGISTRY: ReadonlyArray<DirectVaultReadEntry> = Object.freeze([
   {
-    file: "src/mcp/brain/knowledge-tools.ts",
-    category: D.guarded,
-    reason:
-      "brain_clusters lists Brain/clusters/*.md with readdirSync and brain_bridges reads " +
-      "Brain/proposals/bridges.md with readFileSync, both by path and neither through a read " +
-      "root. Both now ask reachView(ctx.vault, contextReach(ctx)) about each path before its " +
-      "title or body crosses the boundary, which is the same decision isPathReadableAtReach " +
-      "makes for a ranked result.",
-  },
-  {
     file: "src/cli/onboarding.ts",
     category: D.discloses_nothing,
     reason:
@@ -1559,24 +1571,5 @@ export const DIRECT_VAULT_READ_REGISTRY: ReadonlyArray<DirectVaultReadEntry> = O
       "atomically. It is a maintenance lane in the operator's own shell, and one that must see " +
       "every page: a repair that stopped reading reserved pages would rewrite the links around " +
       "them and leave the graph pointing at nothing.",
-  },
-  {
-    file: "src/cli/brain/verbs/clusters.ts",
-    category: D.discloses_nothing,
-    reason:
-      "the CLI mirror of brain_clusters, readdirSyncing Brain/clusters for the staleness " +
-      "fast-path and the listing. It runs in the operator's own shell, which the CLI answers at " +
-      "local reach through CLI_TRANSPORT_REACH, so the reserved-token rule admits every page " +
-      "here by construction rather than by omission.",
-  },
-  {
-    file: "src/cli/bootstrap/receipt.ts",
-    category: D.discloses_nothing,
-    reason:
-      "reads and writes the bootstrap receipt at .open-second-brain/bootstrap.lock.json: " +
-      "schema version, target names, owned keys, a token NAME and non-secret PREFIX, and a " +
-      "timestamp - never page content, and never token material. It runs in the operator's " +
-      "own shell, so the reach question does not arise, and no page's reservation could " +
-      "cover what it hands back.",
   },
 ]);

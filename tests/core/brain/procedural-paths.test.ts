@@ -6,12 +6,15 @@ import { join } from "node:path";
 import {
   procedurePath,
   proceduralMemoryIndexPath,
-  proceduralMemoryUsagePath,
   proceduralRecurrencePath,
   skillProposalAcceptedPath,
   skillProposalPendingPath,
   skillProposalRejectedPath,
 } from "../../../src/core/brain/paths.ts";
+import { useUnshardedLegacyLog } from "../../helpers/device-id.ts";
+
+// The legacy day log and ledgers are read under their un-sharded names.
+useUnshardedLegacyLog();
 
 describe("procedural learning paths", () => {
   const tmpRoots: string[] = [];
@@ -31,7 +34,6 @@ describe("procedural learning paths", () => {
     const rejected = skillProposalRejectedPath(vault, "release-notes");
     const procedure = procedurePath(vault, "release-notes");
     const index = proceduralMemoryIndexPath(vault);
-    const usage = proceduralMemoryUsagePath(vault);
     const recurrence = proceduralRecurrencePath(vault);
 
     expect(pending).toBe(
@@ -45,7 +47,6 @@ describe("procedural learning paths", () => {
     );
     expect(procedure).toBe(join(vault, "Brain", "procedures", "proc-release-notes.md"));
     expect(index).toBe(join(vault, "Brain", "procedural-memory", "index.json"));
-    expect(usage).toBe(join(vault, "Brain", "procedural-memory", "usage.jsonl"));
     expect(recurrence).toBe(join(vault, "Brain", "log", "recurrence-support.jsonl"));
   });
 

@@ -588,6 +588,35 @@ export const BRAIN_LOG_EVENT_KIND = {
    * target wrote nothing and records nothing.
    */
   noteWrite: "note-write",
+  /**
+   * `lessons-approved` (operator-approved lesson promotion, t_1e952e43) -
+   * the operator approved one preference-derived lesson for promotion into
+   * the managed lessons block of the agent rules files. Operator CLI only:
+   * no agent-facing path can mint this event, and the approval pins the
+   * approved text by its content hash. Payload carries the `pref` wikilink,
+   * the `targets` (the rules files the approval covers), the
+   * `approved_content_hash`, the `consent` verdict (`yes-flag` or
+   * `interactive-yes`), and the `agent`.
+   */
+  lessonsApproved: "lessons-approved",
+  /**
+   * `lessons-denied` (operator-approved lesson promotion, t_1e952e43) - the
+   * operator denied one lesson: the ledger keeps the record and the lesson
+   * is suppressed from every future promotion until re-approved. Payload
+   * carries the `pref` wikilink, the `consent` verdict, and the `agent`.
+   * No rules file is written on a denial.
+   */
+  lessonsDenied: "lessons-denied",
+  /**
+   * `lessons-promoted` (operator-approved lesson promotion, t_1e952e43) - a
+   * `refresh-blocks` apply rewrote the lessons block of at least one agent
+   * rules file from the qualified and approved lesson set. Payload carries
+   * the `targets` that changed, the promoted `prefs` (one wikilink per
+   * line), and the `agent`. Derived-state maintenance only: the write goes
+   * through the shared rules-block writer under a consent verdict, and a
+   * no-op refresh emits nothing.
+   */
+  lessonsPromoted: "lessons-promoted",
 } as const;
 export type BrainLogEventKind = (typeof BRAIN_LOG_EVENT_KIND)[keyof typeof BRAIN_LOG_EVENT_KIND];
 
@@ -745,6 +774,11 @@ export const BRAIN_SNAPSHOT_REASON = Object.freeze({
    * Hermes context compaction, which rewrites no ledger.
    */
   receiptCompaction: "receipt-compaction",
+  /**
+   * Pre-import point taken before `o2b brain migrate-store` moves the
+   * legacy brain into the brain store (design D11 step 3).
+   */
+  storeMigration: "store-migration",
   /** Deferred: a session boundary. No producer in this release. */
   sessionBoundary: "session-boundary",
   /** Deferred: a plan boundary. No producer in this release. */
@@ -1634,6 +1668,21 @@ export interface BrainActiveConfig {
    * policy.ts applies.
    */
   readonly inject_budget_chars?: number;
+  /**
+   * Most topic heads the session start digest shows (task 4.2). Absent
+   * means 12.
+   */
+  readonly topic_heads_max?: number;
+  /**
+   * Characters for the whole topic heads block of the session start
+   * digest. Absent means 1600.
+   */
+  readonly topic_heads_max_chars?: number;
+  /**
+   * Characters for the pinned context block of the session start
+   * digest. Absent means 1200.
+   */
+  readonly pinned_max_chars?: number;
   /**
    * Character cap for the operator-authored `Brain/standing-rules.md`
    * block. Separate from `inject_budget_chars` because the standing

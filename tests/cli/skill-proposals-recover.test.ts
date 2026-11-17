@@ -9,7 +9,7 @@
  * exact file on stderr rather than leaving an errno to trace.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -24,11 +24,17 @@ import {
 import { writeSkillAcceptJournal } from "../../src/core/brain/skill-accept-journal.ts";
 import { _resetHeldLocksForTests } from "../../src/core/brain/sync-lockfile.ts";
 import { runCli } from "../helpers/run-cli.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 let vault: string;
 
 beforeEach(() => {
   vault = mkdtempSync(join(tmpdir(), "o2b-recover-cli-"));
+  // A legacy Brain/ tree: an unswitched machine (a vault without one is store-only).
+  mkdirSync(join(vault, "Brain"), { recursive: true });
 });
 
 afterEach(() => {

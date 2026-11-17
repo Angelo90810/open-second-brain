@@ -3,9 +3,9 @@
  * task J).
  *
  * The expiry filter has taken an as-of instant since C5 - `filterExpired`
- * defaults `now` to the wall clock and `queryByTopic` threads a `now`
+ * defaults `now` to the wall clock and `queryByRuleTopic` threads a `now`
  * option straight into it - and no surface ever passed one. The CLI
- * called `queryByTopic(vault, topic)` with no options object at all, so
+ * called `queryByRuleTopic(vault, topic)` with no options object at all, so
  * "what did the brain hold as of last month" was unaskable from the one
  * surface that enforces expiry, and `--show-expired` (which MCP has had
  * since C5) did not exist on the CLI either.
@@ -16,7 +16,7 @@
  * order, indentation or trailing newline fails here.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +24,10 @@ import { join } from "node:path";
 import { bootstrapBrain } from "../../src/core/brain/init.ts";
 import { writeSignal, type WriteSignalInput } from "../../src/core/brain/signal.ts";
 import { runCli } from "../helpers/run-cli.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 const TOPIC = "deploy";
 /** The lapsed signal's expiration; every probe instant is chosen around it. */

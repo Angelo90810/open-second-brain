@@ -55,10 +55,19 @@ import { join } from "node:path";
 
 import { sha256Hex } from "../integrity/digest.ts";
 import { compareStamps, type StampMismatch } from "../integrity/stamp.ts";
-import { AUDIT_WEEK_SHARD_GRAMMAR } from "../reliability/audit.ts";
+import { AUDIT_STORE_LEDGER_NAME, AUDIT_WEEK_SHARD_GRAMMAR } from "../reliability/audit.ts";
+import { DUAL_WRITE_LEDGERS } from "../store/dual-write-records.ts";
+import { readLedgerRows } from "../store/read/ledger-rows.ts";
+import { isStoreOnly } from "../store/store-only.ts";
 import { listShardedFiles } from "./ledger-shards.ts";
 import { brainDirs } from "./paths.ts";
-import { readSchemaPackSource, renderSchemaBlock, type SchemaPack } from "./schema-pack.ts";
+import {
+  readSchemaPackSource,
+  readStoreSchemaPack,
+  renderSchemaBlock,
+  type SchemaPack,
+} from "./schema-pack.ts";
+import type { SchemaDecidingRecord } from "./schema-pack-store.ts";
 
 /** The three answers a schema-pack integrity read can honestly give. */
 export const SCHEMA_PACK_INTEGRITY = Object.freeze({
@@ -196,6 +205,12 @@ export interface SchemaPackIntegrity {
   /** Present exactly when `status` is `unverified`. */
   readonly unverified_reason?: SchemaPackUnverifiedReason;
   /**
+   * Set when the pack is no single apply's output but a merge of audited
+   * applies from several devices (task 3.12): every record that decides it
+   * is one an audit row attests, so it is `ok` though `expected` differs.
+   */
+  readonly merged?: true;
+  /**
    * Non-empty exactly when `status` is `modified`, carrying the shared
    * mismatch shape so it renders through `formatStampMismatch`.
    */
@@ -227,6 +242,9 @@ export function computeSchemaPackDigest(pack: SchemaPack): string {
  * as a clean one.
  */
 export function readRecordedSchemaPackDigest(vault: string): RecordedSchemaPackDigest {
+  // A store-only machine audits its applies to the store's audit ledger
+  // (design D14 item 1); the rows of this trail carry its directory name.
+  if (isStoreOnly({ vault })) return newestRecordedDigest(storeAuditRecords(vault));
   const dir = schemaMutationAuditDir(vault);
   if (!existsSync(dir)) return notFound(SCHEMA_PACK_UNVERIFIED_REASON.noApplyRecorded);
 
@@ -239,7 +257,7 @@ export function readRecordedSchemaPackDigest(vault: string): RecordedSchemaPackD
     return notFound(SCHEMA_PACK_UNVERIFIED_REASON.auditUnreadable);
   }
 
-  let newest: { record: Record<string, unknown>; at: number; path: string } | null = null;
+  const records: Array<{ record: unknown; path: string }> = [];
   for (const path of shards) {
     let text: string;
     try {
@@ -255,16 +273,41 @@ export function readRecordedSchemaPackDigest(vault: string): RecordedSchemaPackD
       } catch {
         return notFound(SCHEMA_PACK_UNVERIFIED_REASON.auditUnreadable);
       }
-      if (!isRecord(parsed)) return notFound(SCHEMA_PACK_UNVERIFIED_REASON.auditUnreadable);
-      if (parsed["action"] !== SCHEMA_MUTATION_AUDIT_ACTION) continue;
-      const timestamp = parsed["timestamp"];
-      if (typeof timestamp !== "string") {
-        return notFound(SCHEMA_PACK_UNVERIFIED_REASON.auditUnreadable);
-      }
-      const at = Date.parse(timestamp);
-      if (!Number.isFinite(at)) return notFound(SCHEMA_PACK_UNVERIFIED_REASON.auditUnreadable);
-      if (newest === null || at >= newest.at) newest = { record: parsed, at, path };
+      records.push({ record: parsed, path });
     }
+  }
+  return newestRecordedDigest(records);
+}
+
+/** The ledger a store-only machine names as its schema audit trail: the audit writer's store name (`reliability/audit.ts`). */
+const STORE_AUDIT_TRAIL = AUDIT_STORE_LEDGER_NAME;
+
+/** The schema-mutation audit records in the store, each named by the ledger. */
+function storeAuditRecords(vault: string): Array<{ record: unknown; path: string }> {
+  const rows = readLedgerRows<unknown>(DUAL_WRITE_LEDGERS.reliabilityAudit, () => [], { vault });
+  return rows
+    .filter((row) => isRecord(row) && row["audit_dir"] === SCHEMA_MUTATION_AUDIT_DIR)
+    .map((row) => ({
+      record: (row as Record<string, unknown>)["record"],
+      path: STORE_AUDIT_TRAIL,
+    }));
+}
+
+/** The newest schema apply's digest among `records`, by each record's own timestamp. */
+function newestRecordedDigest(
+  records: ReadonlyArray<{ record: unknown; path: string }>,
+): RecordedSchemaPackDigest {
+  let newest: { record: Record<string, unknown>; at: number; path: string } | null = null;
+  for (const { record: parsed, path } of records) {
+    if (!isRecord(parsed)) return notFound(SCHEMA_PACK_UNVERIFIED_REASON.auditUnreadable);
+    if (parsed["action"] !== SCHEMA_MUTATION_AUDIT_ACTION) continue;
+    const timestamp = parsed["timestamp"];
+    if (typeof timestamp !== "string") {
+      return notFound(SCHEMA_PACK_UNVERIFIED_REASON.auditUnreadable);
+    }
+    const at = Date.parse(timestamp);
+    if (!Number.isFinite(at)) return notFound(SCHEMA_PACK_UNVERIFIED_REASON.auditUnreadable);
+    if (newest === null || at >= newest.at) newest = { record: parsed, at, path };
   }
   if (newest === null) return notFound(SCHEMA_PACK_UNVERIFIED_REASON.noApplyRecorded);
 
@@ -291,8 +334,34 @@ export function readRecordedSchemaPackDigest(vault: string): RecordedSchemaPackD
  * recorded, and say which of the four conditions this vault is in.
  */
 export function assessSchemaPackIntegrity(vault: string): SchemaPackIntegrity {
-  const source = readSchemaPackSource(vault);
+  // A store-only pack and the records deciding it are one read, so the
+  // merge check below judges the records the digest was taken of.
+  const store = isStoreOnly({ vault }) ? readStoreSchemaPack() : null;
+  const source = store?.source ?? readSchemaPackSource(vault);
+  // A store whose rows name records: a deciding record no row attests is
+  // a finding even when the pack digests as recorded (a record that sets
+  // an entry the pack already held), since the next apply refuses it, and
+  // even when it removed the last entry, so the pack reads as absent.
+  const deciding = store?.deciding ?? [];
+  const unattested = store === null ? null : unattestedDeciding(vault, deciding);
+  const unattestedMismatches =
+    unattested === null || unattested.length === 0
+      ? NO_MISMATCHES
+      : Object.freeze([
+          Object.freeze({
+            field: SCHEMA_DECIDED_RECORDS_FIELD,
+            expected: "every deciding record attested by an audit row",
+            actual: `unattested: ${unattested.join(", ")}`,
+          }),
+        ]);
   if (!source.present) {
+    if (unattestedMismatches.length > 0) {
+      return Object.freeze({
+        status: SCHEMA_PACK_INTEGRITY.modified,
+        digest: null,
+        mismatches: unattestedMismatches,
+      });
+    }
     return Object.freeze({
       status: SCHEMA_PACK_INTEGRITY.unverified,
       digest: null,
@@ -315,10 +384,30 @@ export function assessSchemaPackIntegrity(vault: string): SchemaPackIntegrity {
   // The ungated comparison: this surface reports what it finds regardless
   // of any operator gate, and it reports it in the shape every other
   // integrity surface in this project emits.
-  const mismatches = compareStamps(
+  const digestMismatches = compareStamps(
     { [SCHEMA_PACK_DIGEST_FIELD]: recorded.digest },
     { [SCHEMA_PACK_DIGEST_FIELD]: digest },
   );
+  const mismatches =
+    unattestedMismatches.length === 0
+      ? digestMismatches
+      : Object.freeze([...digestMismatches, ...unattestedMismatches]);
+  if (
+    digestMismatches.length > 0 &&
+    unattested !== null &&
+    unattested.length === 0 &&
+    deciding.length > 0
+  ) {
+    return Object.freeze({
+      status: SCHEMA_PACK_INTEGRITY.ok,
+      digest,
+      expected: recorded.digest,
+      recorded_at: recorded.recorded_at,
+      audit_path: recorded.audit_path,
+      merged: true as const,
+      mismatches: NO_MISMATCHES,
+    });
+  }
   return Object.freeze({
     status: mismatches.length === 0 ? SCHEMA_PACK_INTEGRITY.ok : SCHEMA_PACK_INTEGRITY.modified,
     digest,
@@ -327,6 +416,81 @@ export function assessSchemaPackIntegrity(vault: string): SchemaPackIntegrity {
     audit_path: recorded.audit_path,
     mismatches,
   });
+}
+
+/**
+ * Audit-row field naming the records that decided the pack after an
+ * apply, each as `<id>:<digest>` of the version the row attests.
+ */
+export const SCHEMA_DECIDED_RECORDS_FIELD = "decided";
+
+/**
+ * The `action` of the row the migration's import writes (task 3.12): it
+ * attests the schema records the import wrote, carries no digest, and is
+ * never the newest apply.
+ */
+export const SCHEMA_IMPORT_BASELINE_ACTION = "schema_import_baseline";
+
+/** What the schema audit rows of a store attest. */
+export interface SchemaAttestation {
+  /**
+   * Every record attestation a row names (`decided`), across all rows
+   * seen: `<id>:<digest>` of the one version of the record the row saw
+   * (`schemaRecordAttestation` in `./schema-pack-store.ts`).
+   */
+  readonly attested: ReadonlySet<string>;
+  /**
+   * No row names records: every row predates the field, so only the
+   * digest comparison can attest the pack.
+   */
+  readonly digestOnly: boolean;
+}
+
+/**
+ * The records the schema audit rows of this store attest (task 3.12,
+ * design D19 item 1), each in the version a row saw. An apply's row names
+ * the records that apply wrote plus records rows it had seen already
+ * attest (or the operator adopted by name); the migration's baseline row
+ * names the records the import wrote. The attested set is the union over
+ * every row. An entry that is a bare id binds no content and attests
+ * nothing.
+ */
+export function schemaAttestation(vault: string): SchemaAttestation {
+  const attested = new Set<string>();
+  let named = false;
+  for (const { record } of storeAuditRecords(vault)) {
+    if (!isRecord(record)) continue;
+    const action = record["action"];
+    if (action !== SCHEMA_MUTATION_AUDIT_ACTION && action !== SCHEMA_IMPORT_BASELINE_ACTION) {
+      continue;
+    }
+    const details = record["details"];
+    const decided = isRecord(details) ? details[SCHEMA_DECIDED_RECORDS_FIELD] : undefined;
+    if (!Array.isArray(decided)) continue;
+    named = true;
+    for (const entry of decided) if (typeof entry === "string") attested.add(entry);
+  }
+  return { attested, digestOnly: !named };
+}
+
+/**
+ * The ids of the records deciding a store-only pack that no audit row
+ * attests in the version they hold (task 3.12, design D19 item 1), or
+ * `null` when no row names records (rows written before the field
+ * existed), where the digest comparison alone decides. A pack that matches
+ * no single apply's digest is the merge of audited applies when this is
+ * empty; a pack changed by any other write (a settings write, a forged
+ * record, another body under an attested id) has an id here, even when
+ * the record left the pack as it was. `live` is the deciding records of
+ * the same read the pack's digest was taken of.
+ */
+function unattestedDeciding(
+  vault: string,
+  live: ReadonlyArray<SchemaDecidingRecord>,
+): string[] | null {
+  const { attested, digestOnly } = schemaAttestation(vault);
+  if (digestOnly) return null;
+  return live.filter((record) => !attested.has(record.attestation)).map((record) => record.id);
 }
 
 function notFound(reason: SchemaPackUnverifiedReason): RecordedSchemaPackDigest {

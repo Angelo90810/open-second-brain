@@ -1,10 +1,11 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
-
-import { atomicWriteFileSync } from "../fs-atomic.ts";
 import { proceduralHintsPath } from "./paths.ts";
-import { readProceduralGraph, type ProceduralGraphProjection } from "./procedural-graph.ts";
-import { assertVaultIdentityForWrite } from "./vault-identity.ts";
+import {
+  readProceduralState,
+  readProceduralGraph,
+  writeMachineStateText,
+  type ProceduralGraphProjection,
+} from "./procedural-graph.ts";
+import { assertLaneWrite } from "../store/lane-pages.ts";
 
 export interface ProceduralHintEntry {
   readonly node_id: string;
@@ -22,7 +23,7 @@ export function rebuildProceduralHints(
   opts: { now?: Date; graph?: ProceduralGraphProjection } = {},
 ): ProceduralHintsProjection {
   // Vault-identity write guard (context-integrity-gates, Unit J).
-  assertVaultIdentityForWrite(vault);
+  assertLaneWrite(vault);
   const graph = opts.graph ?? readProceduralGraph(vault);
   const now = opts.now ?? new Date();
   const entries: ProceduralHintEntry[] = [];
@@ -58,17 +59,15 @@ export function rebuildProceduralHints(
     entries: Object.freeze(entries.toSorted((l, r) => l.node_id.localeCompare(r.node_id))),
   };
 
-  const path = proceduralHintsPath(vault);
-  mkdirSync(dirname(path), { recursive: true });
-  atomicWriteFileSync(path, `${JSON.stringify(projection, null, 2)}\n`);
+  writeMachineStateText(proceduralHintsPath(vault), `${JSON.stringify(projection, null, 2)}\n`);
   return projection;
 }
 
 export function readProceduralHints(vault: string): ProceduralHintsProjection | null {
-  const path = proceduralHintsPath(vault);
-  if (!existsSync(path)) return null;
+  const text = readProceduralState(vault, proceduralHintsPath(vault));
+  if (text === null) return null;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as ProceduralHintsProjection;
+    const parsed = JSON.parse(text) as ProceduralHintsProjection;
     if (parsed.schema_version !== 1) return null;
     if (!Array.isArray(parsed.entries)) return null;
     return parsed;

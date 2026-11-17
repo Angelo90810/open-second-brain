@@ -361,6 +361,17 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         command("pin", "Pin a preference"),
         command("unpin", "Unpin a preference"),
         command("set-primary", "Set primary Brain agent"),
+        command(
+          "settings",
+          "Read and change the shared brain settings",
+          [flag("vault", "string"), flag("agent", "string"), flag("json", "boolean")],
+          [
+            command("get", "Show one shared brain setting"),
+            command("set", "Set one shared brain setting"),
+            command("unset", "Remove one shared brain setting; its default applies"),
+            command("list", "List the shared brain settings that are set"),
+          ],
+        ),
         command("protect", "Emit runtime deny rules for Brain", [
           flag("target", "string"),
           flag("vault", "string"),
@@ -479,6 +490,31 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           "storage",
           "Render the vault storage report: usage per surface and the forecast tier against the cap",
           [flag("vault", "string"), flag("json", "boolean")],
+        ),
+        command(
+          "changes",
+          "List brain store record ids new since a watermark, grouped by stream, scope and topic",
+          [
+            flag("vault", "string"),
+            flag("since", "string"),
+            flag("limit", "string"),
+            flag("json", "boolean"),
+          ],
+        ),
+        command(
+          "migrate-store",
+          "Move the legacy brain into the brain store on this machine (--dry-run plans it and writes nothing; --resume continues an interrupted run)",
+          [
+            flag("vault", "string"),
+            flag("dry-run", "boolean"),
+            flag("resume", "boolean"),
+            flag("rollback", "boolean"),
+            flag("wait", "string"),
+            flag("remove-legacy", "boolean"),
+            flag("force-release-gate", "boolean"),
+            flag("force", "boolean"),
+            flag("json", "boolean"),
+          ],
         ),
         command("audit", "Render mutation audit trail"),
         command(
@@ -825,8 +861,23 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         command("knowledge-gaps", "Rank recurring queries the vault answers poorly"),
         command(
           "skill-proposals",
-          "Learn, list, review, and recover skill proposals, including drafts from mature pages",
+          "Learn, list, review, and recover skill proposals, including drafts from mature pages and benchmark-gated rewrites",
           [flag("vault", "string"), flag("payload", "string"), flag("payload-file", "string")],
+          [
+            command("rewrite-plan", "Print a rewrite round's frozen receipt and dev envelopes", [
+              flag("vault", "string"),
+              flag("candidate-file", "string"),
+              flag("skills-root", "string"),
+              flag("json", "boolean"),
+            ]),
+            command("rewrite-score", "Score submitted rewrite rounds and gate the verdict", [
+              flag("vault", "string"),
+              flag("rounds-dir", "string"),
+              flag("candidate-file", "string"),
+              flag("skills-root", "string"),
+              flag("json", "boolean"),
+            ]),
+          ],
         ),
         command("procedural-memory", "Reconcile or list the procedural memory index and its usage"),
         command("procedural-graph", "Rebuild or show the procedural graph and hint projections"),
@@ -940,6 +991,40 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         command("stale", "Stale preferences, signals, and log files against configured thresholds"),
         command("daily", "Daily brief: events by kind, status transitions, vault delta"),
         command("weekly", "Seven-day synthesis: transitions, retired, contradictions, vault delta"),
+        // t_1e952e43: operator-approved lesson promotion into agent rules
+        // files. Operator-only; no MCP tool exposes these subcommands.
+        command(
+          "lessons",
+          "Operator-approved lesson promotion: candidates | approve <pref-id> | deny <pref-id> | refresh-blocks",
+          [flag("vault", "string"), flag("target", "string-array")],
+          [
+            command("candidates", "List promotable lessons and blocked ones with reasons", [
+              flag("vault", "string"),
+            ]),
+            command("approve", "Approve a lesson and write it into the named agent rules files", [
+              flag("target", "string-array"),
+              flag("apply", "boolean"),
+              flag("yes", "boolean"),
+              flag("force", "boolean"),
+              flag("vault", "string"),
+            ]),
+            command("deny", "Record a denial; the lesson is suppressed from promotion", [
+              flag("apply", "boolean"),
+              flag("yes", "boolean"),
+              flag("vault", "string"),
+            ]),
+            command(
+              "refresh-blocks",
+              "Re-render managed lessons blocks (dry run by default; never creates a block)",
+              [
+                flag("apply", "boolean"),
+                flag("yes", "boolean"),
+                flag("force", "boolean"),
+                flag("vault", "string"),
+              ],
+            ),
+          ],
+        ),
       ],
     ),
     command(
@@ -1040,6 +1125,7 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           flag("keyword-only", "boolean"),
           flag("match-mode", "string"),
           flag("kind", "string"),
+          flag("source", "string"),
           flag("path", "string"),
           flag("keyword-weight", "string"),
           flag("semantic-weight", "string"),
@@ -1225,6 +1311,177 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
             flag("dry-run", "boolean"),
             flag("apply", "boolean"),
             flag("yes", "boolean"),
+            flag("json", "boolean"),
+          ],
+        ),
+      ],
+    ),
+    command(
+      "store",
+      "Brain store verbs",
+      [],
+      [
+        command(
+          "init",
+          "Create the brain store (both partitions, or --partitions shared), or complete a half-created one",
+          [flag("partitions", "string"), flag("config", "string"), flag("json", "boolean")],
+        ),
+        command(
+          "path",
+          "Print the store root, partitions, device-local state directory and view target, with origin and existence",
+          [flag("config", "string"), flag("json", "boolean")],
+        ),
+        command(
+          "device",
+          "List the devices the store knows, or retire one that is gone",
+          [flag("config", "string"), flag("json", "boolean")],
+          [
+            command("list", "List each device with its last record and state"),
+            command("retire", "Retire a device that is gone (not this machine)", [
+              flag("reason", "string"),
+            ]),
+          ],
+        ),
+        command(
+          "partition",
+          "Take a partition off this machine on purpose",
+          [flag("config", "string"), flag("json", "boolean")],
+          [
+            command("leave", "Stop holding a partition whose folder is gone (never shared)", [
+              flag("force", "boolean"),
+            ]),
+          ],
+        ),
+        command(
+          "shard",
+          "Skip one bad line of a held shard on this machine, list the skipped lines, or release one",
+          [flag("config", "string"), flag("json", "boolean")],
+          [
+            command("quarantine", "Skip one bad line of a held shard on this machine", [
+              flag("offset", "string"),
+            ]),
+            command("list", "List the quarantined lines with their state"),
+            command("release", "Read a quarantined line again", [flag("offset", "string")]),
+          ],
+        ),
+      ],
+    ),
+    command(
+      "view",
+      "Human view verbs",
+      [],
+      [
+        command(
+          "writer",
+          "Show the view writer, or make this machine the view writer (--here, --force without a release)",
+          [
+            flag("here", "boolean"),
+            flag("force", "boolean"),
+            flag("config", "string"),
+            flag("json", "boolean"),
+          ],
+        ),
+        command("render", "Render the human view (only the view writer writes pages)", [
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("recover", "List the replaced versions of a view page, or print one", [
+          flag("print", "string"),
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+      ],
+    ),
+    command(
+      "topic",
+      "Topics: list, show and change them by recording topic events",
+      [],
+      [
+        command("list", "List topics, newest first", [
+          flag("scope", "string"),
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("show", "Show one topic: its head, items and page", [
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("review", "Proposed merges and quiet topics", [
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("create", "Create a topic", [
+          flag("scope", "string"),
+          flag("goal", "string"),
+          flag("description", "string"),
+          flag("private", "boolean"),
+          flag("shared", "boolean"),
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("rename", "Rename a topic or change its description", [
+          flag("title", "string"),
+          flag("description", "string"),
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("status", "Change a topic's status", [
+          flag("resolved", "string"),
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("goal", "Set or clear a topic's goal", [
+          flag("clear", "boolean"),
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("assign", "Assign a record to a topic", [
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("unassign", "Take a record out of a topic", [
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("merge", "Merge a topic into another", [
+          flag("into", "string"),
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("split", "Move items or records of a topic to another", [
+          flag("into", "string"),
+          flag("items", "string"),
+          flag("records", "string"),
+          flag("owner", "string"),
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("link", "Link two topics, or remove the link", [
+          flag("to", "string"),
+          flag("remove", "boolean"),
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command("archive", "Close a topic", [flag("config", "string"), flag("json", "boolean")]),
+        command("undo", "Undo one topic record", [
+          flag("config", "string"),
+          flag("json", "boolean"),
+        ]),
+        command(
+          "record",
+          "Record a decision, question, log entry, milestone, resolution or completion",
+          [
+            flag("text", "string"),
+            flag("class", "string"),
+            flag("reason", "string"),
+            flag("item", "string"),
+            flag("question", "string"),
+            flag("answer", "string"),
+            flag("milestone", "string"),
+            flag("evidence", "string"),
+            flag("owner", "string"),
+            flag("as-human", "boolean"),
+            flag("config", "string"),
             flag("json", "boolean"),
           ],
         ),

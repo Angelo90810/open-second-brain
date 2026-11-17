@@ -10,7 +10,7 @@
  * byte-identical after every run.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import {
   existsSync,
   mkdtempSync,
@@ -36,6 +36,10 @@ import {
   LOG_CATCHUP_WINDOW_DATES,
 } from "../../hooks/lib/log-cursor-state.ts";
 import { homeEnv } from "../helpers/platform.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 const HOOK = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -693,9 +697,11 @@ describe("log-catchup hook (SessionStart)", () => {
     expect(context).toContain("charcap line 13");
     // Any "older" count in the header is the char-trim loop's own work
     // (the line cap alone would have shown all 14).
-    const older = context?.match(/\((\d+) older not shown\)/);
+    const older = context?.match(/\((\d+) older not shown/);
     expect(older).not.toBeNull();
     expect(Number(older![1])).toBeGreaterThanOrEqual(1);
+    // The cut line names the surface that carries the rest (task 4.4).
+    expect(context).toContain("the log pages carry the rest");
     // The watermark advanced past ALL scanned lines despite the trim.
     const cursor = JSON.parse(readFileSync(cursorPath(), "utf8")) as {
       line: number;

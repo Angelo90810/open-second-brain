@@ -30,7 +30,8 @@
 import { existsSync, readFileSync } from "node:fs";
 
 import { parseFrontmatterText } from "../../src/core/vault.ts";
-import { brainActivePath, brainLessonsPath } from "../../src/core/brain/paths.ts";
+import { activeDigestPathForRead } from "../../src/core/brain/active.ts";
+import { lessonsDigestPathForRead } from "../../src/core/brain/lessons.ts";
 import { budgetActiveBody, isTruncationNoticeOnly } from "../../src/core/brain/active-budget.ts";
 import {
   neutralizeUntrustedText,
@@ -126,10 +127,21 @@ export function createInjectionMeter(configuredBudgetChars: number): InjectionMe
  * standing-rules cap bounds what the operator wrote. Reading them
  * together is only an efficiency - one config open instead of two.
  */
+/** Defaults of the session-start digest's topic and pinned lanes (task 4.2). */
+export const TOPIC_HEADS_MAX_DEFAULT = 12;
+export const TOPIC_HEADS_MAX_CHARS_DEFAULT = 1600;
+export const PINNED_MAX_CHARS_DEFAULT = 1200;
+
 export interface InjectionLimits {
   readonly injectBudgetChars: number;
   readonly standingRulesMaxChars: number;
   readonly scopedRulesMaxChars: number;
+  /** Most topic heads the session start digest shows (task 4.2). */
+  readonly topicHeadsMax: number;
+  /** Characters for the whole topic heads block. */
+  readonly topicHeadsMaxChars: number;
+  /** Characters for the pinned context block. */
+  readonly pinnedMaxChars: number;
 }
 
 /**
@@ -165,6 +177,9 @@ export function resolveInjectionLimits(vault: string): InjectionLimits {
     injectBudgetChars: cfg?.active?.inject_budget_chars ?? INJECT_BUDGET_CHARS_DEFAULT,
     standingRulesMaxChars: resolveStandingRulesMaxChars(cfg),
     scopedRulesMaxChars: resolveScopedRulesMaxChars(cfg),
+    topicHeadsMax: cfg?.active?.topic_heads_max ?? TOPIC_HEADS_MAX_DEFAULT,
+    topicHeadsMaxChars: cfg?.active?.topic_heads_max_chars ?? TOPIC_HEADS_MAX_CHARS_DEFAULT,
+    pinnedMaxChars: cfg?.active?.pinned_max_chars ?? PINNED_MAX_CHARS_DEFAULT,
   };
 }
 
@@ -261,7 +276,9 @@ export function assembleActiveContext(
     });
   }
 
-  const activePath = brainActivePath(vault);
+  // `Brain/active.md` on an unswitched machine; on a store-only one the
+  // digest rendered on demand into the device-local cache (D14 item 7).
+  const activePath = activeDigestPathForRead(vault);
   const activeBody = existsSync(activePath) ? readActiveBody(vault, activePath, budget, meter) : "";
 
   return joinBlocks([noticesBlock, activeBody]);
@@ -312,7 +329,7 @@ function readActiveBody(
   // on the same SessionStart surface. Fail-soft and budgeted separately:
   // a missing / unreadable / oversized lessons file must never disturb
   // the active-preferences injection above.
-  const lessonsBody = readLessonsBody(brainLessonsPath(vault), budget);
+  const lessonsBody = readLessonsBody(vault, budget);
 
   // Untrusted vault content: neutralize (control/bidi/zero-width strip,
   // delimiter escape) BEFORE budgeting, and set under the light
@@ -364,9 +381,12 @@ function readActiveBody(
  * neutralized and framed like the active body, with the same
  * budget-charged header overhead.
  */
-function readLessonsBody(lessonsPath: string, budget: number): string | null {
-  if (!existsSync(lessonsPath)) return null;
+function readLessonsBody(vault: string, budget: number): string | null {
   try {
+    // Rendered on demand on a store-only machine; a failure is the same
+    // fail-soft skip as an unreadable file.
+    const lessonsPath = lessonsDigestPathForRead(vault);
+    if (!existsSync(lessonsPath)) return null;
     const raw = readFileSync(lessonsPath, "utf8");
     const [, body] = parseFrontmatterText(raw);
     const trimmed = body.trim();

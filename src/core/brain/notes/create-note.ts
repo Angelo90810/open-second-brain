@@ -44,6 +44,7 @@
  */
 
 import { existsSync, mkdirSync } from "node:fs";
+import { loadPermissionsDocumentFor } from "../permissions/document-source.ts";
 import { dirname, join, posix, sep, win32 } from "node:path";
 
 import { resolveAgentName } from "../../config.ts";
@@ -71,13 +72,13 @@ import {
   type VaultScope,
 } from "../../vault-scope/index.ts";
 import { BRAIN_CONFIG_FILE, BRAIN_ROOT_REL, isUnderBrainRoot } from "../paths.ts";
+import { viewFolderRefusal } from "../../view/vault-guard.ts";
 import { requireNextStep } from "../next-step.ts";
 import { BrainConfigError, loadIntegrityConfigSafe } from "../policy.ts";
-import { loadPermissionsDocument } from "../permissions/document.ts";
 import { appendDecisionLedger } from "../permissions/ledger.ts";
 import { OWNER_SCOPE_WRITES_KEY, refuseCrossOwnerWrite } from "../trust/owner-write-gate.ts";
 import { loadSchemaPack } from "../schema-pack.ts";
-import { assertVaultIdentityForWrite } from "../vault-identity.ts";
+import { assertNoteVaultForWrite } from "../../vault-adapter/index.ts";
 import { checkWriteBinding } from "../../write-binding/index.ts";
 import { validateArtifact } from "../write-session/validate.ts";
 import type { WriteSessionError } from "../write-session/types.ts";
@@ -87,6 +88,9 @@ import {
   type NoteTemplateVariables,
 } from "./note-template.ts";
 import { NOTE_WRITE_OP, recordNoteWrite } from "./write-record.ts";
+import type { PrivacyVerdict } from "../../store/operation-privacy.ts";
+import { withOperationPrivacy } from "../../store/operation-scope.ts";
+import { createNotePrivacy } from "./create-note-privacy.ts";
 import { ROUTE_STAGE, timeStageSync } from "../../route-scope.ts";
 import { REVIEW_LANE } from "../write-gate.ts";
 import { resolveWriteDisposition, stageForReview } from "../pending/pending-lanes.ts";
@@ -181,6 +185,11 @@ export interface CreateNoteInput {
    * config-derived subject.
    */
   readonly subject?: WriteSubject;
+  /**
+   * Brain store dual write: the privacy verdict of an enclosing operation
+   * (a write batch), which the note-write event's store record inherits.
+   */
+  readonly storePrivate?: PrivacyVerdict;
 }
 
 /** What a {@link createNote} call actually did. `staged` means the review gate parked the bytes in the queue. */
@@ -467,6 +476,13 @@ export function resolveNoteTarget(vault: string, path: string): ResolvedNoteTarg
       `the Brain machinery root is not writable via create_note: ${relPath} resolves to ${landsAt}`,
     );
   }
+  // The human view folder, when it sits in the vault, is the view
+  // writer's: a page edited there is read back with human authority
+  // (`core/view/vault-guard.ts`), so a note tool must not write it.
+  for (const rel of new Set([relPath, landsAt])) {
+    const viewRefusal = viewFolderRefusal(vault, rel, "the note tools");
+    if (viewRefusal !== null) throw new CreateNoteError("excluded", viewRefusal);
+  }
 
   // Vault scope is ONE policy every consumer obeys, so a write is
   // refused wherever a walk would be refused - a note authored outside
@@ -645,7 +661,7 @@ export function noteOwnerGateVerdict(
   // token's agent, never for whoever the process config names.
   const resolved = subject?.agent ?? resolveAgentName(configPath);
   const gateMode = loadIntegrityConfigSafe(vault).owner_scope_writes;
-  const { document } = loadPermissionsDocument(vault);
+  const { document } = loadPermissionsDocumentFor(vault, configPath);
   const verdict = refuseCrossOwnerWrite({
     frontmatterOwner: named,
     resolvedIdentity: resolved,
@@ -737,10 +753,21 @@ export function logWatchedNoteOwnerWrite(
  * refusal.
  */
 export function createNote(vault: string, input: CreateNoteInput): CreateNoteResult {
+  // One operation: every store record written below (the owner-write
+  // decision row, the review gate's row, the note-write event) carries the
+  // create's verdict (`store/operation-scope.ts`).
+  return withOperationPrivacy(createNotePrivacy(vault, input), () =>
+    createNoteInScope(vault, input),
+  );
+}
+
+function createNoteInScope(vault: string, input: CreateNoteInput): CreateNoteResult {
   // Vault-identity write guard (context-integrity-gates, Unit J). This
   // backs `brain_create_note`, `brain_append_note`, and
   // `brain_update_note` - the headline note writers.
-  assertVaultIdentityForWrite(vault);
+  // Through the vault adapter (design D14 items 8, 13): a vault is
+  // required, and the vault identity guard holds.
+  assertNoteVaultForWrite(vault, "note writes");
   const { relPath, abs, originChannel } = resolveNoteTarget(vault, input.path);
   const callerFrontmatter = input.frontmatter ?? {};
   // The owner-write gate runs BEFORE the body resolves, before validation,
@@ -879,6 +906,7 @@ export function createNote(vault: string, input: CreateNoteInput): CreateNoteRes
       before: null,
       after: { bytes: formatFrontmatter(frontmatter, body) },
       ...(input.configPath !== undefined ? { configPath: input.configPath } : {}),
+      ...(input.storePrivate !== undefined ? { storePrivate: input.storePrivate } : {}),
     }),
   );
   return { path: relPath, outcome: "created", created: true, ...receipt };

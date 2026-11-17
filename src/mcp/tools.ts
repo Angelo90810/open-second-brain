@@ -27,6 +27,7 @@ import { resolvedSecretLiterals } from "../core/secret-resolver.ts";
 import type { ConfigDiscovery } from "../core/types.ts";
 import { REMOVED_TOOLS } from "../core/removed-surfaces.ts";
 import { computeBrainStatus } from "../core/brain/status.ts";
+import { TRANSPORT_REACH } from "../core/graph/transport-reach.ts";
 import { doctor } from "../core/doctor.ts";
 import { nextCommandField } from "../core/brain/next-step.ts";
 import { collectRuntimeNotices } from "../core/brain/runtime-notices.ts";
@@ -37,6 +38,8 @@ import { cursorOffsetArg, CURSOR_SCHEMA } from "./brain/pagination.ts";
 import { pageSlice } from "../core/brain/offset-cursor.ts";
 import { WIRING_TOOLS } from "./wiring-tools.ts";
 import { SEARCH_TOOLS, buildSearchStatusBlock } from "./search-tools.ts";
+import { buildStoreStatusBlock } from "../core/store/store-status.ts";
+import { storeStatusForCaller } from "./brain/device-path.ts";
 import { SCHEMA_TOOLS } from "./schema-tools.ts";
 import { WATCHDOG_TOOLS } from "./watchdog-tools.ts";
 import { SKILL_TOOLS } from "./skill-tools.ts";
@@ -58,6 +61,7 @@ import {
   TOOL_SCOPE,
   TOOL_SCOPES,
   contextReach,
+  contextVault,
   type ServerContext,
   type ToolCapabilityReport,
   type ToolDefinition,
@@ -128,12 +132,20 @@ async function toolStatus(ctx: ServerContext): Promise<Record<string, unknown>> 
   // omitted block reads as the same confident negative the bare `false`
   // did, which is precisely what the probe could not determine. The absent
   // branch keeps omitting them, because there the omission IS the answer.
-  const { present: vaultExists, unexaminable } = probeVaultDirectory(ctx.vault);
+  // A server with no vault (design D14) reports that, not a refusal: the
+  // vault-gated blocks are absent and the store block answers alone.
+  const served = contextVault(ctx);
+  const { present: vaultExists, unexaminable } =
+    served === null ? { present: false, unexaminable: null } : probeVaultDirectory(served);
   const configKeys =
     broken === null ? Object.keys(discovery.data).toSorted() : unresolvedField(broken);
   // Safe to call on a vault that has no Brain layer yet — returns
   // `present: false` with zero counts.
-  const brain = vaultExists ? computeBrainStatus(ctx.vault) : unexaminable;
+  const brain = vaultExists
+    ? computeBrainStatus(ctx.vault, {
+        withholdsPrivate: contextReach(ctx) !== TRANSPORT_REACH.local,
+      })
+    : unexaminable;
   // On the broken branch this gate is unresolvable, so the block is built
   // rather than skipped: `buildSearchStatusBlock` resolves its own config
   // and degrades to `{ exists: false, error }` naming the same file. A skip
@@ -186,7 +198,7 @@ async function toolStatus(ctx: ServerContext): Promise<Record<string, unknown>> 
     config:
       broken === null
         ? redactConfigMapping(discovery.data, {
-            resolvedLiterals: resolvedSecretLiterals(ctx.vault),
+            resolvedLiterals: served === null ? [] : resolvedSecretLiterals(served),
           })
         : unresolvedField(broken),
     vault_path: vaultPathField(ctx),
@@ -198,6 +210,16 @@ async function toolStatus(ctx: ServerContext): Promise<Record<string, unknown>> 
     ...(vault ? { vault } : {}),
     ...(brain ? { brain } : {}),
     ...(search ? { search } : {}),
+    // The brain store block (design D12) comes last, so every field above
+    // keeps its place. It is always present: a store that does not exist
+    // yet, or cannot be used, is what the block reports.
+    store: storeStatusForCaller(
+      ctx,
+      buildStoreStatusBlock({
+        vault: vaultExists ? served : null,
+        configPath: ctx.configPath,
+      }),
+    ),
   };
 }
 

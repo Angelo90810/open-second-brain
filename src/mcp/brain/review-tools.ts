@@ -231,12 +231,15 @@ async function toolBrainStaleScan(
 ): Promise<Record<string, unknown>> {
   void _args;
   const cfg = loadTemporalConfigSafe(ctx.vault);
-  const index = buildTimelineIndex(ctx.vault, {});
-  const report = findStaleEntries(index, ctx.vault, cfg);
   // Every stale row names its artifact by id, topic and vault-relative
   // path (a-label-is-not-a-boundary, U3). Log shards are named by date
   // and shared by construction, so they carry no ownership to read.
+  // Below local reach a private log event anchors no preference's age.
   const view = reviewView(ctx);
+  const index = buildTimelineIndex(ctx.vault, {
+    withholdsPrivate: view.withholdsPrivate === true,
+  });
+  const report = findStaleEntries(index, ctx.vault, cfg);
   return {
     vault_path: vaultPathField(ctx),
     thresholds: report.thresholds,
@@ -306,7 +309,7 @@ export const REVIEW_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
     name: "brain_stale_scan",
     kind: "read",
     description:
-      "Structural staleness report: preferences, signals, and Brain/log files inactive longer than the configured `temporal:` thresholds (stale_pref_days / stale_signal_days / stale_log_days). Read-only.",
+      "Structural staleness report: preferences, signals, and log days inactive longer than the configured `temporal:` thresholds (stale_pref_days / stale_signal_days / stale_log_days). Read-only.",
     inputSchema: {
       type: "object",
       properties: {},

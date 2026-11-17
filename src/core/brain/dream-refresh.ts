@@ -10,8 +10,10 @@
 
 import { BAND_RANK, computeConfidence, rebandConfidence } from "./confidence.ts";
 import type { PlanState, ScanResult } from "./dream-plan.ts";
-import { collectEvidenceForSlug } from "./evidence.ts";
-import { listLogDates, readLogDay } from "./log-jsonl.ts";
+import { collectEvidenceForSlug, privateEvidenceCounts } from "./evidence.ts";
+import { preferencesStoreOnly, storePreferenceEntry } from "./preference-store.ts";
+import { countersForShared } from "../store/read/store-entities.ts";
+import { logDayReader } from "./log-days.ts";
 import { isPinned } from "./pin.ts";
 import { wouldRewritePreference } from "./preference.ts";
 import { classifyFreshnessTrend } from "./temporal/freshness-trend.ts";
@@ -131,14 +133,17 @@ export interface ApplyEvidenceEntry {
   readonly result: (typeof BRAIN_APPLY_RESULT)[keyof typeof BRAIN_APPLY_RESULT];
   /** Downstream outcome when recorded (t_d478df53). */
   readonly outcome?: "success" | "failure";
+  /** The event was read from the `private` partition (see `evidence.ts`). */
+  readonly fromPrivatePartition?: true;
 }
 
-export function scanApplyEvidence(vault: string): ApplyEvidenceEntry[] {
+export function scanApplyEvidence(vault: string | null): ApplyEvidenceEntry[] {
   const out: ApplyEvidenceEntry[] = [];
   const mergeAliases = new Map<string, string>();
   // Shard-aware (Memory Integrity Suite): merged per-day reads.
-  for (const date of listLogDates(vault)) {
-    const { entries } = readLogDay(vault, date);
+  const log = logDayReader(vault);
+  for (const date of log.dates) {
+    const { entries } = log.day(date);
     for (const e of entries) {
       if (e.eventType === BRAIN_LOG_EVENT_KIND.merge) {
         const keep = parseWikilinkFromBodyValue(e.body["keep"]);
@@ -171,17 +176,43 @@ export function scanApplyEvidence(vault: string): ApplyEvidenceEntry[] {
         ...(e.body["outcome"] === "success" || e.body["outcome"] === "failure"
           ? { outcome: e.body["outcome"] as "success" | "failure" }
           : {}),
+        ...(e.fromPrivatePartition === true ? { fromPrivatePartition: true as const } : {}),
       });
     }
   }
-  const resolved = out.map((entry) => ({
-    ...entry,
-    pref_slug: resolveMergeAlias(entry.pref_slug, mergeAliases),
-  }));
+  // A private event counts only toward a private preference (`evidence.ts`),
+  // judged after the merge aliases name the preference it lands on.
+  const takesPrivate = new Map<string, boolean>();
+  const counts = (slug: string): boolean => {
+    let known = takesPrivate.get(slug);
+    if (known === undefined) {
+      known = privateEvidenceCounts(slug);
+      takesPrivate.set(slug, known);
+    }
+    return known;
+  };
+  const resolved = out
+    .map((entry) => ({
+      ...entry,
+      pref_slug: resolveMergeAlias(entry.pref_slug, mergeAliases),
+    }))
+    .filter((entry) => entry.fromPrivatePartition !== true || counts(entry.pref_slug));
   // Stable order: by timestamp ascending. Multiple entries at the same
   // second keep their parse order (parseLogDay returns insertion order).
   resolved.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
   return resolved;
+}
+
+/** The applied and violated counts of `pref` as the dream scan counts evidence. */
+function priorCounters(
+  vault: string | null,
+  slug: string,
+  pref: { readonly applied_count: number; readonly violated_count: number },
+): { readonly applied: number; readonly violated: number } {
+  const entry = preferencesStoreOnly(vault) ? storePreferenceEntry(slug) : undefined;
+  if (entry === undefined) return { applied: pref.applied_count, violated: pref.violated_count };
+  const counters = countersForShared(entry);
+  return { applied: counters.applied_count, violated: counters.violated_count };
 }
 
 function parseWikilinkFromBodyValue(value: unknown): string | null {
@@ -201,7 +232,7 @@ function resolveMergeAlias(slug: string, aliases: ReadonlyMap<string, string>): 
 }
 
 export function planRefresh(
-  vault: string,
+  vault: string | null,
   scan: ScanResult,
   evidence: ApplyEvidenceEntry[],
   cfg: BrainConfig,
@@ -229,6 +260,10 @@ export function planRefresh(
   for (const rec of scan.preferences) {
     const slug = rec.pref.id.startsWith("pref-") ? rec.pref.id.slice("pref-".length) : rec.pref.id;
     if (retiringSlugs.has(slug)) continue;
+    // The counters the preference holds now, counted by the rule the scan
+    // counts its evidence by: a shared preference's private uses are left
+    // out (`evidence.ts`), or every pass would see them as a change.
+    const prior = priorCounters(vault, slug, rec.pref);
 
     const ev = bySlug.get(slug) ?? [];
     const applied = ev.filter((e) => e.result === BRAIN_APPLY_RESULT.applied).length;
@@ -276,7 +311,7 @@ export function planRefresh(
     ) {
       status = BRAIN_PREFERENCE_STATUS.quarantine;
     } else if (status === BRAIN_PREFERENCE_STATUS.quarantine) {
-      const newViolated = violated > rec.pref.violated_count;
+      const newViolated = violated > prior.violated;
       if (newViolated) {
         if (isPinned(rec.pref)) {
           plan.retainPinned.push({
@@ -347,8 +382,8 @@ export function planRefresh(
     const valueDifferent =
       previousValue !== null && Math.abs(previousValue - confidence.value) > 1e-6;
     const countersChanged =
-      applied !== rec.pref.applied_count ||
-      violated !== rec.pref.violated_count ||
+      applied !== prior.applied ||
+      violated !== prior.violated ||
       lastEvidence !== rec.pref.last_evidence_at ||
       status !== rec.pref.status ||
       confirmedAt !== rec.pref.confirmed_at ||

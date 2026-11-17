@@ -55,7 +55,7 @@ import { BRAIN_ROOT_REL, ensureInsideVault, writeImagePath } from "../paths.ts";
 import { withDestructiveSnapshot } from "../snapshot-gate.ts";
 import { isoSecond } from "../time.ts";
 import { BRAIN_SNAPSHOT_REASON } from "../types.ts";
-import { assertVaultIdentityForWrite } from "../vault-identity.ts";
+import { assertNoteVaultForWrite } from "../../vault-adapter/index.ts";
 import { listNoteWrites, type NoteWriteRecord } from "./write-log.ts";
 import {
   NOTE_WRITE_NO_PRIOR,
@@ -302,10 +302,12 @@ export interface NoteRevertApplyResult {
 /** Injected clock, shared by both entry points. */
 export interface PlanNoteRevertOptions {
   readonly now?: Date;
+  /** Select as a caller below local reach; the safety rules still see every write. */
+  readonly withholdsPrivate?: boolean;
 }
 
 /** How an apply attributes the `revert` writes it records. */
-export interface ApplyNoteRevertOptions extends PlanNoteRevertOptions {
+export interface ApplyNoteRevertOptions extends Omit<PlanNoteRevertOptions, "withholdsPrivate"> {
   /** Caller-asserted identity; defaults to the resolved agent name. */
   readonly agent?: string;
   /** Config file that names the writing agent, threaded to the record. */
@@ -562,7 +564,9 @@ export function planNoteRevert(
   const normalised = normaliseSelector(selector);
   // `listNoteWrites` returns newest-first; every rule here reads the
   // history forwards, so both lists are reversed once, here.
-  const selectedRead = listNoteWrites(vault, normalised);
+  const withholdsPrivate = opts.withholdsPrivate === true;
+  const selectedRead = listNoteWrites(vault, { ...normalised, withholdsPrivate });
+  // Only the safety rules read the universe: it keeps private writes.
   const universeRead = listNoteWrites(
     vault,
     normalised.path !== undefined ? { path: normalised.path } : {},
@@ -633,7 +637,9 @@ export function applyNoteRevert(
   digest: string,
   opts: ApplyNoteRevertOptions = {},
 ): NoteRevertApplyResult {
-  assertVaultIdentityForWrite(vault);
+  // Through the vault adapter (design D14 items 8, 13): a vault is
+  // required, and the vault identity guard holds.
+  assertNoteVaultForWrite(vault, "note revert");
   const plan = planNoteRevert(vault, selector, opts);
   if (plan.digest !== digest) {
     throw new NoteRevertError(

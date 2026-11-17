@@ -46,6 +46,9 @@ let vault: string;
 
 function freshVault(): string {
   const dir = mkdtempSync(join(tmpdir(), "o2b-gitignore-guard-"));
+  // A legacy vault: it keeps machine state, so it wants the ignore block.
+  // A vault with no `Brain/` is store-only and keeps none.
+  mkdirSync(join(dir, "Brain"));
   return dir;
 }
 
@@ -403,7 +406,15 @@ function derivedStoreSites(): string[] {
  * paths outside the covered directory) fails the membership assertion.
  */
 const DECLARED_SITES: ReadonlyMap<string, string> = new Map([
+  [
+    "core/search/brain-store/location.ts",
+    "names the legacy derived-store file to place the store-aware index outside the vault",
+  ],
   ["cli/bootstrap/receipt.ts", "bootstraps the bootstrap lockfile under the store"],
+  [
+    "core/state/machine-state.ts",
+    "names the derived-store tree the machine-state resolver maps into device-local state",
+  ],
   ["cli/bootstrap/run.ts", "CLI bootstrap reporting that names the store"],
   ["cli/brain/help-text.ts", "help prose naming the store directory"],
   ["cli/brain/verbs/bench.ts", "bench runs default dir, composed from BENCH_RUNS_REL"],
@@ -435,6 +446,10 @@ const DECLARED_SITES: ReadonlyMap<string, string> = new Map([
   [
     "core/brain/inject-failopen.ts",
     "inject cache under the store, spelled as the private INJECT_CACHE_DIR beside its join",
+  ],
+  [
+    "core/brain/lessons-promotion.ts",
+    "lesson-approval ledger under the store (t_1e952e43), the decisions-in-force table",
   ],
   ["core/brain/maintenance/journal.ts", "maintenance journals under the store"],
   ["core/brain/maintenance/lease.ts", "maintenance lease sqlite under the store"],
@@ -468,6 +483,10 @@ const DECLARED_SITES: ReadonlyMap<string, string> = new Map([
   [
     "core/install/adapters/aider-wrapper.ts",
     "aider context artifact under the store, spelled as a join literal",
+  ],
+  [
+    "core/install/instruction-block.ts",
+    "instruction-block ownership lockfile under the store (t_ba41a78a)",
   ],
   ["core/install/manifest.ts", "install lockfile under the store, spelled as a join literal"],
   ["core/maintenance/self-heal-upgrade-state.ts", "self-heal upgrade state under the store"],

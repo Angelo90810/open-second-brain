@@ -22,10 +22,20 @@
  * recompute counters.
  */
 
-import { existsSync } from "node:fs";
 import { join } from "node:path";
 
+import { PREFERENCE_EVIDENCE_KIND, type EvidenceResult } from "../store/constants.ts";
+import {
+  isPrivatePageFile,
+  isPrivatePreference,
+  MERGED_FROM_FIELD,
+  preferenceEvidenceRecord,
+} from "../store/dual-write-records.ts";
+import { storeWrite } from "../store/store-write.ts";
+
 import { regenerateActiveQuiet } from "./active.ts";
+import { preferencesStoreOnly, storePreferenceEntry } from "./preference-store.ts";
+import { countersForShared } from "../store/read/store-entities.ts";
 import { computeContentHash } from "./content-hash.ts";
 import { buildEntityIndex } from "./entities/index-builder.ts";
 import { guardEntityMerge, type GuardEntityLike } from "./truth/merge-guard.ts";
@@ -33,7 +43,13 @@ import { resolveAppendShardId } from "./ledger-shards.ts";
 import { appendLogEvent, logShardWikilink } from "./log.ts";
 import { brainDirs, preferencePath } from "./paths.ts";
 import { appendPrefAudit } from "./pref-audit.ts";
-import { moveToRetired, parsePreference, writePreference } from "./preference.ts";
+import {
+  loadPreference,
+  moveToRetired,
+  parsePreference,
+  preferencePresence,
+  writePreference,
+} from "./preference.ts";
 import { isoDate, isoSecond } from "./time.ts";
 import { BRAIN_LOG_EVENT_KIND, BRAIN_RETIRED_REASON, PREF_AUDIT_OP } from "./types.ts";
 import { renderPrefLink } from "./wikilink.ts";
@@ -102,33 +118,36 @@ export function mergePreferences(
   const keepPath = preferencePath(vault, keepSlug);
   const dropPath = preferencePath(vault, dropSlug);
 
-  if (!existsSync(keepPath)) {
-    if (existsSync(join(brainDirs(vault).retired, `ret-${keepSlug}.md`))) {
+  // The pages on an unswitched machine, the store's fold once switched.
+  const keepPresence = preferencePresence(vault, keepSlug);
+  if (keepPresence !== "active") {
+    if (keepPresence === "retired") {
       throw new BrainMergeError(
         "keep-not-found",
         `keep '${keepId}' is already retired; cannot merge into a retired pref`,
       );
     }
-    throw new BrainMergeError(
-      "keep-not-found",
-      `keep '${keepId}' not found under Brain/preferences/`,
-    );
+    throw new BrainMergeError("keep-not-found", `keep preference '${keepId}' not found`);
   }
-  if (!existsSync(dropPath)) {
-    if (existsSync(join(brainDirs(vault).retired, `ret-${dropSlug}.md`))) {
-      throw new BrainMergeError(
-        "drop-already-retired",
-        `drop '${dropId}' is already in Brain/retired/`,
-      );
+  const dropPresence = preferencePresence(vault, dropSlug);
+  if (dropPresence !== "active") {
+    if (dropPresence === "retired") {
+      throw new BrainMergeError("drop-already-retired", `drop '${dropId}' is already retired`);
     }
-    throw new BrainMergeError(
-      "drop-not-found",
-      `drop '${dropId}' not found under Brain/preferences/`,
-    );
+    throw new BrainMergeError("drop-not-found", `drop preference '${dropId}' not found`);
   }
 
-  const keep = parsePreference(keepPath);
-  const drop = parsePreference(dropPath);
+  // Once switched the fold is the only source: a preference gone since
+  // the presence check is not found, and no page path is read.
+  const storeOnly = preferencesStoreOnly(vault);
+  const load = (slug: string, path: string, code: "keep-not-found" | "drop-not-found") => {
+    const loaded = loadPreference(vault, slug);
+    if (loaded !== null) return loaded;
+    if (storeOnly) throw new BrainMergeError(code, `preference 'pref-${slug}' not found`);
+    return parsePreference(path);
+  };
+  const keep = load(keepSlug, keepPath, "keep-not-found");
+  const drop = load(dropSlug, dropPath, "drop-not-found");
 
   if (!isMergeableStatus(keep.status)) {
     throw new BrainMergeError(
@@ -188,8 +207,42 @@ export function mergePreferences(
   }
 
   const merged_evidenced_by = mergeEvidencedBy(keep.evidenced_by, drop.evidenced_by);
-  const applied_sum = keep.applied_count + drop.applied_count;
-  const violated_sum = keep.violated_count + drop.violated_count;
+  // Once switched, a shared preference's private uses stay out of the
+  // sums the merge log event and audit trail carry (task 3.18), and a drop
+  // record an earlier, interrupted run of this merge already copied to the
+  // keep is counted once, in the keep's counters.
+  const counts = (pref: typeof keep, slug: string) => {
+    const entry = storeOnly ? storePreferenceEntry(slug) : undefined;
+    if (entry === undefined) return { applied: pref.applied_count, violated: pref.violated_count };
+    const counters = countersForShared(entry);
+    return { applied: counters.applied_count, violated: counters.violated_count };
+  };
+  const keepCounts = counts(keep, keepSlug);
+  const dropCounts = ((): { applied: number; violated: number } => {
+    const dropEntry = storeOnly ? storePreferenceEntry(dropSlug) : undefined;
+    if (dropEntry === undefined) return counts(drop, dropSlug);
+    const copied = new Set(
+      (storePreferenceEntry(keepSlug)?.state.history ?? [])
+        .map((record) => record.body[MERGED_FROM_FIELD])
+        .filter((id): id is string => typeof id === "string"),
+    );
+    let applied = 0;
+    let violated = 0;
+    for (const record of dropEntry.state.history) {
+      if (record.kind !== PREFERENCE_EVIDENCE_KIND || copied.has(record.id)) continue;
+      // A private use counts unless the keep it lands on is shared: copied
+      // to a private keep (or from a private drop) it is part of the keep.
+      const keepPrivate = storePreferenceEntry(keepSlug)?.private ?? true;
+      if (!dropEntry.private && !keepPrivate && dropEntry.privateRecordIds.has(record.id)) {
+        continue;
+      }
+      if (record.body["result"] === "applied") applied += 1;
+      else if (record.body["result"] === "violated") violated += 1;
+    }
+    return { applied, violated };
+  })();
+  const applied_sum = keepCounts.applied + dropCounts.applied;
+  const violated_sum = keepCounts.violated + dropCounts.violated;
   const last_evidence_at = maxIso(keep.last_evidence_at, drop.last_evidence_at);
 
   const plan: MergePlan = Object.freeze({
@@ -201,7 +254,10 @@ export function mergePreferences(
     applied_sum,
     violated_sum,
     last_evidence_at,
-    retired_path: join(brainDirs(vault).retired, `ret-${dropSlug}.md`),
+    // Once switched no page is written: the retired record's id names it.
+    retired_path: storeOnly
+      ? `ret-${dropSlug}`
+      : join(brainDirs(vault).retired, `ret-${dropSlug}.md`),
   });
 
   if (dryRun) return plan;
@@ -235,6 +291,53 @@ export function mergePreferences(
     },
     { overwrite: true },
   );
+
+  // 1b. Once switched the fold derives the counters from evidence records
+  //     and ignores a counter written as a field, so the keep absorbs the
+  //     drop's counters as evidence: one evidence record per drop
+  //     evidence record, private when either side is.
+  if (storeOnly) {
+    const dropEntry = storePreferenceEntry(dropSlug);
+    const keepEntry = storePreferenceEntry(keepSlug);
+    // The merge's steps are separate store writes. A merge retried after
+    // a step past this one failed (the drop still active) must not copy
+    // the drop's evidence a second time: each copy names the record it
+    // copies, and a record the keep already holds a copy of is skipped.
+    const copied = new Set(
+      (keepEntry?.state.history ?? [])
+        .map((record) => record.body[MERGED_FROM_FIELD])
+        .filter((id): id is string => typeof id === "string"),
+    );
+    const evidence = (dropEntry?.state.history ?? []).filter(
+      (record) => record.kind === PREFERENCE_EVIDENCE_KIND && !copied.has(record.id),
+    );
+    if (evidence.length > 0) {
+      const pairPrivate = (keepEntry?.private ?? true) || (dropEntry?.private ?? true);
+      // A record of the drop that sits in `private` (its artifact named a
+      // private page) stays there as a copy too. One store write lands in
+      // one partition, so the shared and the private copies are two writes.
+      const isPrivate = (record: (typeof evidence)[number]): boolean =>
+        pairPrivate || (dropEntry?.privateRecordIds.has(record.id) ?? true);
+      for (const group of [evidence.filter((r) => !isPrivate(r)), evidence.filter(isPrivate)]) {
+        if (group.length === 0) continue;
+        storeWrite(
+          () =>
+            group.map((record) =>
+              preferenceEvidenceRecord({
+                id: keep.id,
+                result: record.body["result"] as EvidenceResult,
+                artifact:
+                  typeof record.body["artifact"] === "string" ? record.body["artifact"] : "",
+                agent: opts.agentName ?? "merge",
+                private: isPrivate(record),
+                mergedFrom: record.id,
+              }),
+            ),
+          { vault },
+        );
+      }
+    }
+  }
 
   // 2. Move drop to retired/ with merged-into reason. moveToRetired
   //    re-reads the source file, so the latest on-disk state is
@@ -274,6 +377,12 @@ export function mergePreferences(
         revision_after: keep.revision ?? null,
         hash_before: keepHash,
         hash_after: keepHash,
+        // The row names the drop too (`merged-in <drop>`): private when
+        // either side is. The drop is already in `retired/` by now.
+        private: () =>
+          (storeOnly
+            ? (storePreferenceEntry(keepSlug)?.private ?? true)
+            : isPrivatePageFile(keepPath)) || isPrivatePreference(vault, dropSlug),
       },
       { now },
     );
@@ -291,8 +400,8 @@ export function mergePreferences(
         keep: renderPrefLink({ id: keep.id, principle: keep.principle }),
         drop: renderPrefLink({ id: drop.id, principle: drop.principle }),
         signal_union: `${merged_evidenced_by.length} (was ${keep.evidenced_by.length}, ${drop.evidenced_by.length})`,
-        applied_sum: `${applied_sum} (was ${keep.applied_count}, ${drop.applied_count})`,
-        violated_sum: `${violated_sum} (was ${keep.violated_count}, ${drop.violated_count})`,
+        applied_sum: `${applied_sum} (was ${keepCounts.applied}, ${dropCounts.applied})`,
+        violated_sum: `${violated_sum} (was ${keepCounts.violated}, ${dropCounts.violated})`,
         agent: opts.agentName ?? "unknown",
       },
     },
@@ -301,7 +410,9 @@ export function mergePreferences(
 
   // 4. Regenerate active.md so the operator sees the new state on
   //    their next session start.
-  regenerateActiveQuiet(vault, { now });
+  // The digest is a page of the legacy tree; a store-only machine renders
+  // it on demand (design D14 item 7).
+  if (!preferencesStoreOnly(vault)) regenerateActiveQuiet(vault, { now });
 
   return plan;
 }

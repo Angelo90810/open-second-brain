@@ -13,7 +13,8 @@ import {
 } from "../validate.ts";
 import { resolveVaultScope } from "../vault-scope/index.ts";
 import { DEFAULT_HYBRID_DEADLINE_MS } from "./pipeline/request.ts";
-import { resolveIndexPath, SEARCH_DB_CONFIG_KEY, SEARCH_DB_ENV } from "./paths.ts";
+import { resolveIndexPathForProbe, SEARCH_DB_CONFIG_KEY, SEARCH_DB_ENV } from "./paths.ts";
+import { resolveIndexedStoreProbe } from "./brain-store/location.ts";
 import { buildFtsTokenize } from "./schema.ts";
 import { isFusionMode, DEFAULT_RRF_K } from "./fusion.ts";
 import { DEFAULT_RECENCY } from "./recency.ts";
@@ -768,7 +769,7 @@ const BUILTIN_PROVIDERS: ReadonlySet<string> = new Set([
  */
 function resolveRegistryProvider(
   rawProvider: string | null,
-  vault: string,
+  vault: string | null,
   env: NodeJS.ProcessEnv,
 ): ExpandedProvider | null {
   if (rawProvider === null || BUILTIN_PROVIDERS.has(rawProvider)) return null;
@@ -776,9 +777,12 @@ function resolveRegistryProvider(
     // The vault's custody store joins the probe (store first, reference-
     // shaped probe entries resolved) so a registered provider's key can
     // live in the store; without it the probe reads env exactly as before.
-    return expandRegisteredProvider(rawProvider, loadProviderRegistry(vault), env, {
-      secretsVault: vault,
-    });
+    return expandRegisteredProvider(
+      rawProvider,
+      loadProviderRegistry(vault),
+      env,
+      vault === null ? {} : { secretsVault: vault },
+    );
   } catch (err) {
     // The resolver's named refusals are ANSWERS, not expansion misses: a
     // locked store, a missing keyfile, or a malformed reference in a probe
@@ -807,7 +811,7 @@ function resolveRegistryProvider(
  * rerank env-key read go through, so every key inside one resolved
  * config resolves by one rule.
  */
-function resolveCredentialValue(vault: string, value: string | null): string | null {
+function resolveCredentialValue(vault: string | null, value: string | null): string | null {
   if (value === null || !isSecretReferenceValue(value)) return value;
   return resolveNamedSecret(vault, value.trim());
 }
@@ -822,7 +826,7 @@ function resolveCredentialValue(vault: string, value: string | null): string | n
  * name the registry does not hold is no profile.
  */
 export function resolveCredentialContext(opts: {
-  vault: string;
+  vault: string | null;
   configPath?: string;
   env?: NodeJS.ProcessEnv;
 }): CredentialSourceContext {
@@ -847,7 +851,8 @@ export function resolveCredentialContext(opts: {
 }
 
 export function resolveSearchConfig(opts: {
-  vault: string;
+  /** The vault, or `null` with no vault: the index then holds the brain store only (D14). */
+  vault: string | null;
   configPath?: string;
   overrides?: SearchConfigOverrides;
 }): ResolvedSearchConfig {
@@ -856,9 +861,19 @@ export function resolveSearchConfig(opts: {
     ? discoverConfig(opts.configPath).data
     : {};
 
-  const dbPath = resolveIndexPath(
+  // The brain store the index catches up from, when one is in use; the
+  // index then lives in the store's device-local state (design D5).
+  const storeProbe = resolveIndexedStoreProbe({
+    vault: opts.vault,
+    config,
+    configPath: opts.configPath ?? null,
+  });
+  const brainStore = storeProbe.kind === "store" ? storeProbe.store : null;
+  // An `unknown` probe keeps the store index this machine last wrote.
+  const dbPath = resolveIndexPathForProbe(
     opts.vault,
     envOrConfig(env, config, SEARCH_DB_ENV, SEARCH_DB_CONFIG_KEY),
+    storeProbe,
   );
 
   const chunkSize = parseInteger(
@@ -1558,6 +1573,8 @@ export function resolveSearchConfig(opts: {
   const base: ResolvedSearchConfig = Object.freeze({
     vault: opts.vault,
     dbPath,
+    brainStore,
+    ...(storeProbe.kind === "unknown" ? { brainStoreUnknown: true } : {}),
     configPath: opts.configPath ?? null,
     scopeRules,
     chunkSize,

@@ -1,8 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 
 import { nestedCommandGroups } from "../../src/cli/command-manifest.ts";
 import { renderCompletions } from "../../src/cli/completions.ts";
 import { runCli } from "../helpers/run-cli.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 describe("CLI command manifest", () => {
   test("help --json lists root commands, nested verbs, and inherited json flag", async () => {
@@ -30,6 +34,9 @@ describe("CLI command manifest", () => {
     const brainVerbs = brain.commands.map((command: any) => command.name);
     expect(brainVerbs).toContain("doctor");
     expect(brainVerbs).toContain("mcp-landscape");
+    // t_1e952e43: the lessons verb family is a manifest entry, so shell
+    // completions and help --json offer it.
+    expect(brainVerbs).toContain("lessons");
   });
 });
 

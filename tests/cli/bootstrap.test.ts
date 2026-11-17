@@ -17,7 +17,7 @@
  * that shells out on a real host.
  */
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, test } from "bun:test";
 import {
   existsSync,
   mkdirSync,
@@ -53,6 +53,10 @@ import { JSONRPC_VERSION } from "../../src/mcp/protocol.ts";
 // in a forwarding mock (captured before the mock is installed, or the
 // forward would recurse) that fails only while a flag is set.
 import * as payloadModule from "../../src/core/install/payload.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 const realBuildPayload = payloadModule.buildPayload;
 let failPayloadBuild = false;
@@ -79,7 +83,9 @@ beforeEach(() => {
   vault = join(tempRoot, "brain vault");
   codexHome = join(tempRoot, "codex-home");
   opencodeHome = join(tempRoot, "opencode-home");
-  mkdirSync(vault, { recursive: true });
+  // A legacy vault: it keeps its machine state (the bootstrap receipt). A
+  // vault with no `Brain/` is store-only and keeps it device-local instead.
+  mkdirSync(join(vault, "Brain"), { recursive: true });
   // Both subprocess seams are injected for the whole suite: the codex
   // adapter must take its file-fallback path (no binary), and the host
   // probe must report the binary missing (no `codex mcp list` spawn).

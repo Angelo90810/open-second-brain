@@ -13,7 +13,7 @@
  * an apply is measured against the exact set of paths that changed.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,7 +26,11 @@ import { resetVaultIdentityPins } from "../../src/core/brain/vault-identity.ts";
 import { HYGIENE_TOOLS } from "../../src/mcp/brain/hygiene-tools.ts";
 import { PROPERTY_DESCRIPTION_MAX, TOOL_DESCRIPTION_MAX } from "../../src/mcp/registry-guard.ts";
 import { runCli } from "../helpers/run-cli.ts";
-import { changedPaths, digestVaultFiles, digestVaultTree } from "../helpers/vault-digest.ts";
+import { changedPaths, treeEntries, digestVaultTree } from "../helpers/vault-digest.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 let tmp: string;
 let vault: string;
@@ -183,7 +187,7 @@ describe("o2b brain hygiene apply", () => {
   test("an apply changes exactly the set the merge reports", async () => {
     seedDuplicatePair();
     const id = (await scan("--detectors", "dedup")).findings[0]!.id;
-    const before = digestVaultFiles(vault);
+    const before = treeEntries(vault);
 
     const out = await runCli(
       [
@@ -210,7 +214,7 @@ describe("o2b brain hygiene apply", () => {
     // A merge keeps the first target, retires the second, and records the
     // action in the hygiene audit log. Naming the set means a write
     // anywhere else fails this test.
-    const changed = changedPaths(before, digestVaultFiles(vault));
+    const changed = changedPaths(before, treeEntries(vault));
     expect(changed.filter((p) => p.startsWith("Brain/preferences/"))).toEqual([
       "Brain/preferences/pref-dup-a.md",
       "Brain/preferences/pref-dup-b.md",

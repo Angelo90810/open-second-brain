@@ -13,9 +13,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { appendAuditRecord } from "../reliability/audit.ts";
+import { isStoreOnly } from "../store/store-only.ts";
 import { atomicWriteText } from "../fs-atomic.ts";
 import { withFileLock } from "../reliability/lock.ts";
 import { brainConfigPath, brainDirsForWrite } from "./paths.ts";
+import { applySchemaMutationsToStore } from "./schema-mutate-store.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 import { REVIEW_LANE } from "./write-gate.ts";
 import { refuseDocumentDeny, type WriteSubject } from "./write-disposition.ts";
@@ -31,6 +33,7 @@ import {
   parseSchemaPack,
   renderSchemaBlock,
   replaceSchemaBlock,
+  pairEndpoints,
   schemaPackTokens,
   validateEndpointPair,
   FRONTMATTER_TIERS,
@@ -39,6 +42,7 @@ import {
 } from "./schema-pack.ts";
 import {
   SCHEMA_VOCAB_CATEGORIES,
+  resolveSchemaVocabulary,
   validateSchemaDeclarations,
   validateSchemaToken,
   type BrainSchemaDeclarations,
@@ -133,6 +137,13 @@ export interface ApplySchemaMutationsOptions {
    * label is an audit field, not an identity a policy can answer on.
    */
   readonly subject?: WriteSubject;
+  /**
+   * Authority of the store records on a store-only machine: `human` from
+   * the CLI, `agent` from MCP. Absent: decided by the process's origin.
+   */
+  readonly authority?: "human" | "agent";
+  /** Store-only: adopt unattested deciding records (operator only; `./schema-mutate-store.ts`). */
+  readonly adoptUnattested?: boolean;
 }
 
 export interface ApplySchemaMutationsResult {
@@ -181,6 +192,11 @@ export interface PreviewSchemaMutationsResult {
   readonly diff: ReadonlyArray<SchemaPackDiffEntry>;
 }
 
+/** The refusal of an adoption with no mutation on an unswitched machine. */
+export const SCHEMA_ADOPT_ONLY_UNSWITCHED =
+  "schema apply --adopt-unattested without a mutation is for a store-only machine; " +
+  "this one reads its schema from the vault file, which has no records to adopt";
+
 /**
  * Separates a leaf's path from its value when keying a list MEMBER, so two
  * members of the same list do not collide in the flat map the diff walks. A
@@ -215,7 +231,16 @@ export async function applySchemaMutations(
   // Vault-identity write guard (context-integrity-gates, Unit J), ahead
   // of the `_brain.yaml` rewrite - the trailing audit append is far too
   // late to stop a schema landing in the wrong store.
-  assertVaultIdentityForWrite(vault);
+  const storeOnly = isStoreOnly({ vault });
+  // A store-only machine checks the store's identity on the write itself;
+  // the vault identity guard is the legacy tree's.
+  if (!storeOnly) assertVaultIdentityForWrite(vault);
+  // Adoption alone (an empty batch) is for a store-only machine: the file
+  // path has no records to adopt, and an empty apply there would rewrite
+  // and re-attest `_brain.yaml` as it stands.
+  if (!storeOnly && mutations.length === 0 && opts.adoptUnattested === true) {
+    throw new Error(SCHEMA_ADOPT_ONLY_UNSWITCHED);
+  }
   // Deny-consulted evidence (write-side trust, PR #247 review M3 residual,
   // schema sibling): a schema batch rewrites the operator's vocabulary pack
   // - the same mutation-lane shape as update, append and delete_by_source -
@@ -231,8 +256,19 @@ export async function applySchemaMutations(
     target: BRAIN_CONFIG_TARGET,
     ...(opts.now !== undefined ? { now: opts.now } : {}),
   });
-  const configPath = brainConfigPath(vault);
   const now = opts.now ?? new Date();
+  if (storeOnly) {
+    return await applySchemaMutationsToStore(vault, mutations, {
+      actor: opts.actor,
+      now,
+      ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
+      ...(opts.lockStaleMs !== undefined ? { lockStaleMs: opts.lockStaleMs } : {}),
+      ...(opts.authority !== undefined ? { authority: opts.authority } : {}),
+      ...(opts.adoptUnattested === true ? { adoptUnattested: true } : {}),
+      next: (current) => applyMutationsToPack(current, mutations),
+    });
+  }
+  const configPath = brainConfigPath(vault);
   return await withFileLock(configPath, { staleMs: opts.lockStaleMs ?? 30_000, retries: 3 }, () => {
     const before = existsSync(configPath)
       ? readFileSync(configPath, "utf8")
@@ -264,6 +300,7 @@ export async function applySchemaMutations(
           ...(opts.reason ? { reason: opts.reason } : {}),
         },
       },
+      vault,
     );
     return {
       applied: mutations.length,
@@ -434,6 +471,11 @@ function applyOne(pack: MutableSchemaPack, mutation: SchemaMutation): void {
       removeValue(pack.extractable, token);
       delete pack.expert_routing[token];
       delete pack.attributes[token];
+      for (const [linkType, pairs] of Object.entries(pack.link_constraints)) {
+        const kept = pairs.filter((pair) => !pairEndpoints(pair).includes(token));
+        if (kept.length > 0) pack.link_constraints[linkType] = kept;
+        else delete pack.link_constraints[linkType];
+      }
       return;
     }
     case "update_type": {
@@ -500,6 +542,17 @@ function applyOne(pack: MutableSchemaPack, mutation: SchemaMutation): void {
       const token = validateSchemaToken(mutation.token, "schema.link_types");
       removeValue(pack.link_types, token);
       delete pack.link_constraints[token];
+      // A pair of another link type may name the link type as an endpoint;
+      // it goes with it unless a vocabulary type keeps the token declared.
+      const vocabulary = resolveSchemaVocabulary(pruneDeclarations(pack.declarations));
+      if (SCHEMA_VOCAB_CATEGORIES.some((category) => vocabulary[category].includes(token))) {
+        return;
+      }
+      for (const [linkType, pairs] of Object.entries(pack.link_constraints)) {
+        const kept = pairs.filter((pair) => !pairEndpoints(pair).includes(token));
+        if (kept.length > 0) pack.link_constraints[linkType] = kept;
+        else delete pack.link_constraints[linkType];
+      }
       return;
     }
     case "set_extractable": {
@@ -659,9 +712,14 @@ function validateSchemaPackReferences(pack: SchemaPack): void {
       throw new Error(`schema.expert_routing.${token}: token is not declared`);
     }
   }
-  for (const linkType of Object.keys(pack.link_constraints)) {
+  for (const [linkType, pairs] of Object.entries(pack.link_constraints)) {
     if (!pack.link_types.includes(linkType)) {
       throw new Error(`schema.link_constraints.${linkType}: link type is not declared`);
+    }
+    for (const pair of pairs) {
+      if (!pairEndpoints(pair).every((token) => tokens.has(token))) {
+        throw new Error(`schema.link_constraints.${linkType}: ${pair}: token is not declared`);
+      }
     }
   }
   for (const type of Object.keys(pack.attributes)) {

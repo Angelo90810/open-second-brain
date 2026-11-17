@@ -107,6 +107,9 @@ const HOOK_SPEC: ReadonlyArray<{ event: string; groups: ReadonlyArray<HookGroupS
           // the plugin's own order: default-off, fail-soft exit 0, read-only
           // over Brain/log with its cursor in the vault's derived store.
           "log-catchup",
+          // The human view render (brain store, design D7), in the plugin's
+          // own order: a no-op off the view writer, hourly on it, fail-open.
+          "view-render",
           "session-capture",
         ],
       },
@@ -120,6 +123,7 @@ const HOOK_SPEC: ReadonlyArray<{ event: string; groups: ReadonlyArray<HookGroupS
           "session-capture",
           "recall-inject",
           "nav-inject",
+          "neighbour-updates",
           // The opt-in counterparty brief (dated commitments), in the
           // plugin's own order: default-off like recall-inject, once per
           // session through the injection ledger, one additionalContext

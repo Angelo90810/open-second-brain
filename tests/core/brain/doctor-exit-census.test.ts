@@ -197,10 +197,12 @@ const DOCTOR_REGISTERED_CODES: ReadonlyArray<string> = [
   "inbox-archivable",
   "log-chain-broken",
   "low-evidence-confirmed",
+  "migration-available",
   "orphan-evidence",
   "orphan-session-ref",
   "payload-orphan",
   "permissions-agent-denied",
+  "permissions-legacy-only",
   "permissions-unreadable",
   "principle-corrupted",
   "recall-channel-silent",
@@ -214,11 +216,14 @@ const DOCTOR_REGISTERED_CODES: ReadonlyArray<string> = [
   "stale-dependency",
   "storage-capacity-critical",
   "storage-capacity-warn",
+  "store-missing",
+  "store-shard-corrupt-line",
   "sync-conflict-log",
   "tier-drift",
   "topic-key-collision",
   "vault-frozen",
   "vault-walk-entry-skipped",
+  "view-writer-silent",
 ];
 
 /** A reason has to say something; a placeholder cannot reach this. */

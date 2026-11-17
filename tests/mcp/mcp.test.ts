@@ -260,6 +260,10 @@ describe("tool listing", () => {
         "brain_receipts",
         // The vault storage report (storage-lifecycle).
         "brain_storage",
+        // The brain store change probe (brain store and topics, phase 1).
+        "brain_changes",
+        // Shared brain settings writer (brain store and topics, task 2.11).
+        "brain_settings",
         // Observed-use verdict feeding recall ranking (Retrieval & Ranking Quality).
         "brain_observed_use",
         "brain_knowledge_gaps",
@@ -270,6 +274,9 @@ describe("tool listing", () => {
         "brain_session_expand",
         // Procedural-learning surfaces (v0.30.0).
         "brain_skill_proposals",
+        // Benchmark-gated rewrite status (agent-presence, t_635e3e72):
+        // read-only ids-and-rates status; MCP never accepts or scores.
+        "brain_skill_rewrite_status",
         "brain_procedural_memory",
         "brain_procedural_graph",
         "brain_recurrence",
@@ -370,6 +377,8 @@ describe("tool listing", () => {
         "brain_retrieval_plan",
         // Durable token-impact ledger (context-pack-economics-observability).
         "brain_token_impact",
+        // Topics (brain-store-and-topics phase 3).
+        "brain_topic",
       ].toSorted(),
     );
     // Explicit grep: legacy writable tools are no longer advertised.

@@ -5,6 +5,10 @@ import { interleaveShardRows, jsonlLedgerGrammar, readShardLinesByShard } from "
 import { BRAIN_LOG_REL } from "./path-constants.ts";
 import { proceduralRecurrencePath, RECURRENCE_LEDGER_STEM } from "./paths.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
+import { readLedgerRows } from "../store/read/ledger-rows.ts";
+import { routeWrite } from "../store/store-write.ts";
+import { DUAL_WRITE_LEDGERS, ledgerRowRecord } from "../store/dual-write-records.ts";
+import { claimSourceIsPrivate, rowNamesPrivatePage } from "../store/reference-privacy.ts";
 
 /** The recurrence ledger's file-name layout, handed to the shared shard grammar. */
 const RECURRENCE_LEDGER_GRAMMAR = jsonlLedgerGrammar(RECURRENCE_LEDGER_STEM);
@@ -104,10 +108,11 @@ export interface RecurrenceCadence {
 export function listRecurrenceCadences(
   vault: string,
   thresholds: RecurrenceThresholds = DEFAULT_THRESHOLDS,
+  opts: RecurrenceReadOptions = {},
 ): ReadonlyArray<RecurrenceCadence> {
-  const entries = listRecurrenceEntries(vault, thresholds);
+  const entries = listRecurrenceEntries(vault, thresholds, opts);
   if (entries.length === 0) return Object.freeze([]);
-  const events = readEvents(vault);
+  const events = readEvents(vault, opts);
   const purged = new Set(events.filter((e) => e.kind === "purge-source").map((e) => e.sourceId));
   const byHash = new Map<string, string[]>();
   for (const e of events) {
@@ -148,8 +153,9 @@ export function listRecurrenceCadences(
 export function listRecurrenceEntries(
   vault: string,
   thresholds: RecurrenceThresholds = DEFAULT_THRESHOLDS,
+  opts: RecurrenceReadOptions = {},
 ): ReadonlyArray<RecurrenceEntry> {
-  const events = readEvents(vault);
+  const events = readEvents(vault, opts);
   const state = new Map<string, { supportBySourceScope: Map<string, number> }>();
 
   for (const event of events) {
@@ -236,12 +242,29 @@ function commitmentForSupport(
 }
 
 function appendEvent(vault: string, event: RecurrenceEvent): void {
-  // Vault-identity write guard (context-integrity-gates, Unit J).
-  assertVaultIdentityForWrite(vault);
-  // This device's shard (t_774dea61); the path helper confines it to the vault.
-  const path = proceduralRecurrencePath(vault);
-  mkdirSync(dirname(path), { recursive: true });
-  appendFileSync(path, `${JSON.stringify(event)}\n`, { encoding: "utf8" });
+  // One `recurrence` ledger row on a store-only machine (design D14 item
+  // 1), this device's legacy shard plus the dual write otherwise.
+  // `sourceId` and `scope` can name a page: a source that is a private
+  // page, or a page link that names none here, goes to `private` only.
+  routeWrite({
+    legacy: () => {
+      // Vault-identity write guard (context-integrity-gates, Unit J).
+      assertVaultIdentityForWrite(vault);
+      // This device's shard (t_774dea61); the path helper confines it to the vault.
+      const path = proceduralRecurrencePath(vault);
+      mkdirSync(dirname(path), { recursive: true });
+      appendFileSync(path, `${JSON.stringify(event)}\n`, { encoding: "utf8" });
+    },
+    store: () =>
+      ledgerRowRecord(
+        DUAL_WRITE_LEDGERS.recurrence,
+        event,
+        claimSourceIsPrivate(vault, event.sourceId) || rowNamesPrivatePage(vault, event)
+          ? "private"
+          : "shared",
+      ),
+    context: { vault },
+  });
 }
 
 /**
@@ -263,7 +286,36 @@ function parseEvent(line: string): RecurrenceEvent | null {
   }
 }
 
-function readEvents(vault: string): RecurrenceEvent[] {
+/**
+ * Read options for the recurrence fold. With `excludePrivateEvents`,
+ * every support event the writer classified private is dropped BEFORE
+ * the fold - the same verdicts the writer applied at append time
+ * ({@link claimSourceIsPrivate} on the source, {@link rowNamesPrivatePage}
+ * on the row) - so an entry's scopes, support count and commitment are
+ * built only from evidence the caller may be shown, and no private
+ * scope string survives into a projected title.
+ */
+export interface RecurrenceReadOptions {
+  readonly excludePrivateEvents?: boolean;
+}
+
+function readEvents(vault: string, opts: RecurrenceReadOptions = {}): RecurrenceEvent[] {
+  // A store-only machine reads the `recurrence` ledger rows in fold order,
+  // the one order every machine agrees on (design D3).
+  const events = readLedgerRows<RecurrenceEvent>(DUAL_WRITE_LEDGERS.recurrence, readLegacyEvents, {
+    vault,
+  }).filter((event) => event !== null && typeof event === "object");
+  if (opts.excludePrivateEvents !== true) return events;
+  // Purge events carry no page name and only ever shrink the fold; the
+  // support events they purge are already judged individually.
+  return events.filter(
+    (event) =>
+      event.kind === "purge-source" ||
+      !(claimSourceIsPrivate(vault, event.sourceId) || rowNamesPrivatePage(vault, event)),
+  );
+}
+
+function readLegacyEvents(vault: string): RecurrenceEvent[] {
   // Merged read over every device's shard (t_774dea61), interleaved by
   // event time with each shard keeping its own file order. The fold is
   // order-sensitive (`purge-source` deletes, `forget` decrements), so a

@@ -72,6 +72,10 @@ import { brainDirs, dreamWorkrunPath } from "../../../src/core/brain/paths.ts";
 import { BRAIN_SNAPSHOT_REASON } from "../../../src/core/brain/types.ts";
 import { atomicWriteFileSync } from "../../../src/core/fs-atomic.ts";
 import { maskLogChainDigests } from "../../helpers/vault-digest.ts";
+import { useUnshardedLegacyLog } from "../../helpers/device-id.ts";
+
+// The legacy day log and ledgers are read under their un-sharded names.
+useUnshardedLegacyLog();
 
 const NOW = new Date("2026-06-01T00:00:00Z");
 
@@ -257,10 +261,16 @@ describe("the dream pass runs behind the gate, not beside it", () => {
     // bootstrapped `_BRAIN.md` names the new directory. Verified before
     // updating: with `dream.archive_stale_signals: false` and the previous
     // manual template this branch reproduces the previous literal exactly.
+    //
+    // Re-measured a FIFTH time, for one named reason: the bootstrapped
+    // `_BRAIN.md` carries a `template_revision:` line in its frontmatter,
+    // so a release never rewrites a manual a newer release wrote. Verified
+    // before updating: with that one template line removed, this branch
+    // reproduces the previous literal exactly.
     seedSignal("tidy");
     dream(vault, { now: NOW, agentName: "tester" });
     expect(dreamOutputDigest(join(vault, "Brain"))).toBe(
-      "cc900f3916b844d2fb04f8156b04a5e0ee6f70115035f790580742e036477f61",
+      "044a18bcd0538c768e0c5d98e071125683805ceb6579f2acbadc96916a126210",
     );
   });
 

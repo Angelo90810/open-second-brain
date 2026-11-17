@@ -335,6 +335,9 @@ export const PREVIEW_BUDGET_EXEMPT: Readonly<Record<string, string>> = Object.fr
   brain_feedback: "write; returns a small fixed-shape ack",
   brain_apply_evidence: "write; returns a small fixed-shape ack",
   brain_note: "write; returns a small fixed-shape ack",
+  brain_settings:
+    "small fixed-shape answers: one setting, or the list of shared settings that are set, " +
+    "bounded by the closed key classification",
   brain_observed_use: "write; returns a small fixed-shape ack (records/aggregates count)",
   // The four note writers. Their receipts are no longer fixed-shape:
   // each carries an additive `lint` key over the pages it committed
@@ -350,7 +353,7 @@ export const PREVIEW_BUDGET_EXEMPT: Readonly<Record<string, string>> = Object.fr
     "write; returns the appended note path, the kernel's appended flag, and a page-lint finding list capped and self-declaring its truncation",
   brain_write_batch:
     "write; returns a bounded per-operation result list, an applied count, and one page-lint finding list capped and self-declaring its truncation",
-  brain_pinned_context: "pinned.md is operator-curated and small by practice",
+  brain_pinned_context: "pinned context is operator-curated and small by practice",
   brain_recall_feedback: "write; returns one event receipt plus bounded weights",
   brain_switch_vault: "write; returns a small profile ack",
   brain_write_session: "lifecycle ops return one fixed-shape envelope; prompts are kernel-bounded",
@@ -369,7 +372,7 @@ export const PREVIEW_BUDGET_EXEMPT: Readonly<Record<string, string>> = Object.fr
   // `dry_run: true` this tool is not a write at all and returns no receipt:
   // it returns the entire resulting pack plus a leaf-level diff.
   schema_apply_mutations:
-    "returns the whole resulting schema pack - plus a leaf diff under dry_run, which writes nothing; bounded by the size of the schema block in Brain/_brain.yaml, which the operator curates",
+    "returns the whole resulting schema pack - plus a leaf diff under dry_run, which writes nothing; bounded by the size of the schema pack, which the operator curates",
 
   // Bounded-by-construction reads.
   second_brain_capabilities: "fixed-size capability report",
@@ -405,9 +408,14 @@ export const PREVIEW_BUDGET_EXEMPT: Readonly<Record<string, string>> = Object.fr
     "bounded destination table: the handler caps the page at limit and total_matched reports " +
     "the pre-truncation count; the fold is recomputed per call, so a cursor pages one walk, " +
     "and the per-kind readers remain the full-record surface",
+  brain_changes:
+    "record ids only, bounded by limit; a cut page says truncated: true and carries the watermark to pass next, which a head preview would cut off",
   brain_context_presets: "small preset list",
   brain_pre_compact_extract: "bounded extract; host injects it whole by design",
   brain_skill_proposals: "bounded proposal list",
+  brain_skill_rewrite_status:
+    "bounded status: one benchmark receipt plus at most ten grade verdict rows for one skill; " +
+    "ids and rates only, never task or transcript text",
   brain_procedural_memory: "bounded hint list",
   brain_procedural_graph: "bounded graph summary",
   brain_recurrence: "bounded recurrence records; learn/forget are writes",

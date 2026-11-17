@@ -1,6 +1,6 @@
 {
   "name": "open-second-brain",
-  "version": "1.97.0",
+  "version": "1.98.0",
   "private": false,
   "description": "Second brain for AI agents using Obsidian-compatible Markdown vaults. Works with Hermes, Claude Code, Codex, and OpenClaw.",
   "keywords": [
@@ -61,14 +61,15 @@
     "prepare": "bun scripts/prepare.ts || exit 0"
   },
   "dependencies": {
-    "proper-lockfile": "^4.1.2"
+    "proper-lockfile": "^4.1.2",
+    "signal-exit": "^3.0.7"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.3",
+    "@types/bun": "^1.4.4",
     "@types/node": "^22.20.5",
     "@types/proper-lockfile": "^4.1.4",
-    "oxfmt": "0.74.0",
-    "oxlint": "1.89.0",
+    "oxfmt": "0.78.0",
+    "oxlint": "1.93.0",
     "typescript": "^5.5.0"
   },
   "optionalDependencies": {

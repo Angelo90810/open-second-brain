@@ -12,6 +12,9 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
+import { storeLogDays } from "./log-days.ts";
+import { withoutPrivateEntries } from "./log-events-at-reach.ts";
+import { memoryFromStore, storePagesIn } from "./memory-pages.ts";
 import { BRAIN_ROOT_REL, brainDirs } from "./paths.ts";
 import { estimateTokens } from "./text/tokenizer.ts";
 
@@ -67,6 +70,35 @@ function sumDir(dir: string): { tokens: number; files: number } {
   return { tokens, files };
 }
 
+/** {@link sumDir} over the store's records whose page sat in `dir`. */
+function sumStorePages(vault: string, dir: string): { tokens: number; files: number } {
+  const pages = storePagesIn(vault, dir);
+  return {
+    tokens: pages.reduce((sum, page) => sum + estimateTokens(page.text), 0),
+    files: pages.length,
+  };
+}
+
+/**
+ * The store's log on a store-only machine, measured as its days: one
+ * "file" per day with an event, the events of the day as JSON lines (the
+ * shape a day file holds). With `withholdsPrivate`, an event of the
+ * store's `private` partition is not measured, and a day left with no
+ * event is not a file.
+ */
+function sumStoreLog(vault: string, withholdsPrivate: boolean): { tokens: number; files: number } {
+  const days = storeLogDays(vault) ?? [];
+  let tokens = 0;
+  let files = 0;
+  for (const day of days) {
+    const entries = withoutPrivateEntries(day.entries, withholdsPrivate);
+    if (entries.length === 0) continue;
+    tokens += estimateTokens(entries.map((entry) => JSON.stringify(entry)).join("\n"));
+    files += 1;
+  }
+  return { tokens, files };
+}
+
 /**
  * Resolve the warn threshold from an env-var override, falling back
  * to the documented default. The env-var path lets cron jobs
@@ -80,9 +112,20 @@ function resolveWarnThreshold(envValue: string | undefined): number {
   return TOKEN_WARN_THRESHOLD_DEFAULT;
 }
 
+export interface ComputeTokenFootprintOptions {
+  readonly warnThreshold?: number;
+  readonly envWarnThreshold?: string;
+  /**
+   * The caller is below local reach: the log bucket leaves out the events
+   * of the store's `private` partition. The page buckets are page
+   * aggregates and count every page. Default false.
+   */
+  readonly withholdsPrivate?: boolean;
+}
+
 export function computeTokenFootprint(
   vault: string,
-  opts: { warnThreshold?: number; envWarnThreshold?: string } = {},
+  opts: ComputeTokenFootprintOptions = {},
 ): TokenFootprintReport {
   const dirs = brainDirs(vault);
   const tracked: Array<[name: string, path: string]> = [
@@ -97,8 +140,15 @@ export function computeTokenFootprint(
   const byCategory: TokenFootprintCategory[] = [];
   let total = 0;
   let totalFiles = 0;
+  // Store-only (task 2.10): the memory records are the fold's, measured
+  // as the pages they would be; the log folder is not a memory record.
+  const fromStore = memoryFromStore(vault);
   for (const [name, path] of tracked) {
-    const { tokens, files } = sumDir(path);
+    let measured: { tokens: number; files: number };
+    if (!fromStore) measured = sumDir(path);
+    else if (name === "log") measured = sumStoreLog(vault, opts.withholdsPrivate === true);
+    else measured = sumStorePages(vault, path);
+    const { tokens, files } = measured;
     byCategory.push({ name, tokens, files });
     total += tokens;
     totalFiles += files;
@@ -108,8 +158,10 @@ export function computeTokenFootprint(
   // already accounted for. We do not recurse into unknown subdirs
   // so a runaway plugin dropping junk under Brain/exotic-thing/ is
   // not silently included; the digest action list flags it instead.
+  // A store-only machine writes nothing under `Brain/`: files left there
+  // are pre-switch copies nothing reads, so they are not counted.
   const brainRoot = join(vault, BRAIN_ROOT_REL);
-  if (existsSync(brainRoot)) {
+  if (!fromStore && existsSync(brainRoot)) {
     let otherTokens = 0;
     let otherFiles = 0;
     for (const name of readdirSync(brainRoot)) {

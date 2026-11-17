@@ -22,23 +22,41 @@
  *     callers (notably `dream`) that want to express intent without
  *     reaching into the `BrainPreference` shape directly.
  *
+ * On a store-only machine (task 2.10) the flip is one `preference-set`
+ * record of the field, read against the store's fold; no page changes.
+ *
  * A successful flip emits a `pin` or `unpin` log event via
  * `appendLogEvent`. A no-op (`changed: false`) emits no log entry — the
  * log is reserved for state transitions, not redundant calls.
  */
 
+import { legacyVaultOf } from "./no-vault.ts";
 import { existsSync } from "node:fs";
 
 import { writeFrontmatterAtomic, parseFrontmatter } from "../vault.ts";
+import { authorityFromOrigin } from "../store/dual-write.ts";
+import { routeWrite } from "../store/store-write.ts";
+import { withOperationPrivacy } from "../store/operation-scope.ts";
+import { preferenceSetRecord } from "../store/dual-write-records.ts";
+import { callerInput, opaqueFields } from "../store/operation-privacy.ts";
 import { regenerateActiveQuiet } from "./active.ts";
-import { appendLogEvent, type BrainLogEntry } from "./log.ts";
-import { parsePreference } from "./preference.ts";
-import { preferencePath, validateSlug } from "./paths.ts";
+import { appendLogEvent, logEventPrivacyContent, type BrainLogEntry } from "./log.ts";
+import {
+  loadPreference,
+  preferencePrivacy,
+  storeFieldsOf,
+  storePreferenceMeta,
+} from "./preference.ts";
+import { preferencesStoreOnly } from "./preference-store.ts";
+import { preferencePathOf, validateSlug } from "./paths.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 import { isoSecond } from "./time.ts";
 import { BRAIN_LOG_EVENT_KIND, type BrainPreference } from "./types.ts";
 import { renderPrefLink } from "./wikilink.ts";
 import { BrainPreferenceNotFoundError } from "./apply-evidence.ts";
+
+/** Fields of a pin call's input that are not text: its clock. */
+const PIN_INPUT_OPAQUE: ReadonlySet<string> = opaqueFields("now");
 
 export interface SetPinnedOptions {
   /** Override the wall clock used in the log event. */
@@ -73,13 +91,14 @@ export interface SetPinnedResult {
  *   "wrong pref_id" cases consistently.
  */
 export function setPinned(
-  vault: string,
+  vault: string | null,
   prefId: string,
   value: boolean,
   opts: SetPinnedOptions = {},
 ): SetPinnedResult {
-  // Vault-identity write guard (context-integrity-gates, Unit J).
-  assertVaultIdentityForWrite(vault);
+  // Vault-identity write guard (context-integrity-gates, Unit J). With no
+  // vault the store write checks the store identity instead (D14 item 13).
+  if (vault !== null) assertVaultIdentityForWrite(vault);
   if (typeof prefId !== "string" || !prefId.trim()) {
     throw new Error("setPinned missing field: pref_id");
   }
@@ -93,17 +112,20 @@ export function setPinned(
     throw new Error(`setPinned: invalid pref_id (empty slug): ${prefId}`);
   }
   validateSlug(slug);
-  const path = preferencePath(vault, slug);
-  if (!existsSync(path)) {
-    throw new BrainPreferenceNotFoundError(`pref-${slug}`, path);
-  }
-
-  // Re-parse the file to drive the idempotency check off the canonical
-  // boolean (rather than the raw frontmatter string), and to validate
-  // the file's shape before we rewrite it. A corrupt preference here
+  const path = preferencePathOf(vault, slug);
+  // Store-only (task 2.10), and always with no vault: the preference is the
+  // store's fold and the flip is one `preference-set` record; no page is
+  // rewritten.
+  const storeOnly = vault === null || preferencesStoreOnly(vault);
+  // Parse the preference once, to drive the idempotency check off the
+  // canonical boolean (rather than the raw frontmatter string), and to
+  // validate its shape before we rewrite it. A corrupt preference here
   // is a hard error — the caller asked us to mutate a specific rule;
-  // we refuse to make that decision blindly.
-  const current = parsePreference(path);
+  // we refuse to make that decision blindly. `null` is "no such
+  // preference" in both modes (no page, or no live fold entry).
+  const loaded = storeOnly || existsSync(path) ? loadPreference(vault, slug) : null;
+  if (loaded === null) throw new BrainPreferenceNotFoundError(`pref-${slug}`, path);
+  const current: BrainPreference = loaded;
   if (current.pinned === value) {
     return { path, changed: false };
   }
@@ -111,14 +133,9 @@ export function setPinned(
   // Read the raw frontmatter + body so we can rewrite without
   // disturbing the human-authored prose ("## Principle", "## Origin",
   // "## How to apply", and any custom sections appended downstream).
-  const [meta, body] = parseFrontmatter(path);
+  // The preference's fields, for the privacy verdict below.
+  const meta = storeOnly ? (storePreferenceMeta(slug)?.meta ?? {}) : parseFrontmatter(path)[0];
   const newMeta = { ...meta, pinned: value };
-  writeFrontmatterAtomic(path, newMeta, body, {
-    overwrite: true,
-    existsErrorKind: "preference",
-    vaultForRelativePath: vault,
-  });
-
   // Emit the log event only on a real transition.
   const now = opts.now ?? new Date();
   const entry: BrainLogEntry = {
@@ -132,10 +149,49 @@ export function setPinned(
       agent: (opts.agent ?? "cli").trim() || "cli",
     },
   };
-  appendLogEvent(vault, entry);
-  regenerateActiveQuiet(vault, { now });
+  // One privacy verdict for both store records of this call, the pinned
+  // field and the log event: the preference's own (its frontmatter, its
+  // content fields), the event's body and the caller's whole input.
+  const privacy = preferencePrivacy(vault, storeFieldsOf(newMeta), [
+    logEventPrivacyContent(entry.body),
+    callerInput({ prefId, ...opts }, PIN_INPUT_OPAQUE),
+  ]);
+  // Every store record written from here on, by this call or by any
+  // writer it calls, carries this verdict (`store/operation-scope.ts`).
+  return withOperationPrivacy(privacy, () => {
+    // Brain store dual write (task 1.11): the one field this call changed,
+    // filed under the preference's own scope.
+    // On a store-only machine that record is the whole write.
+    const routed = routeWrite({
+      // The page is read again inside the write: whatever mode the route
+      // decides on, the legacy page keeps its own prose and frontmatter.
+      legacy: () => {
+        const [pageMeta, pageBody] = parseFrontmatter(path);
+        return writeFrontmatterAtomic(path, { ...pageMeta, pinned: value }, pageBody, {
+          overwrite: true,
+          existsErrorKind: "preference",
+          vaultForRelativePath: legacyVaultOf(vault, "setPinned"),
+        });
+      },
+      store: () => {
+        const record = preferenceSetRecord({
+          id: `pref-${slug}`,
+          frontmatter: { pinned: value },
+          authority: authorityFromOrigin(),
+          private: privacy(),
+        });
+        const scope = current.scope?.trim();
+        return record === null ? null : { ...record, scope: scope ? scope : null };
+      },
+      context: { vault },
+    });
+    appendLogEvent(vault, entry, { storePrivate: privacy });
+    // The digest is a page of the legacy tree; a store-only machine renders
+    // it on demand (design D14 item 7). Decided by the route the write took.
+    if (routed.mode === "legacy") regenerateActiveQuiet(legacyVaultOf(vault, "setPinned"), { now });
 
-  return { path, changed: true };
+    return { path, changed: true };
+  });
 }
 
 /**

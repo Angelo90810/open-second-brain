@@ -46,6 +46,9 @@ import {
   dreamRunsDir,
   hookAuditDir,
   prefAuditDir,
+  proceduralGraphPath,
+  proceduralHintsPath,
+  proceduralMemoryUsagePath,
   proceduralRecurrencePath,
   proposalWatermarkPath,
   queryDemandLogPath,
@@ -78,6 +81,9 @@ import { sessionMiningLedgerPath } from "../../../src/core/brain/session-mining-
 import { sessionMiningSurveysPath } from "../../../src/core/brain/session-mining-surveys.ts";
 import { secretsDir } from "../../../src/core/brain/secrets/store.ts";
 import { manifestPath as installManifestPath } from "../../../src/core/install/manifest.ts";
+import { instructionBlockLockPath } from "../../../src/core/install/instruction-block.ts";
+import { lessonsApprovalsPath } from "../../../src/core/brain/lessons-promotion.ts";
+import { skillBenchmarkTasksPath } from "../../../src/core/brain/paths.ts";
 import { bootstrapReceiptPath } from "../../../src/cli/bootstrap/receipt.ts";
 import { receiptsDir } from "../../../src/core/brain/decisions/receipts.ts";
 import { anticipatoryCachePath } from "../../../src/core/brain/anticipatory-cache.ts";
@@ -97,6 +103,9 @@ import type { InstallEnv } from "../../../src/core/install/types.ts";
 import { feedbackDir, learnedWeightsPath } from "../../../src/core/search/feedback.ts";
 import { reinforceDir } from "../../../src/core/search/reinforce.ts";
 import { tuningPath } from "../../../src/core/search/tuning-store.ts";
+import { activationDir } from "../../../src/core/search/activation/store.ts";
+import { providerRegistryPath } from "../../../src/core/search/embeddings/registry.ts";
+import { rerankRegistryPath } from "../../../src/core/search/rerank/registry.ts";
 import { resolveIndexPath } from "../../../src/core/search/paths.ts";
 import { sessionFocusPath } from "../../../src/core/search/session-focus.ts";
 import { acquireWriterLockSync } from "../../../src/core/search/store/writer-lock.ts";
@@ -120,6 +129,10 @@ import {
 } from "../../../src/core/state/surfaces.ts";
 import { CHMOD_CANNOT_DENY } from "../../helpers/platform.ts";
 import { tempDirs } from "../../helpers/temp-dir.ts";
+import { useUnshardedLegacyLog } from "../../helpers/device-id.ts";
+
+// The legacy day log and ledgers are read under their un-sharded names.
+useUnshardedLegacyLog();
 
 const mkTemp = tempDirs();
 
@@ -138,7 +151,11 @@ const EMPTY_ENV: NodeJS.ProcessEnv = Object.freeze({});
 const EMPTY_CONFIG: Readonly<Record<string, string>> = Object.freeze({});
 
 function tempVault(): string {
-  return mkTemp("osb-state-surfaces-");
+  const vault = mkTemp("osb-state-surfaces-");
+  // A legacy Brain/ tree: an unswitched machine, whose writers still put
+  // bytes in the vault (a vault without one is store-only).
+  mkdirSync(join(vault, "Brain"), { recursive: true });
+  return vault;
 }
 
 function row(id: StateSurfaceId) {
@@ -284,6 +301,21 @@ const RESOLVER_BINDINGS: ReadonlyArray<readonly [StateSurfaceId, (vault: string)
     ["attestations", (v) => attestationsDir(v)],
     ["attestation_keys", (v) => attestationKeysDir(v)],
     ["install_manifest", (v) => installManifestPath(v)],
+    ["instruction_block_lock", (v) => instructionBlockLockPath(v)],
+    [
+      "lesson_approvals",
+      // t_1e952e43: the approval ledger lives in the derived store beside
+      // the install manifest; the kernel owns the one path spelling.
+      (v) => lessonsApprovalsPath(v),
+    ],
+    [
+      "skill_benchmarks",
+      // The tasks file is what an operator authors and the receipt
+      // verification reads; the row is the TREE above it (one directory
+      // per skill), so the binding climbs two levels from the core
+      // resolver's file to the directory the row declares.
+      (v) => dirname(dirname(skillBenchmarkTasksPath(v, "example-skill"))),
+    ],
     ["bootstrap_receipt", (v) => bootstrapReceiptPath(v)],
     ["hook_audit", (v) => hookAuditDir(v)],
     ["hook_session_state", (v) => dirname(hookStateFilePath(v, null))],
@@ -302,6 +334,9 @@ const RESOLVER_BINDINGS: ReadonlyArray<readonly [StateSurfaceId, (vault: string)
     ["capture_decision_log", (v) => captureDecisionLogPath(v)],
     ["capture_watermark", (v) => captureWatermarkPath(v)],
     ["proposal_watermark", (v) => proposalWatermarkPath(v)],
+    ["procedural_usage", (v) => proceduralMemoryUsagePath(v)],
+    ["procedural_graph", (v) => proceduralGraphPath(v)],
+    ["procedural_hints", (v) => proceduralHintsPath(v)],
     ["decision_receipts", (v) => receiptsDir(v)],
     ["lineage_ledger", (v) => sessionLineageLedgerPath(v)],
     ["freeze_marker", (v) => frozenMarkerPath(v)],
@@ -313,6 +348,9 @@ const RESOLVER_BINDINGS: ReadonlyArray<readonly [StateSurfaceId, (vault: string)
     ["search_learned_weights", (v) => learnedWeightsPath(v)],
     ["search_reinforce", (v) => reinforceDir(v)],
     ["search_tuning", (v) => tuningPath(v)],
+    ["search_embedding_providers", (v) => providerRegistryPath(v)],
+    ["search_rerank_providers", (v) => rerankRegistryPath(v)],
+    ["search_activation", (v) => activationDir(v)],
     ["snapshots", (v) => snapshotsDir(v)],
     ["mcp_artifacts", (v) => brainArtifactsDir(v)],
     ["skill_accept_journal", (v) => dirname(skillAcceptJournalPath(v, "probe"))],
@@ -492,18 +530,20 @@ const UNBOUND_ROW_COUNT = 0;
 const MIN_UNBOUND_REASON_LENGTH = 80;
 
 describe("each row is bound to the resolver that owns it", () => {
+  // A legacy vault: the row names the legacy location the migration reads,
+  // which is where an unswitched machine's resolver puts it. A vault with
+  // no `Brain/` is store-only and resolves to device-local state instead.
   // Host-absolute: resolvers `resolve()` the vault, which on Windows adds
   // the drive, while the row joins what it was handed.
-  const vault = resolve("/srv/vaults/example");
-
   for (const [id, resolver] of RESOLVER_BINDINGS) {
     test(`${id} derives what its resolver returns`, () => {
+      const vault = resolve(tempVault());
       expect(row(id).derive(vault, null)).toBe(resolver(vault));
     });
   }
 
   test("the cross-topic rule ledger names its Brain/ file exactly (t_642bc2b8)", () => {
-    const example = resolve("/srv/vaults/example");
+    const example = resolve(tempVault());
     expect(crossTopicLedgerPath(example)).toBe(join(example, "Brain", "cross-topic-rules.json"));
     expect(row(STATE_SURFACE_ID.crossTopicLedger).derive(example, null)).toBe(
       crossTopicLedgerPath(example),
@@ -516,6 +556,7 @@ describe("each row is bound to the resolver that owns it", () => {
   });
 
   test("the search index follows its override, and so does everything derived from it", () => {
+    const vault = resolve(tempVault());
     const elsewhere = "/elsewhere/brain.sqlite";
     expect(row("search_index").derive(vault, elsewhere)).toBe(resolveIndexPath(vault, elsewhere));
     expect(row("search_writer_lock").derive(vault, elsewhere)).toBe(`${elsewhere}.lock`);

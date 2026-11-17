@@ -26,7 +26,9 @@
  *
  * ## The append-mode forms
  *
- * `appendFileSync(` / `appendFile(`; `openSync(` / `open(` whose second
+ * `appendFileSync(` / `appendFile(`; `appendSeparated(` (the Brain log's
+ * append primitive, which appends to whatever path its caller passes);
+ * `openSync(` / `open(` whose second
  * argument is an `"a"` or `"a+"` literal; and any `flag:` / `flags:`
  * property set to one (the `writeFileSync(..., { flag: "a" })` and
  * `createWriteStream` spellings). Read off the shared source lexer, so a
@@ -48,13 +50,17 @@ const SWEPT_ROOT = "src";
 
 /**
  * Functions whose result is a per-device shard name or the shard id
- * itself: the shared grammar's builders, and the device-id resolver the
- * older hand-rolled shard paths call directly.
+ * itself: the shared grammar's builders, the device-id resolver the
+ * older hand-rolled shard paths call directly, and the brain store's
+ * shard path builder (`store/store-paths.ts`), whose
+ * `<stream>/<device>/<YYYY-MM>.jsonl` names carry the device id as a
+ * directory rather than a file-name segment.
  */
 const SHARD_NAMING_PRIMITIVES: ReadonlyArray<string> = Object.freeze([
   "shardedFileName",
   "resolveAppendShardId",
   "resolveDeviceId",
+  "shardRelPath",
 ]);
 
 /** An allow-list reason has to be an argument, not a label. */
@@ -65,12 +71,25 @@ const MIN_REASON_LENGTH = 80;
  * single shared file is still correct.
  */
 const APPEND_ALLOW_LIST: Readonly<Record<string, string>> = Object.freeze({
+  "src/core/store-migration/exporters.ts":
+    "a rollback appends each log event to this device's own day shard only, never to a shard " +
+    "another device writes",
+  "src/core/store-migration/rollback.ts":
+    "the rollback's replay journal lives in the device-local state of the store, which is never " +
+    "synced, so only this device appends to it",
+  "src/core/store-migration/journal.ts":
+    "the migration journal lives in the device-local state of the store, which is never synced, " +
+    "so only this device ever appends to it",
   "src/core/brain/dream-workrun.ts":
     "each dream run appends to its own dream-runs/<run-id>.jsonl, a name unique to one run on one " +
     "device, so no second device ever appends to the same file",
   "src/core/brain/diagnostics.ts":
     "the doctor repair appends the terminal interrupted marker to a dangling per-run dream workrun " +
     "file, under a lock, and that file is unique to the run that created it",
+  "src/core/brain/log-append-io.ts":
+    "the Brain log's append primitive takes the path it appends to from its caller; every call of " +
+    "appendSeparated is itself an append form this census checks, so each caller must name a " +
+    "device shard (appendLogEvent builds them with logShardPath or logShardJsonlPath)",
   "src/core/doctor.ts":
     "the config-writeable probe opens the machine config file in append mode and writes zero bytes; " +
     "it lives outside the vault, is not a ledger, and removes the file it created",
@@ -99,6 +118,9 @@ const APPEND_MODE_LITERAL = /^(["'`])a\+?\1$/;
 
 const APPEND_SHAPES: ReadonlyArray<AppendShape> = Object.freeze<AppendShape[]>([
   { form: "appendFile", pattern: /\bappendFile(?:Sync)?\s*\(/g, isAppend: () => true },
+  // The Brain log's append primitive (`log-append-io.ts`) appends to the
+  // path it is given, so each caller is an append site in its own right.
+  { form: "appendSeparated", pattern: /\bappendSeparated\s*\(/g, isAppend: () => true },
   {
     form: 'open(..., "a")',
     pattern: /\bopen(?:Sync)?\s*\(/g,

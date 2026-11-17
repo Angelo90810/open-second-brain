@@ -17,7 +17,15 @@
  *      answer as an empty vault.
  */
 
-import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  setDefaultTimeout,
+  setSystemTime,
+  test,
+} from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,6 +48,10 @@ import { measureStorageUsage } from "../../../../src/core/brain/storage/usage.ts
 import { atomicWriteFileSync } from "../../../../src/core/fs-atomic.ts";
 import { runCli } from "../../../helpers/run-cli.ts";
 import { CHMOD_CANNOT_DENY } from "../../../helpers/platform.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../../../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 let vault: string;
 let configHome: string;
@@ -269,8 +281,12 @@ describe("o2b brain storage", () => {
     },
   );
 
+  // A vault with a legacy `Brain/` tree and no `_brain.yaml`. A vault with
+  // no `Brain/` at all is store-only and reads its settings from the store
+  // (design D14 item 3), so it has no missing config to name.
   test("a vault with no brain config fails by name", async () => {
     const bare = mkdtempSync(join(tmpdir(), "o2b-cli-storage-bare-"));
+    mkdirSync(join(bare, "Brain"));
     try {
       const { captured, code } = await drive(["--json", "--vault", bare]);
       expect(code).toBe(1);

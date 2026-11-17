@@ -69,7 +69,7 @@
  */
 
 import { lstatSync, readdirSync, statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 
 import {
   BRAIN_ARCHIVES_REL,
@@ -88,6 +88,7 @@ import {
   DERIVED_STORE_FILE,
   HOOK_AUDIT_DIR,
 } from "../brain/path-constants.ts";
+import { SKILL_BENCHMARKS_DIR } from "../brain/skill-rewrite-tasks.ts";
 import { WATCHDOG_FALLBACK_AUDIT_DIR } from "../brain/audit-dirs.ts";
 import { JSONL_LEDGER_EXT, jsonlLedgerGrammar, parseShardedName } from "../brain/ledger-shards.ts";
 import { MAINTENANCE_JOURNAL_STEM } from "../brain/maintenance/journal.ts";
@@ -97,6 +98,7 @@ import {
   RECURRENCE_LEDGER_STEM,
 } from "../brain/paths.ts";
 import { CONFIG_ORIGIN, resolveWithOrigin, type ConfigOrigin } from "../validate.ts";
+import { peekMachineStateLocation } from "./machine-state.ts";
 
 // ----- Vocabularies ---------------------------------------------------------
 
@@ -152,6 +154,9 @@ export const STATE_SURFACE_ID = Object.freeze({
   searchLearnedWeights: "search_learned_weights",
   searchReinforce: "search_reinforce",
   searchTuning: "search_tuning",
+  searchEmbeddingProviders: "search_embedding_providers",
+  searchRerankProviders: "search_rerank_providers",
+  searchActivation: "search_activation",
   snapshots: "snapshots",
   mcpArtifacts: "mcp_artifacts",
   metrics: "metrics",
@@ -161,9 +166,15 @@ export const STATE_SURFACE_ID = Object.freeze({
   rollupLedger: "rollup_ledger",
   crossTopicLedger: "cross_topic_ledger",
   proposalWatermark: "proposal_watermark",
+  proceduralUsage: "procedural_usage",
+  proceduralGraph: "procedural_graph",
+  proceduralHints: "procedural_hints",
   captureWatermark: "capture_watermark",
   decisionLedger: "decision_ledger",
   sourceArchives: "source_archives",
+  instructionBlockLock: "instruction_block_lock",
+  lessonApprovals: "lesson_approvals",
+  skillBenchmarks: "skill_benchmarks",
 } as const);
 
 export type StateSurfaceId = (typeof STATE_SURFACE_ID)[keyof typeof STATE_SURFACE_ID];
@@ -239,6 +250,33 @@ export function isStateReachability(value: unknown): value is StateReachability 
   );
 }
 
+/**
+ * Where a surface lives once this machine is switched to the brain store
+ * (design D14, task 2.10). It follows the migration map
+ * (`store-migration/surface-map.ts`), which a test holds this field to:
+ *
+ *  - `device-local`: the same vault-relative path under this machine's
+ *    device-local state, `<device state>/migration/local/` (the folder the
+ *    migration copies such surfaces into; `state/machine-state.ts` is the
+ *    one resolver every writer asks). Device-local, backup-class and
+ *    dropped-but-rewritten surfaces all live here.
+ *  - `index`: beside the search index, which a switched machine keys by
+ *    store id under its device-local state (`search/brain-store/location.ts`).
+ *  - `store`: records in the brain store; nothing is kept on disk outside it.
+ */
+export const STATE_SWITCHED = Object.freeze({
+  deviceLocal: "device-local",
+  index: "index",
+  store: "store",
+} as const);
+
+export type StateSwitched = (typeof STATE_SWITCHED)[keyof typeof STATE_SWITCHED];
+
+/** The switched locations, in the order the rendering names them. */
+export const STATE_SWITCHED_LOCATIONS: ReadonlyArray<StateSwitched> = Object.freeze(
+  Object.values(STATE_SWITCHED),
+);
+
 // ----- The enumeration ------------------------------------------------------
 
 /** One durable location this tool keeps inside a vault. */
@@ -247,6 +285,8 @@ export interface StateSurface {
   /** What it is, as a noun phrase the statement can print. */
   readonly label: string;
   readonly tier: StateTier;
+  /** Where it lives once this machine is switched; see {@link STATE_SWITCHED}. */
+  readonly switched: StateSwitched;
   /**
    * The location, as a pure function of the vault and the resolved
    * override value. Reads nothing; the second argument is `null` when no
@@ -296,6 +336,8 @@ const SESSION_MINING_LEDGER_FILE = "session-mining-ledger.json";
 const SESSION_MINING_SURVEYS_FILE = "session-mining-surveys.json";
 const INSTALL_MANIFEST_FILE = "install.lock.json";
 const PROTECT_MANIFEST_FILE = "protect.lock.json";
+const INSTRUCTION_BLOCK_LOCK_FILE = "instruction-block.lock.json";
+const LESSONS_APPROVALS_LEDGER_FILE = "lessons-approvals.json";
 const BOOTSTRAP_RECEIPT_FILE = "bootstrap.lock.json";
 const MAINTENANCE_LEASE_FILE = "maintenance.sqlite";
 const MAINTENANCE_JOURNAL_FILE = `${MAINTENANCE_JOURNAL_STEM}.${JSONL_LEDGER_EXT}`;
@@ -312,6 +354,9 @@ const QUERY_DEMAND_FILE = `${QUERY_DEMAND_LEDGER_STEM}.${JSONL_LEDGER_EXT}`;
 const CAPTURE_DECISIONS_FILE = `${CAPTURE_DECISION_LEDGER_STEM}.${JSONL_LEDGER_EXT}`;
 const CAPTURE_WATERMARK_FILE = ".catchup-watermark.json";
 const PROPOSAL_WATERMARK_FILE = "proposal-watermark.json";
+const PROCEDURAL_USAGE_FILE = "usage.jsonl";
+const PROCEDURAL_GRAPH_FILE = "graph.json";
+const PROCEDURAL_HINTS_FILE = "hints.json";
 const TRUTH_DIR = "truth";
 const BRAIN_INTERNAL_STATE_DIR = ".state";
 const LINEAGE_LEDGER_FILE = "session-lineage.jsonl";
@@ -384,6 +429,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.searchIndex,
     label: "search index",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.index,
     derive: indexPath,
     override_env: SEARCH_DB_ENV,
     override_config_key: SEARCH_DB_CONFIG_KEY,
@@ -398,6 +444,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.searchWriterLock,
     label: "search writer lock",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.index,
     derive: (vault, override) => `${indexPath(vault, override)}${WRITER_LOCK_SUFFIX}`,
     override_env: SEARCH_DB_ENV,
     override_config_key: SEARCH_DB_CONFIG_KEY,
@@ -412,6 +459,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.searchSessionFocus,
     label: "per-session search focus",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.index,
     derive: (vault, override) => join(dirname(indexPath(vault, override)), SEARCH_FOCUS_DIR),
     override_env: SEARCH_DB_ENV,
     override_config_key: SEARCH_DB_CONFIG_KEY,
@@ -426,6 +474,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.secretCustody,
     label: "encrypted secret custody",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(SECRETS_DIR),
     override_env: null,
     override_config_key: null,
@@ -440,6 +489,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.ingestContentManifest,
     label: "ingest content manifest",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(INGEST_MANIFEST_FILE),
     override_env: null,
     override_config_key: null,
@@ -453,6 +503,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.ingestCheckpoints,
     label: "ingest checkpoints",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(INGEST_CHECKPOINT_DIR),
     override_env: null,
     override_config_key: null,
@@ -466,6 +517,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.sessionImportCheckpoints,
     label: "session import checkpoints",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(SESSION_CHECKPOINT_DIR),
     override_env: null,
     override_config_key: null,
@@ -484,6 +536,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.attestations,
     label: "store attestations",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(ATTESTATIONS_DIR),
     override_env: null,
     override_config_key: null,
@@ -499,6 +552,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.attestationKeys,
     label: "attestation signing keys",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(ATTESTATION_KEYS_DIR),
     override_env: null,
     override_config_key: null,
@@ -515,6 +569,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.writeDeadLetters,
     label: "multi-artifact write dead letters",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(DEAD_LETTER_DIR),
     override_env: null,
     override_config_key: null,
@@ -531,6 +586,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.sessionImportLedger,
     label: "session import ledger",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(SESSION_LEDGER_FILE),
     override_env: null,
     override_config_key: null,
@@ -546,6 +602,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.sessionMiningLedger,
     label: "session mining ledger",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(SESSION_MINING_LEDGER_FILE),
     override_env: null,
     override_config_key: null,
@@ -562,6 +619,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.sessionMiningSurveys,
     label: "session mining surveys",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(SESSION_MINING_SURVEYS_FILE),
     override_env: null,
     override_config_key: null,
@@ -577,6 +635,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.installManifest,
     label: "install manifest",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(INSTALL_MANIFEST_FILE),
     override_env: null,
     override_config_key: null,
@@ -591,6 +650,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.protectManifest,
     label: "protect manifest",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(PROTECT_MANIFEST_FILE),
     override_env: null,
     override_config_key: null,
@@ -605,6 +665,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.bootstrapReceipt,
     label: "bootstrap receipt",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(BOOTSTRAP_RECEIPT_FILE),
     override_env: null,
     override_config_key: null,
@@ -620,6 +681,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.maintenanceLease,
     label: "maintenance lease database",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(MAINTENANCE_LEASE_FILE),
     override_env: null,
     override_config_key: null,
@@ -633,6 +695,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.maintenanceJournal,
     label: "maintenance journal",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.store,
     derive: derivedStore(MAINTENANCE_JOURNAL_FILE),
     sharded_ledger: true,
     override_env: null,
@@ -647,6 +710,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.hookAudit,
     label: "hook audit trail",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.store,
     derive: derivedStore(HOOK_AUDIT_DIR),
     override_env: null,
     override_config_key: null,
@@ -661,6 +725,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.hookSessionState,
     label: "per-session hook state",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(HOOK_STATE_DIR),
     override_env: null,
     override_config_key: null,
@@ -677,6 +742,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.selfHealUpgradeMarker,
     label: "failed automatic upgrade marker",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(SELF_HEAL_UPGRADE_MARKER_FILE),
     override_env: null,
     override_config_key: null,
@@ -691,6 +757,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.freshenState,
     label: "freshen-on-read state",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.index,
     // Beside the index, wherever the override puts it: `freshen.ts` keeps
     // its state in `dirname(config.dbPath)`.
     derive: (vault, override) => join(dirname(indexPath(vault, override)), FRESHEN_STATE_FILE),
@@ -708,6 +775,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.watchdogAudit,
     label: "watchdog audit fallback",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.store,
     derive: derivedStore(WATCHDOG_FALLBACK_AUDIT_DIR),
     override_env: null,
     override_config_key: null,
@@ -722,6 +790,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.injectFailopenCache,
     label: "injection fail-open cache",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(INJECT_CACHE_DIR),
     override_env: null,
     override_config_key: null,
@@ -736,6 +805,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.aiderContext,
     label: "Aider context sidecar",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: derivedStore(AIDER_CONTEXT_FILE),
     override_env: null,
     override_config_key: null,
@@ -749,6 +819,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.brainLog,
     label: "Brain event log",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: (vault) => join(vault, BRAIN_LOG_REL),
     override_env: DEVICE_ID_ENV,
     override_config_key: DEVICE_ID_CONFIG_KEY,
@@ -763,6 +834,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.continuityLedger,
     label: "continuity ledger",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainLog(CONTINUITY_DIR),
     override_env: DEVICE_ID_ENV,
     override_config_key: DEVICE_ID_CONFIG_KEY,
@@ -777,6 +849,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.dreamRuns,
     label: "dream workrun checkpoints",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainLog(DREAM_RUNS_DIR),
     override_env: null,
     override_config_key: null,
@@ -790,6 +863,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.prefAudit,
     label: "preference mutation audit",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainLog(PREF_AUDIT_DIR),
     override_env: DEVICE_ID_ENV,
     override_config_key: DEVICE_ID_CONFIG_KEY,
@@ -806,6 +880,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.recurrenceLedger,
     label: "procedural recurrence ledger",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainLog(RECURRENCE_FILE),
     sharded_ledger: true,
     override_env: null,
@@ -821,6 +896,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.queryDemandLedger,
     label: "query demand ledger",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainLog(QUERY_DEMAND_FILE),
     sharded_ledger: true,
     override_env: null,
@@ -836,6 +912,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.captureDecisionLog,
     label: "inbound capture decision log",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainLog(CAPTURE_DECISIONS_FILE),
     sharded_ledger: true,
     override_env: null,
@@ -851,6 +928,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.decisionReceipts,
     label: "decision receipts",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainTree(TRUTH_DIR),
     override_env: DEVICE_ID_ENV,
     override_config_key: DEVICE_ID_CONFIG_KEY,
@@ -865,6 +943,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.lineageLedger,
     label: "session lineage ledger",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainTree(BRAIN_INTERNAL_STATE_DIR, LINEAGE_LEDGER_FILE),
     sharded_ledger: true,
     override_env: DEVICE_ID_ENV,
@@ -882,6 +961,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.freezeMarker,
     label: "fleet freeze marker",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainTree(BRAIN_INTERNAL_STATE_DIR, FROZEN_MARKER_FILE),
     override_env: null,
     override_config_key: null,
@@ -897,6 +977,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.repairCandidates,
     label: "staged hub candidates",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainTree(BRAIN_INTERNAL_STATE_DIR, REPAIR_CANDIDATES_FILE),
     override_env: null,
     override_config_key: null,
@@ -911,6 +992,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.writeImages,
     label: "note-write before-images",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainTree(BRAIN_INTERNAL_STATE_DIR, WRITE_IMAGES_DIR),
     override_env: null,
     override_config_key: null,
@@ -926,6 +1008,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.anticipatoryCache,
     label: "anticipatory context cache",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainTree(BRAIN_INTERNAL_STATE_DIR, ANTICIPATORY_DIR),
     override_env: null,
     override_config_key: null,
@@ -934,12 +1017,13 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
       "Pre-rendered context packs keyed by root and agent scope. Inside the Markdown tree and " +
       "still derived: deleting it costs one recomputation, and every byte in it came from the " +
       "vault it sits in.",
-    sources: ["src/core/brain/anticipatory-cache.ts"],
+    sources: ["src/core/brain/anticipatory-cache.ts", "src/core/brain/anticipatory-prune.ts"],
   },
   {
     id: STATE_SURFACE_ID.exactState,
     label: "exact-state lane",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: (vault) => join(vault, BRAIN_STATE_REL),
     override_env: null,
     override_config_key: null,
@@ -953,6 +1037,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.searchFeedback,
     label: "search feedback events",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainTree(SEARCH_STATE_DIR, SEARCH_FEEDBACK_DIR),
     override_env: null,
     override_config_key: null,
@@ -967,6 +1052,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.searchLearnedWeights,
     label: "learned ranking weights",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainTree(SEARCH_STATE_DIR, SEARCH_LEARNED_WEIGHTS_FILE),
     override_env: null,
     override_config_key: null,
@@ -980,6 +1066,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.searchReinforce,
     label: "search reinforcement events",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainTree(SEARCH_STATE_DIR, SEARCH_REINFORCE_DIR),
     override_env: null,
     override_config_key: null,
@@ -993,6 +1080,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.searchTuning,
     label: "tuned search parameters",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainTree(SEARCH_STATE_DIR, SEARCH_TUNING_FILE),
     override_env: null,
     override_config_key: null,
@@ -1003,9 +1091,54 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     sources: ["src/core/search/tuning-store.ts"],
   },
   {
+    id: STATE_SURFACE_ID.searchEmbeddingProviders,
+    label: "registered embedding providers",
+    tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
+    derive: brainTree(SEARCH_STATE_DIR, "embedding-providers.json"),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "The custom embedding providers `o2b search provider add` registered on this machine, " +
+      "each named by `embedding_provider` in the machine config. Losing it leaves a configured " +
+      "custom provider unresolvable until it is registered again.",
+    sources: ["src/core/search/embeddings/registry.ts"],
+  },
+  {
+    id: STATE_SURFACE_ID.searchRerankProviders,
+    label: "registered rerank providers",
+    tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
+    derive: brainTree(SEARCH_STATE_DIR, "rerank-providers.json"),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "The custom rerank providers `o2b search rerank-provider add` registered on this machine. " +
+      "Losing it leaves a configured custom reranker unresolvable until it is registered again.",
+    sources: ["src/core/search/rerank/registry.ts"],
+  },
+  {
+    id: STATE_SURFACE_ID.searchActivation,
+    label: "search activation history",
+    tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
+    derive: brainTree(SEARCH_STATE_DIR, "activation"),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "Per-access events and the decayed boost folded from them (`activation-state.json` " +
+      "beside the folder): how recently this machine's searches used each path. Deleting it " +
+      "only resets the recency boost.",
+    sources: ["src/core/search/activation/store.ts"],
+  },
+  {
     id: STATE_SURFACE_ID.snapshots,
     label: "pre-dream snapshots",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: (vault) => join(vault, BRAIN_SNAPSHOTS_REL),
     override_env: null,
     override_config_key: null,
@@ -1020,6 +1153,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.mcpArtifacts,
     label: "MCP overflow artifacts",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: (vault) => join(vault, BRAIN_ARTIFACTS_REL),
     override_env: null,
     override_config_key: null,
@@ -1034,6 +1168,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.metrics,
     label: "per-surface metrics",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainTree(METRICS_DIR),
     override_env: DEVICE_ID_ENV,
     override_config_key: DEVICE_ID_CONFIG_KEY,
@@ -1048,6 +1183,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.skillAcceptJournal,
     label: "skill proposal accept journal",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: (vault) => join(vault, BRAIN_SKILL_ACCEPT_JOURNAL_REL),
     override_env: null,
     override_config_key: null,
@@ -1062,6 +1198,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.claudeMemoryManifest,
     label: "Claude memory import manifest",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainTree(IMPORTS_DIR, CLAUDE_MEMORY_MANIFEST_FILE),
     override_env: null,
     override_config_key: null,
@@ -1076,6 +1213,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.claimGraph,
     label: "claim graph projection",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainTree(BRAIN_CLAIM_GRAPH_FILE),
     override_env: null,
     override_config_key: null,
@@ -1089,6 +1227,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.rollupLedger,
     label: "rollup ladder ledger",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainTree(BRAIN_ROLLUP_LEDGER_FILE),
     override_env: null,
     override_config_key: null,
@@ -1103,6 +1242,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.crossTopicLedger,
     label: "cross-topic rule ledger",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: brainTree(BRAIN_CROSS_TOPIC_LEDGER_FILE),
     override_env: null,
     override_config_key: null,
@@ -1117,6 +1257,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.proposalWatermark,
     label: "proposal scan watermark",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: (vault) => join(vault, BRAIN_PROCEDURAL_MEMORY_REL, PROPOSAL_WATERMARK_FILE),
     override_env: null,
     override_config_key: null,
@@ -1127,9 +1268,54 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     sources: ["src/core/brain/paths.ts"],
   },
   {
+    id: STATE_SURFACE_ID.proceduralUsage,
+    label: "procedural memory usage counters",
+    tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.deviceLocal,
+    derive: (vault) => join(vault, BRAIN_PROCEDURAL_MEMORY_REL, PROCEDURAL_USAGE_FILE),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "How often and how recently each procedure was used, and how its uses turned out. The " +
+      "counters tick on every use, so they stay on the machine that counts them instead of " +
+      "appending a whole record to the store per tick; a reset restarts the counts and the " +
+      "ranking they feed.",
+    sources: ["src/core/brain/paths.ts"],
+  },
+  {
+    id: STATE_SURFACE_ID.proceduralGraph,
+    label: "procedural graph projection",
+    tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
+    derive: (vault) => join(vault, BRAIN_PROCEDURAL_MEMORY_REL, PROCEDURAL_GRAPH_FILE),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "A projection of the procedural memory index and the skill proposals into nodes and " +
+      "edges. It is recomputed from those, which are the source of truth.",
+    sources: ["src/core/brain/paths.ts"],
+  },
+  {
+    id: STATE_SURFACE_ID.proceduralHints,
+    label: "procedural recall hints",
+    tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
+    derive: (vault) => join(vault, BRAIN_PROCEDURAL_MEMORY_REL, PROCEDURAL_HINTS_FILE),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "The recall cues of each procedural graph node. They are recomputed from the procedural " +
+      "graph.",
+    sources: ["src/core/brain/paths.ts"],
+  },
+  {
     id: STATE_SURFACE_ID.captureWatermark,
     label: "capture catchup watermark",
     tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
     derive: (vault) => join(vault, BRAIN_CAPTURES_REL, CAPTURE_WATERMARK_FILE),
     override_env: null,
     override_config_key: null,
@@ -1143,6 +1329,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.decisionLedger,
     label: "decision ledger",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: brainTree("logs", "decisions"),
     override_env: DEVICE_ID_ENV,
     override_config_key: DEVICE_ID_CONFIG_KEY,
@@ -1159,6 +1346,7 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
     id: STATE_SURFACE_ID.sourceArchives,
     label: "source archives",
     tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
     derive: (vault) => join(vault, BRAIN_ARCHIVES_REL),
     override_env: null,
     override_config_key: null,
@@ -1170,6 +1358,72 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
       "is untouched, which is exactly what separates it from a rebuildable derived store, and " +
       "there is no TTL to bring it back.",
     sources: ["src/core/brain/provenance/source-archive.ts"],
+  },
+  {
+    // K5 append-only placement: this row joins at the end of the
+    // catalogue because three lanes share this array this wave and the
+    // integrator re-freezes the by-root order.
+    id: STATE_SURFACE_ID.instructionBlockLock,
+    label: "instruction block lock",
+    tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
+    derive: derivedStore(INSTRUCTION_BLOCK_LOCK_FILE),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "Which vault-root agent instruction files carry an Open Second Brain write-gate block " +
+      "this tool wrote: per file, the block id, the begin marker and the applied time. " +
+      "Uninstall reads it to remove exactly the recorded pair, and the applied time is what " +
+      "makes the installer refuse a hand-edited block; without it the installer cannot prove " +
+      "a block is its own and refuses to rewrite any diverged one.",
+    sources: ["src/core/install/instruction-block.ts"],
+  },
+  {
+    // K5 append-only placement: rides the same tail the three lanes
+    // share; the integrator re-freezes the by-root order.
+    id: STATE_SURFACE_ID.lessonApprovals,
+    label: "lesson approvals ledger",
+    tier: STATE_TIER.derived,
+    switched: STATE_SWITCHED.deviceLocal,
+    derive: derivedStore(LESSONS_APPROVALS_LEDGER_FILE),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "One JSON table of the lesson-promotion decisions currently in force, keyed by preference " +
+      "id: which lessons the operator approved for promotion into agent rules files, which they " +
+      "refused, and the content hash each approval pinned. It lives in the derived store rather " +
+      "than under Brain/ so an agent cannot read its own approval state as a note surface. " +
+      "Nothing rebuilds it: deleting it lifts every approval and refusal at once - the " +
+      "fail-closed direction, since a lifted approval blocks a lesson rather than promoting it.",
+    sources: [
+      "src/core/brain/lessons-promotion.ts",
+      "src/core/brain/doctor/lessons-block-check.ts",
+    ],
+  },
+  {
+    id: STATE_SURFACE_ID.skillBenchmarks,
+    label: "skill benchmarks",
+    tier: STATE_TIER.vaultContent,
+    switched: STATE_SWITCHED.store,
+    derive: (vault) => join(vault, BRAIN_ROOT_REL, SKILL_BENCHMARKS_DIR),
+    override_env: null,
+    override_config_key: null,
+    carries_memory: false,
+    reason:
+      "Each skill's benchmark task set, its frozen rewrite receipt, and the submitted gate-round " +
+      "transcripts under rounds/. This is the preregistration an operator audits a staged " +
+      "rewrite against: the spec hash on a pending scored_rewrite proposal is a claim about " +
+      "these files, and the grade ledger's verdicts are only as trustworthy as the task set " +
+      "they gated on. Operator-authored content in the same sense the skills tree is - the " +
+      "vault is the primary home so the receipt travels with the skills it gates.",
+    sources: [
+      "src/core/brain/skill-rewrite-tasks.ts",
+      "src/core/brain/skill-rewrite.ts",
+      "src/core/brain/skill-proposals.ts",
+      "src/core/brain/paths.ts",
+    ],
   },
 ]);
 
@@ -1186,6 +1440,13 @@ export const STATE_SURFACES: ReadonlyArray<StateSurface> = Object.freeze([
  * {@link STATE_SURFACES} instead, no matter how small.
  */
 export const STATE_SURFACE_SWEEP_EXCLUSIONS: ReadonlyMap<string, string> = new Map([
+  [
+    "src/core/state/machine-state.ts",
+    "it RELOCATES every surface rather than owning one: it names the directory only to copy, " +
+      "once, the `.open-second-brain/` an older release kept in a bare vault into the " +
+      "device-local root where each surface's own module now finds it, and to keep the " +
+      "marker of that copy there. The surfaces themselves are the rows above",
+  ],
   [
     "src/core/doctor-selftest.ts",
     "the doctor self-test drives a THROWAWAY store end to end: it pins its database inside the " +
@@ -1268,7 +1529,13 @@ export interface StateSurfaceReport {
   readonly id: StateSurfaceId;
   readonly label: string;
   readonly tier: StateTier;
-  /** Where it resolved on this machine, after any override. */
+  /** Where it lives once this machine is switched. */
+  readonly switched: StateSwitched;
+  /**
+   * Where it resolved on this machine, after any override: under the
+   * device-local state root for a `device-local` surface when the input
+   * names one, else the vault-side location.
+   */
   readonly path: string;
   readonly override_env: string | null;
   readonly override_config_key: string | null;
@@ -1299,6 +1566,14 @@ export interface StateInventoryInput {
   readonly env: NodeJS.ProcessEnv;
   /** The machine config the overrides are read from. */
   readonly config: Readonly<Record<string, string>>;
+  /**
+   * The device-local state root of a switched machine, or `null` on an
+   * unswitched one. When set, every `device-local` surface is measured at
+   * its path under that root. Absent: asked of `peekMachineStateLocation`.
+   */
+  readonly stateRoot?: string | null;
+  /** The machine config file the store-only verdict and the store id come from (default: the resolved one). */
+  readonly configPath?: string;
   /**
    * The filesystem probe. Injected only by tests, which need an `EACCES`
    * they cannot reliably produce as the user running them; every caller
@@ -1399,6 +1674,8 @@ function probe(
  */
 export function inventoryStateSurfaces(input: StateInventoryInput): StateInventory {
   const statAt = input.statAt ?? statOrAbsent;
+  const stateRoot =
+    input.stateRoot !== undefined ? input.stateRoot : relocatedRoot(input.vault, input.configPath);
   const surfaces = STATE_SURFACES.map((surface): StateSurfaceReport => {
     const resolved =
       surface.override_env === null || surface.override_config_key === null
@@ -1409,11 +1686,13 @@ export function inventoryStateSurfaces(input: StateInventoryInput): StateInvento
             surface.override_env,
             surface.override_config_key,
           );
-    const path = surface.derive(input.vault, movesPath(surface) ? resolved.value : null);
+    const vaultPath = surface.derive(input.vault, movesPath(surface) ? resolved.value : null);
+    const path = switchedPath(surface, input.vault, vaultPath, stateRoot);
     return {
       id: surface.id,
       label: surface.label,
       tier: surface.tier,
+      switched: surface.switched,
       path,
       override_env: surface.override_env,
       override_config_key: surface.override_config_key,
@@ -1430,6 +1709,34 @@ export function inventoryStateSurfaces(input: StateInventoryInput): StateInvento
     ]),
   ) as Record<StateReachability, number>;
   return { vault: input.vault, surfaces, summary: Object.freeze(summary) };
+}
+
+/**
+ * This machine's device-local state root when `vault`'s state is
+ * relocated, else `null`; resolved without side effects (the inventory
+ * writes nothing) and against the caller's machine config.
+ */
+function relocatedRoot(vault: string, configPath: string | undefined): string | null {
+  const location = peekMachineStateLocation(vault, configPath);
+  return location.relocated ? location.root : null;
+}
+
+/**
+ * A `device-local` surface's path under `stateRoot`: the same
+ * vault-relative path, as `machineStatePath` joins it. Any other surface,
+ * or no state root, keeps its vault-side path.
+ */
+function switchedPath(
+  surface: StateSurface,
+  vault: string,
+  vaultPath: string,
+  stateRoot: string | null,
+): string {
+  if (stateRoot === null || surface.switched !== STATE_SWITCHED.deviceLocal) return vaultPath;
+  const rel = relative(vault, vaultPath);
+  // `..` as a whole segment only: `..cache` is a name inside the vault.
+  if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return vaultPath;
+  return join(stateRoot, rel);
 }
 
 /**
@@ -1470,6 +1777,18 @@ function reachabilityLine(verdict: StateReachabilityVerdict): string {
       return `absent - ${verdict.reason}`;
     case STATE_REACHABILITY.unchecked:
       return `NOT CHECKED - ${verdict.reason}`;
+  }
+}
+
+/** What one row says about where it lives once this machine is switched. */
+function switchedLine(switched: StateSwitched): string {
+  switch (switched) {
+    case STATE_SWITCHED.deviceLocal:
+      return "once switched to the brain store: in this machine's device-local state";
+    case STATE_SWITCHED.index:
+      return "once switched to the brain store: beside the search index in the device-local state";
+    case STATE_SWITCHED.store:
+      return "once switched to the brain store: records in the store, nothing on disk here";
   }
 }
 
@@ -1515,6 +1834,7 @@ export function renderStateInventory(inventory: StateInventory): string {
     for (const row of rows) {
       lines.push(`    - ${row.label} — ${row.path}`);
       lines.push(`      ${reachabilityLine(row.reachability)}; ${originLine(row)}`);
+      lines.push(`      ${switchedLine(row.switched)}`);
       lines.push(`      ${row.reason}`);
     }
   }

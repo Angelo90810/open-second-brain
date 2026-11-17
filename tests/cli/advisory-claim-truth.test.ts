@@ -14,7 +14,7 @@
  * property and the half that regresses silently is the other one.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +25,12 @@ import { NEXT_COMMAND_KEY, resolveNextStep } from "../../src/core/brain/next-ste
 import { writeSignal } from "../../src/core/brain/signal.ts";
 import { resolveSearchConfig } from "../../src/core/search/index.ts";
 import { indexVault } from "../../src/core/search/indexer.ts";
+import { STORE_ROOT_ENV } from "../../src/core/store/constants.ts";
 import { runCli } from "../helpers/run-cli.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 let tmp: string;
 let vault: string;
@@ -182,15 +187,22 @@ describe("search-index-missing claims the index is not built", () => {
 
   test("o2b init on a vault that already has one does not", async () => {
     // Build the index where the resolver will look for it, then re-init.
-    // The indexer refuses a vault directory that does not exist.
+    // The indexer refuses a vault directory that does not exist. A first
+    // init creates the brain store of this fresh vault (design D14 item 1),
+    // which is where the index of a store-only vault lives.
     mkdirSync(vault, { recursive: true });
+    const storeRoot = join(tmp, "store");
+    const first = await runCli(["init", "--vault", vault], {
+      env: { OPEN_SECOND_BRAIN_CONFIG: configPath, [STORE_ROOT_ENV]: storeRoot },
+    });
+    expect(first.returncode).toBe(0);
     const built = await runCli(["search", "index", "--vault", vault], {
-      env: { OPEN_SECOND_BRAIN_CONFIG: configPath },
+      env: { OPEN_SECOND_BRAIN_CONFIG: configPath, [STORE_ROOT_ENV]: storeRoot },
     });
     expect(built.returncode).toBe(0);
 
     const r = await runCli(["init", "--vault", vault], {
-      env: { OPEN_SECOND_BRAIN_CONFIG: configPath },
+      env: { OPEN_SECOND_BRAIN_CONFIG: configPath, [STORE_ROOT_ENV]: storeRoot },
     });
 
     expect(r.returncode).toBe(0);

@@ -7,10 +7,8 @@
  * module never re-walks the preferences directory.
  */
 
-import { existsSync } from "node:fs";
-
-import { brainDirs } from "./paths.ts";
-import { listLogDates, readLogDay } from "./log-jsonl.ts";
+import { logDayReader } from "./log-days.ts";
+import { withoutPrivateEntries } from "./log-events-at-reach.ts";
 import { MOST_APPLIED_LIMIT_DEFAULT, MOST_APPLIED_WINDOW_DAYS_DEFAULT } from "./policy.ts";
 import { isoDate } from "./time.ts";
 import { normaliseWikilinkTarget } from "./wikilink.ts";
@@ -34,6 +32,12 @@ export interface ComputeMostAppliedOptions {
   readonly windowDays?: number;
   /** Max entries returned. Defaults to 10. */
   readonly limit?: number;
+  /**
+   * The caller is below local reach: events of the store's `private`
+   * partition are not counted, so the counts and the order read as if
+   * they did not exist. Default false (local callers and the CLI).
+   */
+  readonly withholdsPrivate?: boolean;
 }
 
 /**
@@ -46,16 +50,13 @@ export interface ComputeMostAppliedOptions {
  *                    do not appear in `active.md`.
  */
 export function computeMostApplied(
-  vault: string,
+  vault: string | null,
   preferences: ReadonlyArray<BrainPreference>,
   opts: ComputeMostAppliedOptions = {},
 ): ReadonlyArray<MostAppliedEntry> {
   const now = opts.now ?? new Date();
   const windowDays = opts.windowDays ?? MOST_APPLIED_WINDOW_DAYS_DEFAULT;
   const limit = opts.limit ?? MOST_APPLIED_LIMIT_DEFAULT;
-  const dirs = brainDirs(vault);
-  if (!existsSync(dirs.log)) return [];
-
   // The caller is supposed to filter to confirmed | quarantine upstream,
   // but the status guard here keeps the contract honest if a future
   // caller passes a wider list — retired rules must never surface in
@@ -77,23 +78,26 @@ export function computeMostApplied(
   // Day-level fence: include the day before window start to absorb
   // UTC drift between the event timestamp and the file's date prefix.
   const earliestDayPrefix = isoDate(new Date(windowStartMs - DAY_MS));
+  // Only the window's days are read (on a store-only machine, only the
+  // shards that can hold them); a missing `Brain/log/` lists no date.
+  const log = logDayReader(vault, { from: earliestDayPrefix });
 
   const counts = new Map<string, number>();
   // Shard-aware (Memory Integrity Suite): one discovery pass over every
   // log filename shape; readLogDay merges the day's shards.
-  for (const datePrefix of listLogDates(vault)) {
+  for (const datePrefix of log.dates) {
     if (datePrefix < earliestDayPrefix) continue;
 
     let parsed;
     try {
-      parsed = readLogDay(vault, datePrefix);
+      parsed = log.day(datePrefix);
     } catch (err) {
       process.stderr.write(
         `warning: most-applied: failed to read ${datePrefix}: ${(err as Error).message}\n`,
       );
       continue;
     }
-    for (const e of parsed.entries) {
+    for (const e of withoutPrivateEntries(parsed.entries, opts.withholdsPrivate === true)) {
       if (e.eventType !== BRAIN_LOG_EVENT_KIND.applyEvidence) continue;
       if (e.body["result"] !== BRAIN_APPLY_RESULT.applied) continue;
       const eventMs = Date.parse(e.timestamp);

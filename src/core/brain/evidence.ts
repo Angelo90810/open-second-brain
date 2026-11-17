@@ -6,9 +6,24 @@
  * pass, so the file mirrors what the counters say.
  *
  * Pure read: no I/O outside reading log files.
+ *
+ * ## Private evidence on a shared preference (task 3.18)
+ *
+ * On a store-only machine an `apply-evidence` event lands in `private`
+ * when its artifact or note names a private page, even when the
+ * preference it targets is shared. Such an event never counts toward a
+ * shared preference: the counters, the status, the confidence and the
+ * `## Recent ...` sections it would move live on the shared preference
+ * record, which every machine and remote caller reads, so counting it
+ * would publish what the private partition holds. It counts toward a
+ * preference that is itself private, whose record stays in `private`.
+ * The event stays in this machine's private log, where a local reader
+ * sees it. {@link privateEvidenceCounts} is the one rule both the dream
+ * scan and this collector apply.
  */
 
-import { listLogDates, readLogDay } from "./log-jsonl.ts";
+import { storePreferenceEntry } from "./preference-store.ts";
+import { logDayReader } from "./log-days.ts";
 import {
   BRAIN_APPLY_RESULT,
   BRAIN_LOG_EVENT_KIND,
@@ -33,12 +48,26 @@ export function listLogDays(vault: string): string[] {
   // every log filename shape, legacy and sharded.
   let days: string[];
   try {
-    days = [...listLogDates(vault)];
+    days = [...logDayReader(vault).dates];
   } catch {
     return [];
   }
   days.reverse();
   return days;
+}
+
+/**
+ * Whether a private `apply-evidence` event may count toward the preference
+ * `pref-<slug>`: only when that preference is known to be private. A
+ * preference the store does not resolve takes none (fail closed: counting
+ * could publish the event on a shared record).
+ */
+export function privateEvidenceCounts(slug: string): boolean {
+  try {
+    return storePreferenceEntry(slug)?.private === true;
+  } catch {
+    return false;
+  }
 }
 
 export interface CollectEvidenceOptions {
@@ -71,7 +100,7 @@ export interface CollectedEvidence {
  * Stops early once both quotas are full.
  */
 export function collectEvidenceForSlug(
-  vault: string,
+  vault: string | null,
   slug: string,
   opts: CollectEvidenceOptions,
 ): CollectedEvidence {
@@ -83,9 +112,21 @@ export function collectEvidenceForSlug(
   const applied: BrainEvidenceSummary[] = [];
   const violated: BrainEvidenceSummary[] = [];
 
-  for (const day of listLogDays(vault)) {
+  // An unreadable log is no evidence, as it always was: never a throw out
+  // of a reader the dream pass calls once per preference. Only the days
+  // from the cutoff on are read.
+  let log: ReturnType<typeof logDayReader>;
+  let dates: ReadonlyArray<string>;
+  try {
+    log = logDayReader(vault, cutoff !== null ? { from: cutoff.slice(0, 10) } : {});
+    dates = log.dates;
+  } catch {
+    return { applied, violated };
+  }
+  let takesPrivate: boolean | undefined;
+  for (const day of dates.toReversed()) {
     if (cutoff && day < cutoff.slice(0, 10)) break;
-    const { entries } = readLogDay(vault, day);
+    const { entries } = log.day(day);
     // readLogDay returns entries in merged order (oldest first). We want
     // newest first across the whole vault, so iterate in reverse.
     for (let i = entries.length - 1; i >= 0; i--) {
@@ -94,6 +135,9 @@ export function collectEvidenceForSlug(
       if (cutoff && e.timestamp < cutoff) continue;
       const prefRef = e.body["preference"];
       if (typeof prefRef !== "string" || !eqId(prefRef, slug)) continue;
+      if (e.fromPrivatePartition === true && !(takesPrivate ??= privateEvidenceCounts(slug))) {
+        continue;
+      }
       const result = e.body["result"];
       if (typeof result !== "string") continue;
       const artifact = typeof e.body["artifact"] === "string" ? e.body["artifact"] : "";

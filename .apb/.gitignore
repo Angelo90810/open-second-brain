@@ -10,3 +10,11 @@ locks/
 decisions.jsonl
 memory/
 problems/
+scenario-runs/
+launch-challenges/
+corrections/
+handoff/
+start-keys/
+concurrency/
+health/
+runs-archive/

@@ -436,7 +436,10 @@ export interface RecallTelemetrySummary {
   readonly gap_counts: Record<string, number>;
 }
 
-export function emitRecallTelemetry(vault: string, input: RecallTelemetryInput): ContinuityRecord {
+export function emitRecallTelemetry(
+  vault: string | null,
+  input: RecallTelemetryInput,
+): ContinuityRecord {
   const createdAt = input.createdAt ?? new Date().toISOString();
   const topArtifacts = [...(input.topArtifacts ?? [])];
   const gaps = [...new Set((input.gaps ?? []).map((gap) => gap.trim()).filter(Boolean))];
@@ -469,7 +472,7 @@ export function emitRecallTelemetry(vault: string, input: RecallTelemetryInput):
 }
 
 export function listRecallTelemetry(
-  vault: string,
+  vault: string | null,
   filter: RecallTelemetryFilter = {},
 ): ReadonlyArray<ContinuityRecord> {
   let records = listContinuityRecords(vault, {
@@ -483,10 +486,22 @@ export function listRecallTelemetry(
 }
 
 export function summarizeRecallTelemetry(
-  vault: string,
+  vault: string | null,
   filter: RecallTelemetryFilter = {},
 ): RecallTelemetrySummary {
-  const records = listRecallTelemetry(vault, filter);
+  return summarizeRecallTelemetryRecords(listRecallTelemetry(vault, filter));
+}
+
+/**
+ * The summary fold over an already-listed set of records. Split from
+ * {@link summarizeRecallTelemetry} so a reader that must apply its own
+ * record boundary first (the MCP tool applies the caller's reach and
+ * ownership view, dropping withheld records BEFORE the counts) folds the
+ * same numbers over the same shape without a second disk read.
+ */
+export function summarizeRecallTelemetryRecords(
+  records: ReadonlyArray<ContinuityRecord>,
+): RecallTelemetrySummary {
   const byMode: Partial<Record<RecallTelemetryMode, number>> = {};
   const byStatus: Partial<Record<RecallTelemetryStatus, number>> = {};
   const byChannel: Partial<Record<RecallChannel, number>> = {};

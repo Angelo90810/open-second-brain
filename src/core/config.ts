@@ -22,12 +22,14 @@ import { resolvePointerVault } from "./brain/portability/pointer.ts";
 import { parseBrainYaml } from "./brain/yaml-parse.ts";
 import { BrainConfigError } from "./brain/policy/errors.ts";
 import { BRAIN_CONFIG_FILE, BRAIN_ROOT_REL } from "./brain/path-constants.ts";
+import { resolveSkillRewriteMode, type SkillRewriteMode } from "./brain/skill-rewrite.ts";
 import {
   isWikiLinkFormat,
   WIKI_LINK_FORMATS,
   type WikiLinkFormat,
 } from "./brain/link-graph/format-wikilink.ts";
 import type { LinkOutputFormat } from "./brain/wikilink.ts";
+import { STORE_DUAL_WRITE_CONFIG_KEY, STORE_DUAL_WRITE_ENV } from "./store/constants.ts";
 import type { ConfigDiscovery } from "./types.ts";
 
 /**
@@ -414,6 +416,17 @@ export function resolveVault(configPath?: string, opts: { cwd?: string } = {}): 
 }
 
 /**
+ * The machine config's own `vault` key (`~` expanded), or null when it
+ * sets none: unlike {@link resolveVault}, never `VAULT_DIR`, a project
+ * pointer or a profile, which name a vault for one session only. For a
+ * writer that would persist the answer back as the machine's vault.
+ */
+export function configuredVaultKey(configPath?: string): string | null {
+  const value = discoverConfig(configPath).data["vault"];
+  return value ? expandTilde(value) : null;
+}
+
+/**
  * The identity every install writes under until one is configured.
  *
  * It is a placeholder, not a name: two unconfigured installs write under
@@ -504,8 +517,60 @@ const SHARED_NAMESPACE_KEY = "shared_namespace";
  */
 export const DEVICE_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
+/**
+ * Names Windows reserves for devices in every path component (`nul`,
+ * `con`, `com1`, ...): there a directory under such a name makes writes
+ * vanish or reads block. Device ids carry no dot, so the reserved forms
+ * with an extension cannot occur.
+ */
+const WINDOWS_RESERVED_DEVICE_NAME_RE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
+
+/**
+ * Whether `value` has the shape of a device id. Platform-independent: it
+ * judges data that comes from peers (record envelopes, shard listings,
+ * folds, digests, log shards), and every machine must accept the same
+ * records or their folds and digests stop matching across platforms. A
+ * Windows reserved name is a valid id here; choosing this machine's own
+ * id is {@link isUsableLocalDeviceId}.
+ */
 export function isValidDeviceId(value: string): boolean {
   return DEVICE_ID_RE.test(value) && !value.startsWith("sync-conflict");
+}
+
+/** Whether `value` is one of the names Windows reserves for devices (`nul`, `con`, ...). */
+export function isWindowsReservedDeviceId(value: string): boolean {
+  return WINDOWS_RESERVED_DEVICE_NAME_RE.test(value);
+}
+
+/**
+ * Whether `value` may be THIS machine's device id on `platform`. A new id
+ * is never a Windows reserved name on any platform (the generated form
+ * cannot be one). An existing configured reserved id is refused only on
+ * Windows: a POSIX machine whose id is one of them keeps it, so its log
+ * shards and store directories stay under that name.
+ */
+export function isUsableLocalDeviceId(
+  value: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return isValidDeviceId(value) && !(platform === "win32" && isWindowsReservedDeviceId(value));
+}
+
+/** Environment variable that overrides the machine config's `device_id`. */
+export const DEVICE_ID_ENV = "O2B_DEVICE_ID";
+
+/**
+ * The device id {@link resolveDeviceId} would answer, read without
+ * minting one: null when the env override opts out (the empty string)
+ * or when no valid id is configured yet. For readers that must agree
+ * with the writers' identity but must never write the machine config.
+ */
+export function readDeviceId(configPath?: string | null): string | null {
+  const env = process.env[DEVICE_ID_ENV];
+  if (env === "") return null;
+  if (env !== undefined && isUsableLocalDeviceId(env)) return env;
+  const value = discoverConfig(configPath ?? defaultConfigPath()).data["device_id"];
+  return value !== undefined && isUsableLocalDeviceId(value) ? value : null;
 }
 
 export function resolveDeviceId(configPath?: string): string {
@@ -513,13 +578,13 @@ export function resolveDeviceId(configPath?: string): string {
   // of sharding (legacy single-file log pair). The test preload pins
   // this to "" so the suite stays deterministic; an invalid value
   // falls through to config resolution.
-  const env = process.env["O2B_DEVICE_ID"];
-  if (env !== undefined && (env === "" || isValidDeviceId(env))) return env;
+  const env = process.env[DEVICE_ID_ENV];
+  if (env !== undefined && (env === "" || isUsableLocalDeviceId(env))) return env;
   const resolved = configPath ?? defaultConfigPath();
 
   const read = (): string | null => {
     const value = discoverConfig(resolved).data["device_id"];
-    return value && isValidDeviceId(value) ? value : null;
+    return value && isUsableLocalDeviceId(value) ? value : null;
   };
 
   const existing = read();
@@ -989,6 +1054,17 @@ export function resolveNearDuplicateWriteWideningEnabled(configPath?: string): b
 }
 
 /**
+ * Brain store dual writes (task 1.11, a phase 1 trial). Default OFF: the
+ * legacy writers write only the vault tree. When on, every covered legacy
+ * write also appends the equivalent record to the brain store
+ * (`src/core/store/dual-write.ts`); a store failure never fails the
+ * legacy write. Env twin: `OPEN_SECOND_BRAIN_STORE_DUAL_WRITE`.
+ */
+export function resolveStoreDualWrite(configPath?: string): boolean {
+  return resolveConfigFlag(STORE_DUAL_WRITE_ENV, STORE_DUAL_WRITE_CONFIG_KEY, configPath);
+}
+
+/**
  * SessionEnd handoff-note gate (Agent Surface Suite, t_28afa4d2).
  * Default OFF: lifecycle capture writes no handoff note unless
  * `session_handoff: "true"`.
@@ -1010,6 +1086,18 @@ export const DECISION_RECALL_MAX_PER_SESSION_ENV_KEY =
 export const DECISION_RECALL_MIN_SPACING_TURNS_CONFIG_KEY = "decision_recall.min_spacing_turns";
 export const DECISION_RECALL_MIN_SPACING_TURNS_ENV_KEY =
   "OPEN_SECOND_BRAIN_DECISION_RECALL_MIN_SPACING_TURNS";
+
+/**
+ * Environment twin of the lessons promotion scope list (operator-approved
+ * lesson promotion, t_1e952e43). The flat machine-config key itself is
+ * `lessons.promotion.scopes`, declared beside its resolver in
+ * `src/core/brain/policy/blocks/lessons.ts` so the brain module owns its
+ * own key vocabulary. Comma-separated scope names; the same parsing rules
+ * as `resolveCounterpartyBriefTriggers` apply (entries NFC-normalized and
+ * trimmed, empty entries dropped, bracket-shaped values malformed). Absent
+ * or empty disables promotion entirely.
+ */
+export const LESSONS_PROMOTION_SCOPES_ENV_KEY = "OPEN_SECOND_BRAIN_LESSONS_PROMOTION_SCOPES";
 
 /**
  * Shared body for a non-negative-integer config value: env var (trimmed)
@@ -1961,6 +2049,44 @@ export function resolveTelegramCaptureAllowlist(configPath?: string): string[] {
     if (id.length > 0 && !ids.includes(id)) ids.push(id);
   }
   return ids;
+}
+
+/**
+ * Rewrite-gate mode for benchmark-gated skill rewrites (agent-presence,
+ * Lane A). `gated` (the default) runs one candidate per gate round;
+ * `iterative` is accepted and currently behaves exactly like `gated` -
+ * one candidate per round - because the bounded edit loop it reserves is
+ * not implemented yet; the value is carried so operators can opt in
+ * without a config migration when the loop ships. The flat
+ * machine-config key is `skill_rewrite.mode`; an unknown value is a named
+ * error from the kernel's own resolver, never a silent fallback to the
+ * default.
+ */
+export const SKILL_REWRITE_MODE_CONFIG_KEY = "skill_rewrite.mode";
+export const SKILL_REWRITE_MODE_ENV_KEY = "OPEN_SECOND_BRAIN_SKILL_REWRITE_MODE";
+
+/** Resolve the rewrite mode: env twin first, then the config file's flat key. */
+export function resolveSkillRewriteModeConfig(configPath?: string): SkillRewriteMode {
+  const env = process.env[SKILL_REWRITE_MODE_ENV_KEY]?.trim();
+  const raw = env || discoverConfig(configPath).data[SKILL_REWRITE_MODE_CONFIG_KEY]?.trim();
+  return resolveSkillRewriteMode(raw);
+}
+
+/**
+ * Optional advisory judge command for rewrite gate rounds (agent-presence,
+ * Lane A). Same contract as `bench_judge_cmd` (t_882c396a): unset (the
+ * default) means the judge phase is skipped, and when set the judge is
+ * advisory only - it never moves the `tasks_passed_rate` metric the gate
+ * decides on. The deterministic scorer stays canonical in every message.
+ */
+export const SKILL_REWRITE_JUDGE_CMD_CONFIG_KEY = "skill_rewrite_judge_cmd";
+export const SKILL_REWRITE_JUDGE_CMD_ENV_KEY = "OPEN_SECOND_BRAIN_SKILL_REWRITE_JUDGE_CMD";
+
+/** Resolve the advisory rewrite judge: env twin first, then the config file. */
+export function resolveSkillRewriteJudgeCmd(configPath?: string): string | undefined {
+  const env = process.env[SKILL_REWRITE_JUDGE_CMD_ENV_KEY]?.trim();
+  const raw = env || discoverConfig(configPath).data[SKILL_REWRITE_JUDGE_CMD_CONFIG_KEY]?.trim();
+  return raw !== undefined && raw !== "" ? raw : undefined;
 }
 
 /**

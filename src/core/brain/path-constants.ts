@@ -43,6 +43,13 @@ export const BRAIN_SKILL_ACCEPT_JOURNAL_REL = posix.join(
   BRAIN_SKILL_PROPOSALS_REL,
   "accept-journal",
 );
+/**
+ * Shard stem of the verifier-rejection JSONL ledger inside the proposals
+ * root. Here rather than in `skill-proposals.ts` because the migration's
+ * lane map needs it too, and that module's import graph reaches the dream
+ * pass, which reads the lane map.
+ */
+export const VERIFIER_REJECTION_LEDGER_STEM = "verifier-rejections";
 export const BRAIN_PROCEDURES_REL = posix.join(BRAIN_ROOT_REL, "procedures");
 export const BRAIN_PROCEDURAL_MEMORY_REL = posix.join(BRAIN_ROOT_REL, "procedural-memory");
 export const BRAIN_ATTENTION_REL = posix.join(BRAIN_ROOT_REL, "attention");
@@ -106,6 +113,13 @@ export const BRAIN_STATE_REL = posix.join(BRAIN_ROOT_REL, "state");
  */
 export const BRAIN_INTERNAL_STATE_DIR = ".state";
 export const BRAIN_INTERNAL_STATE_REL = posix.join(BRAIN_ROOT_REL, BRAIN_INTERNAL_STATE_DIR);
+/**
+ * Anticipatory context cache: `Brain/.state/anticipatory/<key>.json`. One
+ * entry per lineage root and enforced owner scope, refreshed on hook
+ * events and pruned by age and count on write.
+ */
+export const BRAIN_ANTICIPATORY_DIR = "anticipatory";
+export const BRAIN_ANTICIPATORY_REL = posix.join(BRAIN_INTERNAL_STATE_REL, BRAIN_ANTICIPATORY_DIR);
 /** Obsidian Bases view definitions: `Brain/bases/<view>.base` (v1.15.0). */
 export const BRAIN_BASES_REL = posix.join(BRAIN_ROOT_REL, "bases");
 /** Ingested source summary pages: `Brain/sources/src-<slug>.md` (v1.7.0). */
@@ -184,6 +198,16 @@ export const BRAIN_SNAPSHOT_EXCLUDED_ENTRIES: ReadonlyArray<string> = Object.fre
   BRAIN_SNAPSHOTS_DIR,
   BRAIN_ARTIFACTS_DIR,
 ]);
+
+/**
+ * Name prefix of a restore's staging directory. It normally lives under
+ * `.snapshots/`, but sits directly under `Brain/` when `.snapshots/` is on
+ * another device, and a restore killed mid-swap leaves it there. Such a
+ * top-level entry is restore plumbing, never Brain content: the archiver,
+ * the manifest walker and the restore all skip it, like
+ * {@link BRAIN_SNAPSHOT_EXCLUDED_ENTRIES}.
+ */
+export const BRAIN_RESTORE_STAGING_PREFIX = ".restore-staging-";
 
 /**
  * The DERIVED store: `<vault>/.open-second-brain/brain.sqlite`.

@@ -388,6 +388,70 @@ export const OUT_OF_VAULT_STATE: ReadonlyArray<OutOfVaultState> = Object.freeze(
       "carries numbers, names and timestamps - never vault text.",
     sources: ["src/core/decision-model/thresholds.ts", "src/core/decision-model/config.ts"],
   },
+  {
+    id: "brain_store",
+    label: "brain store",
+    location: WINDOWS
+      ? `%OPEN_SECOND_BRAIN_STORE_ROOT%, else the store_root config key, else (${describeBaseDir("data", "win32")})\\open-second-brain\\store\\`
+      : "${OPEN_SECOND_BRAIN_STORE_ROOT:-the store_root config key, else ${XDG_DATA_HOME:-~/.local/share}/open-second-brain/store}/",
+    carries_memory: true,
+    created_by:
+      "the first brain store dual write, only while the store_dual_write setting (a phase 1 trial, off by default) is on",
+    removed_by: "deleting that directory yourself; it is the store's only copy on this machine",
+    note:
+      "The documented append-only store of Open Second Brain machine data (FORMAT.md inside it), " +
+      "kept outside the vault on purpose: a store root inside the vault is refused. Its shared " +
+      "and private partition folders are what a user syncs between machines.",
+    sources: ["src/core/store/store-paths.ts", "src/core/store/store-location.ts"],
+  },
+  {
+    id: "human_view",
+    label: "human view pages",
+    location: WINDOWS
+      ? "the folder %OPEN_SECOND_BRAIN_VIEW_TARGET% names, else the view_target config key; none when neither is set"
+      : "the folder ${OPEN_SECOND_BRAIN_VIEW_TARGET:-the view_target config key} names; none when neither is set",
+    carries_memory: true,
+    created_by:
+      "a render pass on the view writer device (o2b view render, the end of a dream pass, or the " +
+      "session-start hook at most once an hour), only when a view folder is configured",
+    removed_by:
+      "deleting the pages yourself; the next render on the view writer writes them again from " +
+      "the store, and edits already rendered are kept as store records",
+    note:
+      "Readable Markdown pages (about-me.md, decisions.md, history/) rendered from the brain " +
+      "store by the one view writer device. The folder may be inside the vault or anywhere else; " +
+      "a folder inside the store is refused. Edits made to a page become human records in the store.",
+    sources: ["src/core/view/target.ts"],
+  },
+  {
+    id: "brain_store_device_state",
+    label: "brain store device-local state",
+    location: WINDOWS
+      ? `(${describeBaseDir("state", "win32")})\\open-second-brain\\stores\\`
+      : "${XDG_STATE_HOME:-~/.local/state}/open-second-brain/stores/",
+    carries_memory: true,
+    created_by:
+      "the first write to a brain store from this machine, the first search index build while a " +
+      "brain store is in use, or the first failed or skipped dual write (dual-write.json)",
+    removed_by:
+      "deleting that directory yourself while nothing writes to the store; locks and the clock " +
+      "are recreated, the dual-write failure and skip counters the doctor reports start again " +
+      "from zero, and `o2b search index` rebuilds the search index",
+    note:
+      "Append locks, blob temp files, the persisted hybrid logical clock of this device and, " +
+      "while a brain store is in use, the search index (index/<vault key>/ under the store id, " +
+      "a copy of every indexed chunk), in one directory per store id, plus dual-write.json, the " +
+      "counter of failed or skipped dual writes the doctor reports, and the human view writer's " +
+      "state (render intents, page stats, the hourly hook stamp) with the hook audit of fail-open " +
+      "paths. It is never synced and never " +
+      "lives inside the store, so another machine never sees a lock or a clock of this one.",
+    sources: [
+      "src/core/store/store-paths.ts",
+      "src/core/platform-dirs.ts",
+      "src/core/search/brain-store/location.ts",
+      "src/core/view/auto-render.ts",
+    ],
+  },
 ]);
 
 /**
@@ -403,6 +467,12 @@ export const OUT_OF_VAULT_STATE: ReadonlyArray<OutOfVaultState> = Object.freeze(
  * belongs in {@link OUT_OF_VAULT_STATE} instead, no matter how small.
  */
 export const OUT_OF_VAULT_SWEEP_EXCLUSIONS: ReadonlyMap<string, string> = new Map([
+  [
+    "src/mcp/brain/device-path.ts",
+    "the remote-reach redaction only names this machine's roots (home, temp, vault, store, " +
+      "device state, config) to recognise them inside tool results and rewrite them; it builds " +
+      "no path it or anything else writes to",
+  ],
   [
     "src/core/doctor-selftest.ts",
     "the doctor self-test builds one temp-rooted scratch vault per run (its store database is " +
@@ -593,6 +663,12 @@ export const OUT_OF_VAULT_SWEEP_EXCLUSIONS: ReadonlyMap<string, string> = new Ma
  */
 export const SOURCES_INVISIBLE_TO_THE_SWEEP: ReadonlyMap<string, string> = new Map([
   [
+    "src/core/view/auto-render.ts",
+    "the view writer's hook stamp and fail-open hook audit sit below " +
+      "`deviceStateDirFor(<store id>)` from `store/store-paths.ts`, so there is no home or XDG " +
+      "token in this file for the sweep to match on",
+  ],
+  [
     "src/cli/maintenance-cron.ts",
     "the maintenance lane recipe takes its script path from `operatorScriptPath()` in " +
       "`cli/cron-recipe.ts` and its systemd unit paths from the shared renderer there, so there " +
@@ -615,6 +691,12 @@ export const SOURCES_INVISIBLE_TO_THE_SWEEP: ReadonlyMap<string, string> = new M
     "the native-Windows half of `install-cli`: it writes `.cmd` launchers into whichever bin " +
       "directory its caller hands it and builds no root of its own, so there is no home or XDG " +
       "token in the source to match on",
+  ],
+  [
+    "src/core/search/brain-store/location.ts",
+    "the store index path is `join(store.deviceStateDir, ...)`: the device-local state directory " +
+      "arrives from `deviceStateDirFor()` in src/core/store/store-paths.ts, which IS swept, so " +
+      "no home or XDG token appears in this file's own source",
   ],
   [
     "src/core/search/paths.ts",

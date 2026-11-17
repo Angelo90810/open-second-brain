@@ -19,6 +19,9 @@
  *   - `dream-apply.ts`        the plan turned into disk state, in order
  *   - `dream-report.ts`       the run's audit trail in `Brain/log/`
  *   - `dream-summary.ts`      the {@link DreamRunSummary} the caller sees
+ *   - `dream-outcome.ts`      the `changed` gate, warnings, retire siblings
+ *   - `dream-rollup.ts`       the rollup-ladder plan and its link manifest
+ *   - `dream-tail.ts`         topic planning and the human view render
  *
  * Outputs (high level):
  *
@@ -50,6 +53,9 @@
  *   - dryRun mode returns the planned summary but performs no writes.
  */
 
+import { withTopicPass, withViewPass } from "./dream-tail.ts";
+import { vaultRelativeOf } from "./no-vault.ts";
+import { withLogReadPass } from "./log-days.ts";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -59,30 +65,23 @@ import {
   gatedRetireSlugs,
   plannedSignalArchiveIds,
   plannedSignalMoveIds,
-  shouldGateRetireFromConfirmed,
   type DreamApplyResult,
 } from "./dream-apply.ts";
-import { resolveNearDuplicateRetireSiblingsEnabled } from "../config.ts";
 import { planAutoRetires } from "./dream-plan-retires.ts";
 import { planTopics, topicKeyContentionWarnings } from "./dream-plan-topics.ts";
-import type { PlanState, ScanResult } from "./dream-plan.ts";
+import type { ScanResult } from "./dream-plan.ts";
 import {
   planCrossTopicRules,
   readCrossTopicLedger,
   resolveCrossTopicConfig,
 } from "./dream-plan-cross-topic.ts";
-import { planRefresh, scanApplyEvidence, type RefreshResult } from "./dream-refresh.ts";
+import { planRefresh, scanApplyEvidence } from "./dream-refresh.ts";
 import { writeDreamLog } from "./dream-report.ts";
 import { scanBrain } from "./dream-scan.ts";
 import { planSignalArchive } from "./signal-archive.ts";
 import { buildChangedSummary, buildNoOpSummary } from "./dream-summary.ts";
-import type {
-  DreamGatedRetireEntry,
-  DreamOptions,
-  DreamRunSummary,
-  DreamWarning,
-} from "./dream-types.ts";
-import { openWorkrun, WORKRUN_PHASE, type WorkrunHandle } from "./dream-workrun.ts";
+import type { DreamOptions, DreamRunSummary, DreamWarning } from "./dream-types.ts";
+import { openWorkrun, WORKRUN_PHASE, workrunPath, type WorkrunHandle } from "./dream-workrun.ts";
 import { buildIntentReview } from "./intent-review.ts";
 import { logShardWikilink } from "./log.ts";
 import {
@@ -92,24 +91,17 @@ import {
   type ProgressCounter,
 } from "./progress.ts";
 import { regenerateLessonsQuiet } from "./lessons.ts";
-import { buildLinkCandidateManifest, type LinkCandidateManifest } from "./notes/link-candidates.ts";
-import { gatedOwnerScopeView } from "./owner-scope-view.ts";
-import { brainDirsForWrite, dreamWorkrunPath, vaultRelative } from "./paths.ts";
+import { brainDirsForWrite, collisionCandidateName } from "./paths.ts";
+import { isStoreOnly } from "../store/store-only.ts";
+import { repairLaneEntryIds } from "../store-migration/lane-id-repair.ts";
 import { loadBrainConfig } from "./policy.ts";
 import { buildReconcileOutcomes } from "./reconcile-outcomes.ts";
-import {
-  planRollupLadder,
-  readRollupLedger,
-  resolveRollupThresholds,
-  type RollupLadderPlan,
-} from "./rollup-ladder.ts";
-import { READ_ALL_REFS } from "./near-duplicate.ts";
-import { planRetireSiblings, retireSiblingPool } from "./retire-siblings.ts";
+import { buildRollupPlan, memoizedLinkCandidates } from "./dream-rollup.ts";
+import { collectWarnings, hasStateChange, withRetireSiblings } from "./dream-outcome.ts";
 import { applySalienceGate } from "./salience-gate.ts";
 import { withDestructiveSnapshot } from "./snapshot-gate.ts";
 import { compactRunStamp, isoDate } from "./time.ts";
 import { BRAIN_SNAPSHOT_REASON } from "./types.ts";
-import type { BrainConfig } from "./types.ts";
 
 // ----- Public surface ------------------------------------------------------
 
@@ -186,11 +178,11 @@ export class DreamPreviewReadableError extends Error {
  * every record at a path it rejects is dropped, as if it were absent.
  */
 function scanAsAdmitted(
-  vault: string,
+  vault: string | null,
   scan: ScanResult,
   admit: (rel: string) => boolean,
 ): ScanResult {
-  const keep = (path: string): boolean => admit(vaultRelative(path, vault));
+  const keep = (path: string): boolean => admit(vaultRelativeOf(path, vault));
   return {
     ...scan,
     signals: scan.signals.filter((r) => keep(r.path)),
@@ -211,7 +203,7 @@ function scanAsAdmitted(
  * not tell a cancelled pass from a crashed one from a hung one, which is
  * the whole distinction `SafeguardAbortError` exists to preserve.
  */
-export function dream(vault: string, opts: DreamOptions = {}): DreamRunSummary {
+export function dream(vault: string | null, opts: DreamOptions = {}): DreamRunSummary {
   // A caller's progress sink is an observer, and an observer must not be
   // able to destroy what it observes: a closed pipe or a renderer defect
   // cannot be allowed to abort a pass that is otherwise succeeding. Nor
@@ -222,7 +214,11 @@ export function dream(vault: string, opts: DreamOptions = {}): DreamRunSummary {
     onSinkError: (error) => progressFaults.push(errorMessage(error)),
   });
   try {
-    return dreamRun(vault, opts, progress, progressFaults);
+    // One read pass for the whole dream: the store-only log is read once
+    // and shared by every preference's evidence walk (log-days.ts).
+    return withLogReadPass(() =>
+      withViewPass(withTopicPass(dreamRun(vault, opts, progress, progressFaults), opts), opts),
+    );
   } catch (error) {
     const reason = progressReasonForError(error);
     if (reason !== null) progress.stop(reason);
@@ -230,8 +226,31 @@ export function dream(vault: string, opts: DreamOptions = {}): DreamRunSummary {
   }
 }
 
+/** Ladder attempts for a no-vault run id, as many as a snapshot run gets. */
+const NO_VAULT_RUN_ID_ATTEMPTS = 100;
+
+/** The first `<base>[-N]` run id whose no-vault workrun journal does not exist yet. */
+function uniqueNoVaultRunId(base: string): string {
+  for (let attempt = 1; attempt <= NO_VAULT_RUN_ID_ATTEMPTS; attempt++) {
+    const candidate = collisionCandidateName(base, attempt);
+    if (!existsSync(workrunPath(null, candidate))) return candidate;
+  }
+  throw new Error(`dream: no free run id after ${NO_VAULT_RUN_ID_ATTEMPTS} attempts (${base})`);
+}
+
+/**
+ * Regenerate the active and lessons digests after a pass. Where they land
+ * is `compiledDigestPath`'s one rule: `Brain/active.md` and
+ * `Brain/lessons.md` on an unswitched machine, the device-local cache on
+ * a store-only one (design D14 item 7), which this warms.
+ */
+function regenerateDigestPages(vault: string | null, now: Date): void {
+  regenerateActiveQuiet(vault, { now });
+  regenerateLessonsQuiet(vault, { now });
+}
+
 function dreamRun(
-  vault: string,
+  vault: string | null,
   opts: DreamOptions,
   progress: ProgressCounter,
   progressFaults: ReadonlyArray<string>,
@@ -248,6 +267,16 @@ function dreamRun(
   progress.start(DREAM_STAGE.scan);
   opts.safeguard?.checkpoint();
   const cfg = loadBrainConfig(vault);
+  // Lane entries an earlier release filed under another path's id are
+  // moved to their own (`store-migration/lane-id-repair.ts`); a no-op once
+  // repaired, and never a reason to fail the pass.
+  if (!dryRun && (vault === null || isStoreOnly({ vault }))) {
+    try {
+      repairLaneEntryIds(vault);
+    } catch {
+      // The next pass tries again.
+    }
+  }
   // Per-run gate resolution (no-dead-ends, Unit E): the override wins for
   // this run, the configured value decides when it is absent. Resolved
   // once, here, so the heal branch below has a single source of truth and
@@ -380,10 +409,7 @@ function dreamRun(
   let rollupPlan = buildRollupPlan(vault, cfg, salienceGate.admitted, runId, linkCandidates);
 
   if (!hasStateChange(plan, refresh, scan.corrupted.length, rollupPlan)) {
-    if (!dryRun) {
-      regenerateActiveQuiet(vault, { now });
-      regenerateLessonsQuiet(vault, { now });
-    }
+    if (!dryRun) regenerateDigestPages(vault, now);
     // A run that changed nothing still finished. Reporting it as an
     // unterminated stream would make an idempotent rerun - the common
     // case - indistinguishable from a pass that died in planning.
@@ -434,58 +460,75 @@ function dreamRun(
     };
   } else {
     const baseRunId = runId;
-    const gated = withDestructiveSnapshot(
-      vault,
-      BRAIN_SNAPSHOT_REASON.dream,
-      (snapshot) => {
-        runId = snapshot.runId;
-        // The rollup plan (and each envelope's target_path) was built with
-        // the pre-collision runId; if the ladder corrected it, rebuild the
-        // plan so every target_path embeds the final run_id.
-        if (rollupPlan.fired && runId !== baseRunId) {
-          rollupPlan = buildRollupPlan(vault, cfg, salienceGate.admitted, runId, linkCandidates);
-        }
-        opts.safeguard?.checkpoint();
-        const handle = openWorkrun(vault, runId);
-        // Truthful checkpoints (no-dead-ends, Unit E). A marker means every
-        // durable effect attributed to that phase is already on disk, so a
-        // crash leaves a journal whose last marker names work that genuinely
-        // finished. Cluster and close are the only two phases whose work
-        // provably ends here: clustering is pure planning that produces no
-        // file at all, and close's single artifact - the pre-run snapshot -
-        // was written by the gate before this callback ran. Every other
-        // marker moved down to the point where that phase's writes land;
-        // see the emission notes there.
-        handle.checkpoint(WORKRUN_PHASE.clusterComplete);
-        handle.checkpoint(WORKRUN_PHASE.closeComplete);
-        const applied = applyDreamPlan({
-          vault,
-          cfg,
-          now,
-          plan,
-          refresh,
-          agentName: opts.agentName,
-          wikilinkToRun,
-          healEnrichEnabled,
-          ...(opts.safeguard ? { safeguard: opts.safeguard } : {}),
-          workrun: handle,
-        });
-        return { applied, handle };
-      },
-      {
-        // `now` rather than wall clock: the pass is byte-reproducible given
-        // its injected clock, and the snapshot audit line must not be the
-        // one thing that breaks that.
+    const applyRun = (): { applied: DreamApplyResult; handle: WorkrunHandle } => {
+      opts.safeguard?.checkpoint();
+      const handle = openWorkrun(vault, runId);
+      // Truthful checkpoints (no-dead-ends, Unit E). A marker means every
+      // durable effect attributed to that phase is already on disk, so a
+      // crash leaves a journal whose last marker names work that genuinely
+      // finished. Cluster and close are the only two phases whose work
+      // provably ends here: clustering is pure planning that produces no
+      // file at all, and close's single artifact - the pre-run snapshot -
+      // was written by the gate before this callback ran. Every other
+      // marker moved down to the point where that phase's writes land;
+      // see the emission notes there.
+      handle.checkpoint(WORKRUN_PHASE.clusterComplete);
+      handle.checkpoint(WORKRUN_PHASE.closeComplete);
+      const applied = applyDreamPlan({
+        vault,
+        cfg,
         now,
-        // The dream run id names the workrun as well as the archive, so a
-        // candidate free in `.snapshots/` is not enough. This is the claim
-        // that used to live in a second ladder in this module.
-        available: (candidate) => !existsSync(dreamWorkrunPath(vault, candidate)),
-      },
-    );
-    snapshotPathStr = gated.snapshot.path;
-    exec = gated.result.applied;
-    workrun = gated.result.handle;
+        plan,
+        refresh,
+        agentName: opts.agentName,
+        wikilinkToRun,
+        healEnrichEnabled,
+        ...(opts.safeguard ? { safeguard: opts.safeguard } : {}),
+        workrun: handle,
+      });
+      return { applied, handle };
+    };
+    if (vault === null) {
+      // No vault (design D14 item 9): the store's shards are append-only
+      // and need no pre-run snapshot, so the plan applies directly. The
+      // run id climbs the same `-N` ladder a snapshot run does, so two
+      // passes in one second never share a workrun journal.
+      runId = uniqueNoVaultRunId(runId);
+      if (rollupPlan.fired && runId !== baseRunId) {
+        rollupPlan = buildRollupPlan(vault, cfg, salienceGate.admitted, runId, linkCandidates);
+      }
+      const ran = applyRun();
+      exec = ran.applied;
+      workrun = ran.handle;
+    } else {
+      const gated = withDestructiveSnapshot(
+        vault,
+        BRAIN_SNAPSHOT_REASON.dream,
+        (snapshot) => {
+          runId = snapshot.runId;
+          // The rollup plan (and each envelope's target_path) was built
+          // with the pre-collision runId; if the ladder corrected it,
+          // rebuild the plan so every target_path embeds the final run_id.
+          if (rollupPlan.fired && runId !== baseRunId) {
+            rollupPlan = buildRollupPlan(vault, cfg, salienceGate.admitted, runId, linkCandidates);
+          }
+          return applyRun();
+        },
+        {
+          // `now` rather than wall clock: the pass is byte-reproducible given
+          // its injected clock, and the snapshot audit line must not be the
+          // one thing that breaks that.
+          now,
+          // The dream run id names the workrun as well as the archive, so a
+          // candidate free in `.snapshots/` is not enough. This is the claim
+          // that used to live in a second ladder in this module.
+          available: (candidate) => !existsSync(workrunPath(vault, candidate)),
+        },
+      );
+      snapshotPathStr = gated.snapshot.path;
+      exec = gated.result.applied;
+      workrun = gated.result.handle;
+    }
   }
 
   // Post-mutation safeguard checkpoint: every state-changing write for
@@ -526,8 +569,7 @@ function dreamRun(
     // this run creates no further archives - and the gate is where the
     // refusal and the removal list are reported, so a second prune here
     // would be a second rule for one directory.
-    regenerateActiveQuiet(vault, { now });
-    regenerateLessonsQuiet(vault, { now });
+    regenerateDigestPages(vault, now);
   }
 
   // Pre-finalize safeguard checkpoint (no-dead-ends, Unit E). Everything
@@ -555,7 +597,13 @@ function dreamRun(
     // is resolved only on the branch that actually wrote to it.
     runTail: dryRun
       ? { dry_run: true }
-      : { log_path: join(brainDirsForWrite(vault).log, `${isoDate(now)}.md`) },
+      : {
+          // A store-only machine writes `log-event` records, no day file.
+          log_path:
+            vault === null || isStoreOnly({ vault })
+              ? NO_VAULT_LOG_PATH
+              : join(brainDirsForWrite(vault).log, `${isoDate(now)}.md`),
+        },
     scan,
     plan,
     refresh,
@@ -580,157 +628,8 @@ function dreamRun(
   });
 }
 
-/**
- * Attach the retire-sibling projection (near-duplicate defense) to a
- * changed run's summary. Computed from the completed retire plan, then
- * reconciled against the retires the confirmed-evidence gate holds back:
- * the ones the apply step gated, or on a dry run the ones it would gate,
- * so the dry run and the real run agree. A retiring preference is never
- * refreshed first, so its scanned frontmatter is what the apply step
- * reads. The scan is the pass's own reach (a preview scan is already
- * admitted), hence {@link READ_ALL_REFS}. Off (`enabled`, else the
- * default config's key), or with nothing to report, the summary is
- * returned untouched.
- */
-function withRetireSiblings(
-  summary: DreamRunSummary,
-  scan: ScanResult,
-  plan: PlanState,
-  opts: {
-    readonly enabled: boolean | undefined;
-    readonly gatedRetires: ReadonlyArray<DreamGatedRetireEntry>;
-    readonly previewGateThreshold: number | undefined;
-  },
-): DreamRunSummary {
-  if (plan.retires.length === 0 || !(opts.enabled ?? resolveNearDuplicateRetireSiblingsEnabled())) {
-    return summary;
-  }
-  const gated = new Set(opts.gatedRetires.map((g) => g.pref_id));
-  if (opts.previewGateThreshold !== undefined) {
-    const byId = new Map(scan.preferences.map((p) => [p.pref.id, p.pref] as const));
-    for (const r of plan.retires) {
-      const existing = byId.get(`pref-${r.slug}`);
-      if (
-        existing !== undefined &&
-        shouldGateRetireFromConfirmed(existing, r.reason, opts.previewGateThreshold)
-      ) {
-        gated.add(existing.id);
-      }
-    }
-  }
-  const siblings = planRetireSiblings(
-    retireSiblingPool(scan.preferences.map((p) => p.pref)),
-    plan.retires.map((r) => ({ id: `pref-${r.slug}`, principle: r.principle, reason: r.reason })),
-    { readable: READ_ALL_REFS, gated },
-  );
-  if (siblings.length === 0) return summary;
-  return Object.freeze({ ...summary, retire_siblings: Object.freeze([...siblings]) });
-}
-
-/**
- * Non-fatal warnings raised during the run. The non-primary-dream-run
- * check is the first one: when the caller declares an agent name and it
- * differs from the vault's declared primary, surface a structured
- * warning. We do NOT abort — the declaration is observability, not
- * access control.
- */
-function collectWarnings(
-  isNonPrimary: boolean,
-  callerAgent: string,
-  primaryAgent: string | null,
-): DreamWarning[] {
-  if (!isNonPrimary) return [];
-  return [
-    {
-      code: "non-primary-dream-run",
-      message:
-        `dream run from agent '${callerAgent}', but primary is ` +
-        `'${primaryAgent}'. Convention violation, run proceeds.`,
-    },
-  ];
-}
-
-/**
- * Decide if anything is going to change. We treat any of the following
- * as a state change:
- *   - a new unconfirmed pref
- *   - a refreshed pref (counters/confidence/status changed)
- *   - a retire
- *   - a same-sign signal noted on an active pref (move + log)
- *   - an inbox signal archived because it left the contradiction window
- *   - a corrupted frontmatter (we want the skip event recorded)
- *   - any pinned-rebut-attempt warning
- *   - a fired rollup-ladder rung (S3)
- *   - a cross-topic rule promotion (t_642bc2b8)
- */
-function hasStateChange(
-  plan: PlanState,
-  refresh: RefreshResult,
-  corruptedCount: number,
-  rollupPlan: RollupLadderPlan,
-): boolean {
-  return (
-    plan.newUnconfirmed.length > 0 ||
-    refresh.confirmed.size > 0 ||
-    refresh.updated.size > 0 ||
-    plan.retires.length > 0 ||
-    plan.notedRedundant.length > 0 ||
-    plan.signalsToMove.size > 0 ||
-    plan.signalsToArchive.size > 0 ||
-    plan.retainPinned.length > 0 ||
-    plan.signalsSuppressed.length > 0 ||
-    // v0.10.16: quarantine is a recorded decision (deferred-but-noted),
-    // so a run that produces only quarantine entries is still a
-    // meaningful run from the operator's perspective.
-    plan.quarantined.length > 0 ||
-    plan.crossTopicRules.length > 0 ||
-    rollupPlan.fired ||
-    corruptedCount > 0
-  );
-}
-
-function buildRollupPlan(
-  vault: string,
-  cfg: BrainConfig,
-  factCount: number,
-  runId: string,
-  linkCandidates: () => LinkCandidateManifest,
-): RollupLadderPlan {
-  return planRollupLadder({
-    factCount,
-    ledger: readRollupLedger(vault),
-    thresholds: resolveRollupThresholds(cfg),
-    runId,
-    linkCandidates,
-  });
-}
-
-/**
- * The link-candidate manifest for this run, walked at most once and only
- * if something asks for it. Both callers of {@link buildRollupPlan} share
- * one of these, so a runId collision re-plans off the manifest already
- * built rather than walking the vault a second time.
- *
- * No query: the ladder is count-only by design and never learns which
- * items it is folding, so ranking the candidates would be inventing a
- * relevance nothing measured. The manifest says `alphabetical` and names
- * the total, which is the honest form of that.
- */
-function memoizedLinkCandidates(
-  vault: string,
-  agentName: string | undefined,
-  readable: ((rel: string) => boolean) | undefined,
-): () => LinkCandidateManifest {
-  let manifest: LinkCandidateManifest | null = null;
-  return () => {
-    if (manifest !== null) return manifest;
-    const ownerView = gatedOwnerScopeView(vault, agentName);
-    manifest = buildLinkCandidateManifest(vault, {
-      visible: (rel) => ownerView.visible(rel) && (readable?.(rel) ?? true),
-    });
-    return manifest;
-  };
-}
+/** What a no-vault run names as its log: the brain log is a store record stream. */
+const NO_VAULT_LOG_PATH = "store:log";
 
 function formatRunId(d: Date): string {
   // <reason>-YYYY-MM-DD-HHMMSS. The prefix is the snapshot-reason

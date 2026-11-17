@@ -1,0 +1,643 @@
+/**
+ * The page store of the Brain record lanes (design D14 item 2, task 2.10
+ * WP6): the one place the lane modules (dead-ends, handoffs, pledges,
+ * obligations, decisions, ...) read and write their pages, so each of them
+ * keeps its page format and follows the machine's switch with no code of
+ * its own.
+ *
+ *  - **Store-only machine** (`store-only.ts`): a page is a `lane-entry`
+ *    record (`lane-records.ts`), addressed by its legacy path
+ *    (`lane-paths.ts`): its frontmatter becomes the entry's fields, its
+ *    body the entry's text. A write appends a record through
+ *    {@link storeWrite}; a removal appends the entry's tombstone; a move
+ *    is the tombstone of the old entry and the new entry, written as one
+ *    operation in one partition. Reads fold the lane-entry records. No
+ *    byte is written under `<vault>/Brain/`, and no vault is needed.
+ *  - **Unswitched machine**: the page is the legacy file, written exactly
+ *    as before, with the phase 1 dual write behind the flag
+ *    ({@link routeWrite}). A removal or a move dual-writes too: the
+ *    stored entry's tombstone, and its entry at the new path
+ *    (`./lane-dual-moves.ts`), so a page removed before the switch is not
+ *    live again after it.
+ *
+ * Privacy (phase 1 rules): a page is private when its frontmatter
+ * reserves it, or when its fields or text name a private page or one that
+ * cannot be judged. Each call is one operation with one verdict, and every
+ * record it writes lands in one partition; an enclosing
+ * `withOperationPrivacy` raises it too.
+ *
+ * Authority follows the origin channel (`authorityFromOrigin`): a command
+ * the user ran is `human`, an agent tool call is `agent`. Standing rules
+ * are always `human` (D14 item 4).
+ */
+
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+
+import { BRAIN_ROOT_REL } from "../brain/path-constants.ts";
+import { acquireLockSyncWithRetry } from "../brain/sync-lockfile.ts";
+import { assertVaultIdentityForWrite } from "../brain/vault-identity.ts";
+import {
+  atomicCreateFileSyncExclusive,
+  atomicWriteFileSync,
+  FileAlreadyExistsError,
+  renameWithRetry,
+} from "../fs-atomic.ts";
+import { noVaultRoot } from "../platform-dirs.ts";
+import type { FrontmatterMap } from "../types.ts";
+import {
+  parseFrontmatter,
+  parseFrontmatterText,
+  writeFrontmatterAtomic,
+  type WriteFrontmatterAtomicOptions,
+} from "../vault.ts";
+import { assertStoreContentWrite } from "./content-write-gates.ts";
+import { type DualWriteContext } from "./dual-write.ts";
+import { laneLockTarget, laneStoreFold } from "./lane-fold-cache.ts";
+import {
+  brainRelOf,
+  entryRecord,
+  fieldsCopy,
+  heldInStore,
+  insideBrain,
+  isPrivateEntry,
+  laneTextParts,
+  legacyPagePrivate,
+  livesInPrivate,
+  lanePagesInStore,
+  replacedShared,
+  sameEntry,
+  storeEntries,
+  storeEntry,
+  storedEntryPrivate,
+  tombstoneOf,
+} from "./lane-entry-store.ts";
+import {
+  assertFoldersApart,
+  assertLaneDestination,
+  dualWriteLaneMove,
+  dualWriteLaneRemoval,
+  dualWriteLaneTreeMove,
+  laneMoveRecords,
+  sameLaneEntry,
+  type LaneMove,
+  laneRemovalRecords,
+  storedContent,
+  storedLanePathsBelow,
+} from "./lane-dual-moves.ts";
+import { rawParsesBack, rawToKeep, renderLaneText } from "./lane-raw.ts";
+import { brainRelOfEntry, lanePlaceOf } from "./lane-paths.ts";
+import { acquireDirLock, STORE_LOCK_STALE_MS, withLocalLock } from "./local-lock.ts";
+import { assertNoteVaultForWrite } from "../vault-adapter/index.ts";
+import { withOperationPrivacy } from "./operation-scope.ts";
+import { routeWrite, storeWrite } from "./store-write.ts";
+
+export { laneEntryClockMs, laneEntryInPrivate, lanePagesInStore } from "./lane-entry-store.ts";
+
+/**
+ * The vault root a lane module works under when no vault is configured.
+ * Nothing is ever written below it: with no vault the machine is
+ * store-only, so every lane page is a store record. It only gives the lane
+ * modules a stable root to build their paths from.
+ */
+export function laneVaultRoot(vault: string | null | undefined): string {
+  return vault ?? noVaultRoot();
+}
+
+/**
+ * The write guard of a lane write: the vault identity guard (freeze,
+ * migration gate, identity marker) on an unswitched machine. On a
+ * store-only one the store write checks the store identity in place of
+ * the vault marker (design D14 item 13), and the freeze still holds
+ * (`./content-write-gates.ts`); a migration gate left naming the vault is
+ * a leftover there and refuses nothing.
+ */
+export function assertLaneWrite(vault: string): void {
+  if (lanePagesInStore(vault)) assertStoreContentWrite(vault);
+  else assertVaultIdentityForWrite(vault);
+}
+
+/** `routeWrite` for a lane path; a path outside `Brain/` is written as a file. */
+function routeLaneWrite(vault: string, path: string, spec: Parameters<typeof routeWrite>[0]): void {
+  // A path outside `Brain/` is no lane entry in either mode: a file, never
+  // dual-written as a record (it has no place in the lane path rule).
+  if (!insideBrain(vault, path)) {
+    guardUserVaultWrite(vault, path);
+    spec.legacy();
+    return;
+  }
+  routeWrite(spec);
+}
+
+/**
+ * The guard of a lane module's write outside `Brain/` on a store-only
+ * machine. A path in the user's vault (a materialised `skills/` page, a
+ * runbook) goes through the vault adapter's write guard: the vault must be
+ * the one bound to this machine's store, and not frozen. With no vault
+ * (the no-vault root) there is no user vault to write into, and the
+ * adapter refuses by name. A path outside the vault (device-local machine
+ * state) has no vault to guard. An unswitched machine guards with
+ * `assertLaneWrite` as before.
+ */
+function guardUserVaultWrite(vault: string, path: string): void {
+  if (!lanePagesInStore(vault)) return;
+  const rel = relative(vault, path);
+  if (rel.startsWith("..") || isAbsolute(rel)) return;
+  assertNoteVaultForWrite(
+    vault === laneVaultRoot(null) ? null : vault,
+    "a lane write into the vault",
+  );
+}
+
+function context(vault: string): DualWriteContext {
+  return existsSync(vault) ? { vault } : {};
+}
+
+// ----- Reads --------------------------------------------------------------------
+
+/** One lane page as a lane module reads it. */
+export interface LanePage {
+  /** Absolute path of the page (a legacy path; no file on a store-only machine). */
+  readonly path: string;
+  readonly frontmatter: FrontmatterMap;
+  readonly body: string;
+}
+
+/**
+ * Whether the lane file at `path` exists, or, for a lane folder, whether
+ * any entry lives below it (what `existsSync` answers for a directory).
+ */
+export function lanePageExists(vault: string, path: string): boolean {
+  if (!heldInStore(vault, path)) return existsSync(path);
+  const rel = brainRelOf(vault, path);
+  if (rel === "" || rel.startsWith("..")) return false;
+  if (lanePlaceOf(rel) !== null && storeEntry(vault, path) !== null) return true;
+  const prefix = `${rel}/`;
+  for (const value of storeEntries().values()) {
+    if (brainRelOfEntry(value.lane, value.entry).startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+/** The page at `path`, or null when there is none. Throws on a legacy page that cannot be read. */
+export function readLanePage(vault: string, path: string): LanePage | null {
+  if (heldInStore(vault, path)) {
+    const value = storeEntry(vault, path);
+    return value === null ? null : { path, frontmatter: fieldsCopy(value), body: value.text };
+  }
+  if (!existsSync(path)) return null;
+  const [frontmatter, body] = parseFrontmatterText(readFileSync(path, "utf8"));
+  return { path, frontmatter, body };
+}
+
+/**
+ * `parseFrontmatter(path)` for a lane page: its frontmatter and body, read
+ * from the fold on a store-only machine. A page that is not there reads as
+ * an empty map and body, as the legacy parser answers an absent file.
+ */
+export function parseLanePage(vault: string, path: string): readonly [FrontmatterMap, string] {
+  if (!heldInStore(vault, path)) return parseFrontmatter(path);
+  const value = storeEntry(vault, path);
+  return value === null ? [{}, ""] : [fieldsCopy(value), value.text];
+}
+
+/**
+ * The write lock of the lane file at `path`, as `acquireLockSyncWithRetry`
+ * hands it: the legacy lockfile beside the page on an unswitched machine,
+ * a device-local lock on a store-only one (no lock file in the vault).
+ */
+export function acquireLaneLock(
+  vault: string,
+  path: string,
+  options: { readonly budgetMs?: number } = {},
+): { release(): void } {
+  if (!heldInStore(vault, path)) {
+    return options.budgetMs === undefined
+      ? acquireLockSyncWithRetry(path)
+      : acquireLockSyncWithRetry(path, options.budgetMs);
+  }
+  const target = laneLockTarget(path);
+  mkdirSync(dirname(target), { recursive: true });
+  const release = acquireDirLock(target, {
+    staleMs: STORE_LOCK_STALE_MS,
+    budgetMs: options.budgetMs ?? 10_000,
+    label: "lane page lock",
+    remedy: "retry once the other writer finishes",
+  });
+  return { release };
+}
+
+/**
+ * Run `fn` holding the write lock of the lane file at `path`: the legacy
+ * lockfile beside it on an unswitched machine (`sync-lockfile.ts`), a
+ * device-local lock keyed by the path on a store-only one, so no lock file
+ * lands in the vault.
+ */
+export function withLaneLock<T>(vault: string, path: string, fn: () => T): T {
+  if (!heldInStore(vault, path)) {
+    const handle = acquireLockSyncWithRetry(path);
+    try {
+      return fn();
+    } finally {
+      handle.release();
+    }
+  }
+  return withLocalLock(laneLockTarget(path), fn);
+}
+
+/**
+ * The raw text of a lane file, as `readFileSync(path, "utf8")` reads it:
+ * a missing file throws an `ENOENT` error, so a caller's own missing-file
+ * handling (a named refusal, a skipped row) keeps working in both modes.
+ */
+export function readLaneFile(vault: string, path: string): string {
+  if (!heldInStore(vault, path)) return readFileSync(path, "utf8");
+  const text = readLaneText(vault, path);
+  if (text !== null) return text;
+  const error = new Error(`ENOENT: no such lane file, open '${path}'`) as NodeJS.ErrnoException;
+  error.code = "ENOENT";
+  throw error;
+}
+
+/**
+ * The byte size of the lane file at `path`: the file's size on an
+ * unswitched machine (throwing for a missing path or one that is not a
+ * regular file, as a `statSync` walk would skip it), the UTF-8 length of
+ * the entry's text on a store-only one.
+ */
+export function laneFileBytes(vault: string, path: string): number {
+  if (!heldInStore(vault, path)) {
+    const stat = statSync(path);
+    if (!stat.isFile()) throw new Error(`not a regular file: ${path}`);
+    return stat.size;
+  }
+  return Buffer.byteLength(readLaneFile(vault, path), "utf8");
+}
+
+/** The raw text of a lane file (a page, or a JSON or text file), or null. */
+export function readLaneText(vault: string, path: string): string | null {
+  if (heldInStore(vault, path)) {
+    const value = storeEntry(vault, path);
+    if (value === null) return null;
+    if (value.raw !== undefined && rawParsesBack(path, value.raw, value.fields, value.text)) {
+      return value.raw;
+    }
+    return renderLaneText(path, value.fields, value.text);
+  }
+  return existsSync(path) ? readFileSync(path, "utf8") : null;
+}
+
+/**
+ * The names of the lane files directly in `dir` that end in `ext`, sorted:
+ * what `readdirSync(dir).filter(...)` gives on an unswitched machine.
+ */
+export function listLaneFiles(vault: string, dir: string, ext = ".md"): string[] {
+  if (!heldInStore(vault, dir)) {
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir)
+      .filter((name) => name.endsWith(ext))
+      .toSorted();
+  }
+  const names: string[] = [];
+  const prefix = brainRelOf(vault, dir);
+  for (const value of storeEntries().values()) {
+    const rel = brainRelOfEntry(value.lane, value.entry);
+    const slash = rel.lastIndexOf("/");
+    const parent = slash === -1 ? "" : rel.slice(0, slash);
+    if (parent !== prefix || !rel.endsWith(ext)) continue;
+    names.push(basename(rel));
+  }
+  return names.toSorted();
+}
+
+/**
+ * The vault (or lane root) an absolute `Brain/` path was built under: the
+ * part before its last `Brain` segment. For a reader handed only a page
+ * path (an entity record's `path`), so it can read the page in both modes.
+ */
+export function vaultOfBrainPath(path: string): string {
+  const parts = path.split(sep);
+  const at = parts.lastIndexOf(BRAIN_ROOT_REL);
+  return at <= 0 ? dirname(path) : parts.slice(0, at).join(sep) || sep;
+}
+
+/**
+ * Store-only machine: the absolute paths of every lane file below `dir`, at
+ * any depth, sorted (the store has no directories; a folder is a path
+ * prefix). An unswitched machine walks its own tree, so this answers `[]`
+ * there and the caller keeps its legacy walk.
+ */
+export function listLaneTree(vault: string, dir: string, ext = ".md"): string[] {
+  if (!heldInStore(vault, dir)) return [];
+  return storedLanePathsBelow(laneVaultRoot(vault), dir, ext);
+}
+
+/**
+ * A change stamp of the lane entries a store-only machine reads: it moves
+ * whenever a lane record lands, so a reader's memo (the entity index) keyed
+ * by it never serves a stale build. The stamp is the stored lane fold's
+ * fingerprint, which includes the availability of the blobs a fold skipped
+ * (`lane-fold-cache.ts`): a lane update whose body is a pending blob keeps
+ * the stamp until its blob arrives, and moves it then, so a memo warmed on
+ * the old page is not served after the update becomes readable. Empty on
+ * an unswitched machine.
+ */
+export function laneStoreStamp(vault: string): string {
+  if (!lanePagesInStore(vault)) return "";
+  return laneStoreFold().fingerprint;
+}
+
+// ----- Writes -------------------------------------------------------------------
+
+/**
+ * Write the page at `path` (frontmatter and body), with the options
+ * `writeFrontmatterAtomic` takes. `overwrite: false` refuses a page that
+ * exists with a `FileAlreadyExistsError`, so a slug allocation ladder
+ * (`allocateAndCreate`) works the same in both modes. Returns whether
+ * anything was written.
+ */
+export function writeLanePage(
+  vault: string,
+  path: string,
+  frontmatter: FrontmatterMap,
+  body: string,
+  opts: WriteFrontmatterAtomicOptions = {},
+): boolean {
+  let written = true;
+  // An overwrite with what the entry already holds writes nothing, as the
+  // legacy writer skips a byte-identical file: a page re-rendered on every
+  // run must not grow the shards or move the entry's clock.
+  if (opts.overwrite === true && heldInStore(vault, path)) {
+    if (sameEntry(storeEntry(vault, path), frontmatter, body)) return false;
+  }
+  const replaced = opts.overwrite === true && legacyPagePrivate(vault, path);
+  withCreateLock(vault, path, opts.overwrite !== true, opts.existsErrorKind, () =>
+    routeLaneWrite(vault, path, {
+      legacy: () => {
+        mkdirSync(dirname(path), { recursive: true });
+        written = writeFrontmatterAtomic(path, frontmatter, body, opts);
+      },
+      store: () => [
+        ...replacedShared(vault, path),
+        entryRecord(
+          vault,
+          path,
+          frontmatter,
+          body,
+          replaced || storedEntryPrivate(vault, path) || isPrivateEntry(vault, frontmatter, body),
+        ),
+      ],
+      context: context(vault),
+    }),
+  );
+  return written;
+}
+
+/**
+ * Write a lane file whole from its text: a page (`.md`, its frontmatter
+ * and body are split into the entry's fields and text), a JSON file (its
+ * object becomes the fields) or any other text. With `exclusive`, a file
+ * that exists is refused with a `FileAlreadyExistsError` in both modes.
+ */
+export function writeLaneText(
+  vault: string,
+  path: string,
+  text: string,
+  opts: { readonly exclusive?: boolean } = {},
+): void {
+  if (opts.exclusive !== true && heldInStore(vault, path)) {
+    const { fields, body } = laneTextParts(path, text);
+    const raw = rawToKeep(path, text, fields, body);
+    if (sameEntry(storeEntry(vault, path), fields, body, raw)) return;
+  }
+  const replaced = opts.exclusive !== true && legacyPagePrivate(vault, path);
+  withCreateLock(vault, path, opts.exclusive === true, undefined, () =>
+    routeLaneWrite(vault, path, {
+      legacy: () => {
+        mkdirSync(dirname(path), { recursive: true });
+        if (opts.exclusive === true) atomicCreateFileSyncExclusive(path, text);
+        else atomicWriteFileSync(path, text);
+      },
+      store: () => {
+        const { fields, body } = laneTextParts(path, text);
+        const raw = rawToKeep(path, text, fields, body);
+        return [
+          ...replacedShared(vault, path),
+          entryRecord(
+            vault,
+            path,
+            fields,
+            body,
+            replaced || storedEntryPrivate(vault, path) || isPrivateEntry(vault, fields, body, raw),
+            "judged",
+            raw,
+          ),
+        ];
+      },
+      context: context(vault),
+    }),
+  );
+}
+
+/**
+ * Run a create-once write of `path` under a device-local create lock on a
+ * store-only machine, so the existence check and the record append are one
+ * step: of two writers racing for one entry, one creates it and the other
+ * gets the `FileAlreadyExistsError` the unswitched path's exclusive create
+ * gives. An unswitched machine needs no lock (its create is a hardlink),
+ * and an overwrite takes none. The lock is keyed apart from the page lock,
+ * so a caller holding `withLaneLock` on the same page does not deadlock.
+ */
+function withCreateLock(
+  vault: string,
+  path: string,
+  createOnce: boolean,
+  existsKind: string | undefined,
+  fn: () => void,
+): void {
+  if (!createOnce || !heldInStore(vault, path)) {
+    fn();
+    return;
+  }
+  withLocalLock(laneLockTarget(path, "create\u0000"), () => {
+    // Checked outside the store write, so the refusal reaches the caller as
+    // the same `FileAlreadyExistsError` (EEXIST) the unswitched path throws.
+    if (storeEntry(vault, path) !== null) {
+      throw new FileAlreadyExistsError(path, {
+        ...(existsKind !== undefined ? { kind: existsKind } : {}),
+        displayPath: brainRelOf(vault, path),
+      });
+    }
+    fn();
+  });
+}
+
+/**
+ * Remove the page at `path`; a page that is not there is a no-op. Returns
+ * whether this call removed it (`false` when it was already gone, a lost
+ * race with another remover included).
+ */
+export function removeLanePage(vault: string, path: string): boolean {
+  if (heldInStore(vault, path)) {
+    const value = storeEntry(vault, path);
+    if (value === null) return false;
+    // In the partition the entry lives in, never re-judged from its
+    // content now: a shared entry's tombstone must reach every device.
+    const isPrivate = livesInPrivate(value);
+    withOperationPrivacy(isPrivate, () => storeWrite(() => tombstoneOf(value), context(vault)));
+    return true;
+  }
+  guardUserVaultWrite(vault, path);
+  let removed = true;
+  try {
+    rmSync(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    removed = false;
+  }
+  // The entry the dual write put in the store goes too (`./lane-dual-moves.ts`).
+  dualWriteLaneRemoval(vault, () => [path], context(vault));
+  return removed;
+}
+
+/**
+ * Move the page at `from` to `to` (an archive move), optionally rewritten
+ * to `rewrite`'s frontmatter and body on the way (a reject that retires a
+ * staged page). One operation: on a store-only machine the old entry's
+ * tombstone and the new entry are written together: the tombstone in the
+ * partition the entry lives in, the new entry there too, or in `private`
+ * when the rewritten page is private.
+ * On an unswitched machine a plain move is a rename; a rewrite writes the
+ * new page (refusing one that exists) and then removes the old one.
+ */
+export function moveLanePage(
+  vault: string,
+  from: string,
+  to: string,
+  rewrite?: { readonly frontmatter: FrontmatterMap; readonly body: string },
+): void {
+  assertLaneDestination(vault, from, to);
+  if (!heldInStore(vault, from)) {
+    if (rewrite !== undefined) {
+      writeLanePage(vault, to, rewrite.frontmatter, rewrite.body, {
+        overwrite: false,
+        vaultForRelativePath: vault,
+      });
+      removeLanePage(vault, from);
+      return;
+    }
+    guardUserVaultWrite(vault, from);
+    // Read before the rename replaces it, as a write over the page reads it.
+    const destinationPrivate = legacyPagePrivate(vault, to);
+    mkdirSync(dirname(to), { recursive: true });
+    renameWithRetry(from, to);
+    dualWriteLaneMove(vault, { from, to, destinationPrivate }, context(vault));
+    return;
+  }
+  const value = storeEntry(vault, from);
+  if (value === null) throw new Error(`no lane page to move: ${from}`);
+  // A move onto the entry it moves changes nothing.
+  if (rewrite === undefined && sameLaneEntry(vault, from, to)) return;
+  // The tombstone stays where the entry lives: it must reach every device
+  // that saw the entry. The new entry stays there too, unless a rewrite
+  // whose page is private raises it to `private`, as does an entry it
+  // replaces that is private (nothing lowers an entry's partition) and a
+  // fold that may miss a record (the entry may have been raised in it).
+  const isPrivate =
+    livesInPrivate(value) ||
+    storedEntryPrivate(vault, to) ||
+    (rewrite !== undefined && isPrivateEntry(vault, rewrite.frontmatter, rewrite.body));
+  withOperationPrivacy(isPrivate, () =>
+    storeWrite(
+      () => [
+        // A shared entry this move replaces with a private one goes first.
+        ...replacedShared(vault, to),
+        tombstoneOf(value),
+        entryRecord(
+          vault,
+          to,
+          rewrite?.frontmatter ?? value.fields,
+          rewrite?.body ?? value.text,
+          isPrivate,
+          "located",
+          rewrite === undefined ? value.raw : undefined,
+        ),
+      ],
+      context(vault),
+    ),
+  );
+}
+
+// ----- Folders of lane files (dream bundles) ------------------------------------
+
+/**
+ * The names of the folders directly below `dir` that hold lane files: the
+ * subdirectories on an unswitched machine, the first path segments of the
+ * entries below `dir` on a store-only one (the store has no directories).
+ */
+export function listLaneDirs(vault: string, dir: string): string[] {
+  if (!heldInStore(vault, dir)) {
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .toSorted();
+  }
+  const names = new Set<string>();
+  for (const path of listLaneTree(vault, dir, "")) {
+    const rest = relative(dir, path).split(sep);
+    if (rest.length > 1) names.add(rest[0]!);
+  }
+  return [...names].toSorted();
+}
+
+/**
+ * Move the folder `from` (every lane file below it) to `to`. A rename on an
+ * unswitched machine; on a store-only one each entry's tombstone and its
+ * new entry, all in one store write, each in the entry's own partition.
+ * Folders that overlap, one inside the other, are refused in both modes
+ * before anything moves; a folder moved onto itself changes nothing.
+ */
+export function moveLaneTree(vault: string, from: string, to: string): void {
+  const movedTo = (path: string): LaneMove => ({ from: path, to: join(to, relative(from, path)) });
+  // Judged from the paths alone, so a legacy move reads no store first.
+  assertLaneDestination(vault, from, to, [movedTo(join(from, "page.md"))]);
+  if (relative(from, to) === "") return;
+  assertFoldersApart(from, to);
+  if (!heldInStore(vault, from)) {
+    guardUserVaultWrite(vault, from);
+    mkdirSync(dirname(to), { recursive: true });
+    renameWithRetry(from, to);
+    dualWriteLaneTreeMove(vault, from, to, context(vault));
+    return;
+  }
+  const paths = listLaneTree(vault, from, "");
+  if (paths.length === 0) return;
+  assertLaneDestination(vault, from, to, paths.map(movedTo));
+  // One store write, every record built from one fold (`laneMoveRecords`),
+  // each entry placed by itself (design D14 item 18): a shared entry and
+  // its tombstone stay in `shared`, so a device that holds only `shared`
+  // sees it leave the folder, and a private entry's text never reaches
+  // `shared`. An enclosing private operation still raises the moved
+  // entries, never their tombstones.
+  storeWrite(() => {
+    const fold = laneStoreFold();
+    return paths.flatMap((path) => laneMoveRecords(vault, fold, movedTo(path), storedContent));
+  }, context(vault));
+}
+
+/** Remove the folder `dir` and every lane file below it; absent is a no-op. */
+export function removeLaneTree(vault: string, dir: string): void {
+  if (!heldInStore(vault, dir)) {
+    guardUserVaultWrite(vault, dir);
+    rmSync(dir, { recursive: true, force: true });
+    dualWriteLaneRemoval(vault, () => storedLanePathsBelow(vault, dir, ""), context(vault));
+    return;
+  }
+  // One store write, so a folder is never half removed; each tombstone in
+  // the partition its entry lives in, so a device that holds only `shared`
+  // sees the folder's shared entries go.
+  const paths = listLaneTree(vault, dir, "");
+  if (paths.length === 0) return;
+  storeWrite(() => laneRemovalRecords(vault, laneStoreFold(), paths), context(vault));
+}

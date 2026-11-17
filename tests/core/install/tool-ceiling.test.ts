@@ -32,7 +32,7 @@
  *     writes and reads the surface back off the probe.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,6 +64,10 @@ import { CONFIG_ORIGIN } from "../../../src/core/validate.ts";
 import { evaluateToolCapabilities } from "../../../src/mcp/capabilities.ts";
 import { resolveToolSurface } from "../../../src/mcp/profiles.ts";
 import { buildToolTable } from "../../../src/mcp/tools.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 let vault: string;
 let home: string;
@@ -347,8 +351,11 @@ describe("the capability report states the ceiling it runs under", () => {
     const evaluated = report("cursor");
     // 118 registered tools through v1.90.0; the dated-commitments wave
     // added brain_pledge and brain_intake_pledges (120); the delivery-trust
-    // wave added brain_attestations (121).
-    expect(evaluated.available_tool_count).toBe(121);
+    // wave added brain_attestations (121); the agent-presence wave added
+    // brain_skill_rewrite_status (122); the brain-store wave added
+    // brain_changes (123); the shared-settings change added brain_settings
+    // (124); topics added brain_topic (125).
+    expect(evaluated.available_tool_count).toBe(125);
     expect(evaluated.advertised_tool_count).toBe(7);
   });
 });

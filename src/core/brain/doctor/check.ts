@@ -59,6 +59,13 @@ export interface DoctorCheckContext {
    * here; it never leaves this absent.
    */
   readonly reach?: TransportReach;
+  /**
+   * The caller is below local reach: the broken-backlinks check ignores
+   * references made only by log events of the store's `private` partition,
+   * and the store check reports nothing about that partition. Absent reads
+   * as false (the operator's own shell).
+   */
+  readonly withholdsPrivate?: boolean;
   /** Every valid wikilink target inside `Brain/`, keyed by basename. */
   readonly knownBasenames: ReadonlySet<string>;
   /**
@@ -85,6 +92,25 @@ export interface DoctorCheckContext {
 export interface DoctorFindings {
   readonly issues: DoctorIssue[];
   readonly uncertain: DoctorUncertainEntry[];
+}
+
+/**
+ * The context a store-side check reads (design D14, task 2.10): the parts
+ * of {@link DoctorCheckContext} that do not come from a vault, with the
+ * vault itself `null` when none is configured. A store-side check runs in
+ * the vault pass and in the no-vault pass alike.
+ */
+export interface StoreSideCheckContext extends Pick<
+  DoctorCheckContext,
+  "now" | "dbPath" | "configPath" | "readable" | "reach" | "withholdsPrivate"
+> {
+  readonly vault: string | null;
+}
+
+/** A check over the brain store and this machine's state, not the vault's files. */
+export interface StoreSideDoctorCheck {
+  readonly failSoft: boolean;
+  run(ctx: StoreSideCheckContext, out: DoctorFindings): void;
 }
 
 export interface DoctorCheck {

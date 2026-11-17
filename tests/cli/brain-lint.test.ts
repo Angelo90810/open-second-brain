@@ -15,7 +15,7 @@
  *     compared, not merely its size or the fact that something moved.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
@@ -25,7 +25,11 @@ import { brainDirs } from "../../src/core/brain/paths.ts";
 import { atomicWriteFileSync } from "../../src/core/fs-atomic.ts";
 import { resetVaultIdentityPins } from "../../src/core/brain/vault-identity.ts";
 import { runCli } from "../helpers/run-cli.ts";
-import { changedPaths, digestVaultFiles, digestVaultTree } from "../helpers/vault-digest.ts";
+import { changedPaths, treeEntries, digestVaultTree } from "../helpers/vault-digest.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 let tmp: string;
 let vault: string;
@@ -123,7 +127,7 @@ describe("o2b brain lint --consolidate", () => {
     const reported = [...new Set(preview.fixes.map((f) => toRel(f.path)))].toSorted();
     expect(reported).toEqual(["Brain/log/2026-05-25.md", "Brain/log/2026-05-26.md"]);
 
-    const before = digestVaultFiles(vault);
+    const before = treeEntries(vault);
     const applied = await runCli(
       ["brain", "lint", "--consolidate", "--apply", "--yes", "--vault", vault, "--json"],
       { env: env() },
@@ -133,7 +137,7 @@ describe("o2b brain lint --consolidate", () => {
     expect(result.applied).toBe(true);
     expect(result.files_written).toBe(reported.length);
 
-    expect(changedPaths(before, digestVaultFiles(vault))).toEqual(reported);
+    expect(changedPaths(before, treeEntries(vault))).toEqual(reported);
   });
 
   test("a clean vault reports nothing and writes nothing", async () => {

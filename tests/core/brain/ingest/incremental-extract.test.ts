@@ -28,7 +28,11 @@ import { mkdirSync, mkdtempSync, rmSync, appendFileSync, writeFileSync, statSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, setDefaultTimeout, test } from "bun:test";
+import { CLI_SPAWN_BUDGET_MS } from "../../../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 // Positioned-read observer for the delta pass. The ONLY positioned readSync
 // reachable from ingestSource is the append-proof snapshot's byte walk; the
@@ -89,6 +93,9 @@ beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), "o2b-incremental-extract-"));
   vault = join(tmp, "vault");
   mkdirSync(join(vault, "imports"), { recursive: true });
+  // A legacy tree: these tests pin the watermark stamping of an unswitched
+  // machine (a vault with no `Brain/` is store-only, design D14 item 1).
+  mkdirSync(join(vault, "Brain"), { recursive: true });
 });
 
 afterEach(() => {

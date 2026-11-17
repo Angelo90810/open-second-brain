@@ -1,0 +1,6 @@
+schema: osb
+
+context: |
+  Read openspec/project.md first: it holds the conventions every change in
+  this repository follows (one change per pull request, archived inside
+  that pull request, test first, English only, the local gate).

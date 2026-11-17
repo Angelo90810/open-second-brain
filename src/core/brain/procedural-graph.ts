@@ -1,9 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import { atomicWriteFileSync } from "../fs-atomic.ts";
+
 import { ensureInsideVault } from "../path-safety.ts";
-import { parseFrontmatter } from "../vault.ts";
 import {
   proceduralGraphPath,
   proceduralMemoryIndexPath,
@@ -12,7 +12,16 @@ import {
   skillProposalRejectedPath,
 } from "./paths.ts";
 import type { ProceduralMemoryEntry } from "./types.ts";
-import { assertVaultIdentityForWrite } from "./vault-identity.ts";
+import {
+  assertLaneWrite,
+  readLaneFile,
+  lanePageExists,
+  listLaneFiles,
+  parseLanePage,
+  lanePagesInStore,
+  readLaneText,
+} from "../store/lane-pages.ts";
+import { BRAIN_PROCEDURAL_MEMORY_REL } from "./path-constants.ts";
 
 export type ProceduralGraphNodeKind = "procedure" | "skill" | "runbook" | "proposal" | "entity";
 export type ProceduralGraphEdgeKind =
@@ -52,7 +61,7 @@ export function rebuildProceduralGraph(
   opts: ProceduralGraphBuildOptions = {},
 ): ProceduralGraphProjection {
   // Vault-identity write guard (context-integrity-gates, Unit J).
-  assertVaultIdentityForWrite(vault);
+  assertLaneWrite(vault);
   const now = opts.now ?? new Date();
   const nodes: ProceduralGraphNode[] = [];
   const edges: ProceduralGraphEdge[] = [];
@@ -139,17 +148,87 @@ export function rebuildProceduralGraph(
     ),
   };
 
-  const path = proceduralGraphPath(vault);
-  mkdirSync(dirname(path), { recursive: true });
-  atomicWriteFileSync(path, `${JSON.stringify(projection, null, 2)}\n`);
+  writeMachineStateText(proceduralGraphPath(vault), `${JSON.stringify(projection, null, 2)}\n`);
   return projection;
 }
 
-export function readProceduralGraph(vault: string): ProceduralGraphProjection | null {
-  const path = proceduralGraphPath(vault);
-  if (!existsSync(path)) return null;
+/**
+ * Write a procedural projection or counter file. They are machine state
+ * (`paths.ts`), never store records: the graph and the hints are
+ * recomputed on each machine, and the counters tick on every use.
+ */
+export function writeMachineStateText(path: string, text: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  atomicWriteFileSync(path, text);
+}
+
+/** The text of a machine-state file, or null when there is none. */
+function readMachineStateText(path: string): string | null {
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as ProceduralGraphProjection;
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The text of the procedural projection or counter file at `path` (its
+ * machine-state location), or null when there is none.
+ *
+ * A machine switched before these files became machine state (task 3.10)
+ * holds them as `lane-entry` records of the store, the migration's import
+ * of the legacy files. Until this machine has its own copy, that record is
+ * read and adopted: copied into the machine-state location on the first
+ * read, so a switched machine answers from it before its next reconcile.
+ * The record itself stays in the store until the legacy tree leaves the
+ * vault (`store-migration/removal.ts` retires it then), so a rollback
+ * still finds the legacy file it was imported from.
+ *
+ * `guard` runs the adoption write: a file other writers update (the usage
+ * counters) passes the run of its write lock, and the copy is written only
+ * when the file is still absent inside it, so an adoption never lands over
+ * a tick another process wrote first. A caller that already holds the lock
+ * passes none.
+ */
+export function readProceduralState(
+  vault: string,
+  path: string,
+  guard: (write: () => void) => void = (write) => write(),
+): string | null {
+  const own = readMachineStateText(path);
+  if (own !== null) return own;
+  if (!lanePagesInStore(vault)) return null;
+  const stored = join(vault, BRAIN_PROCEDURAL_MEMORY_REL, basename(path));
+  if (stored === path) return null;
+  let text: string | null;
+  try {
+    text = readLaneText(vault, stored);
+  } catch {
+    return null;
+  }
+  if (text === null) return null;
+  let answer = text;
+  try {
+    guard(() => {
+      // Another process may have adopted (and ticked) it meanwhile.
+      const now = readMachineStateText(path);
+      if (now !== null) {
+        answer = now;
+        return;
+      }
+      writeMachineStateText(path, text);
+    });
+  } catch {
+    // Adopted on the next read instead; the answer stands.
+  }
+  return answer;
+}
+
+export function readProceduralGraph(vault: string): ProceduralGraphProjection | null {
+  const text = readProceduralState(vault, proceduralGraphPath(vault));
+  if (text === null) return null;
+  try {
+    const parsed = JSON.parse(text) as ProceduralGraphProjection;
     if (parsed.schema_version !== 1) return null;
     if (!Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) return null;
     return parsed;
@@ -160,9 +239,9 @@ export function readProceduralGraph(vault: string): ProceduralGraphProjection | 
 
 function readProceduralIndex(vault: string): ProceduralMemoryEntry[] {
   const path = proceduralMemoryIndexPath(vault);
-  if (!existsSync(path)) return [];
+  if (!lanePageExists(vault, path)) return [];
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+    const parsed = JSON.parse(readLaneFile(vault, path)) as {
       schema_version?: unknown;
       entries?: ProceduralMemoryEntry[];
     };
@@ -182,14 +261,14 @@ function detectProcedureSourceProposal(vault: string, sourcePath: string): strin
   } catch {
     return null;
   }
-  if (!existsSync(absPath)) return null;
+  if (!lanePageExists(vault, absPath)) return null;
   // Unit F: `parseFrontmatter` cannot throw (it reads inside its own try;
   // everything after is string work), so the `catch { return null }` that
   // stood here was unreachable - and redundant, since a failed read
   // yields an empty map and falls through to the same `return null`.
   // Dropped lines are reported centrally; see the "Why most readers keep
   // the two-tuple form" section in src/core/vault.ts.
-  const [fm] = parseFrontmatter(absPath);
+  const [fm] = parseLanePage(vault, absPath);
   if (typeof fm["source_proposal"] === "string" && fm["source_proposal"].trim()) {
     return fm["source_proposal"].trim();
   }
@@ -205,8 +284,8 @@ function listProposals(vault: string): ProceduralGraphNode[] {
   ] as const) {
     const [status, builder] = tuple;
     const dir = dirname(builder(vault, "sample"));
-    if (!existsSync(dir)) continue;
-    for (const name of readDirSorted(dir)) {
+    if (!lanePageExists(vault, dir)) continue;
+    for (const name of readDirSorted(vault, dir)) {
       if (!name.endsWith(".md")) continue;
       const absPath = join(dir, name);
       // Unit F: unreachable `catch { continue }` removed - nothing in this
@@ -216,7 +295,7 @@ function listProposals(vault: string): ProceduralGraphNode[] {
       // the next line, and is skipped exactly as the dead branch intended.
       // See the "Why most readers keep the two-tuple form" section in
       // src/core/vault.ts for where the condition IS reported.
-      const [fm] = parseFrontmatter(absPath);
+      const [fm] = parseLanePage(vault, absPath);
       if (fm["kind"] !== "brain-skill-proposal") continue;
       const id = typeof fm["id"] === "string" ? fm["id"] : `proposal-${basename(name, ".md")}`;
       out.push({
@@ -237,9 +316,9 @@ function listProposals(vault: string): ProceduralGraphNode[] {
   return out;
 }
 
-function readDirSorted(dir: string): string[] {
+function readDirSorted(vault: string, dir: string): string[] {
   try {
-    return readdirSync(dir).toSorted();
+    return listLaneFiles(vault, dir, "").toSorted();
   } catch {
     return [];
   }

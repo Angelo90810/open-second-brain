@@ -7,7 +7,7 @@
  * version, renames/removals bump it.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import {
   existsSync,
   mkdtempSync,
@@ -27,6 +27,14 @@ import {
   MetricSurfaceError,
   metricsDir,
 } from "../../../src/core/brain/metrics.ts";
+import { useUnshardedLegacyLog } from "../../helpers/device-id.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
+
+// The legacy day log and ledgers are read under their un-sharded names.
+useUnshardedLegacyLog();
 
 const NOW = "2026-06-05T10:00:00Z";
 
@@ -34,6 +42,8 @@ let vault: string;
 
 beforeEach(() => {
   vault = mkdtempSync(join(tmpdir(), "o2b-metrics-"));
+  // A legacy Brain/ tree: an unswitched machine (a vault without one is store-only).
+  mkdirSync(join(vault, "Brain"), { recursive: true });
 });
 
 afterEach(() => {

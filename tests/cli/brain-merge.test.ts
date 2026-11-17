@@ -8,13 +8,18 @@
  * failures.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { writePreference } from "../../src/core/brain/preference.ts";
+import { regenerateActive } from "../../src/core/brain/active.ts";
 import { runCli } from "../helpers/run-cli.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 let tmp: string;
 let vault: string;
@@ -145,6 +150,8 @@ describe("o2b brain merge — happy paths", () => {
     await bootstrap();
     makePref("keep");
     makePref("drop");
+    const digestPath = regenerateActive(vault).path;
+    expect(readFileSync(digestPath, "utf8")).toContain("## Confirmed (2)");
     const r = await runCli(
       ["brain", "merge", "pref-keep", "pref-drop", "--vault", vault, "--force"],
       { env: { OPEN_SECOND_BRAIN_CONFIG: config } },
@@ -153,6 +160,10 @@ describe("o2b brain merge — happy paths", () => {
     expect(r.stdout).toContain("merged:");
     expect(existsSync(join(vault, "Brain", "preferences", "pref-drop.md"))).toBe(false);
     expect(existsSync(join(vault, "Brain", "retired", "ret-drop.md"))).toBe(true);
+    const digest = readFileSync(digestPath, "utf8");
+    expect(digest).toContain("## Confirmed (1)");
+    expect(digest).toContain("pref-keep");
+    expect(digest).not.toContain("pref-drop");
   });
 
   test("non-TTY without --force exits 1 with the TTY guard message", async () => {

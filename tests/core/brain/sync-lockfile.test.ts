@@ -5,7 +5,7 @@
  * txn layer maps that to a `BrainCollisionError({ kind: 'SourceLock' })`.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import {
   existsSync,
   lstatSync,
@@ -37,6 +37,10 @@ import {
   scanStaleLocks,
   TAKEOVER_CLAIM_STALE_MS,
 } from "../../../src/core/brain/sync-lockfile.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 let tmpRoot: string;
 
@@ -309,11 +313,11 @@ describe("every module that takes a lock is under a scanned root", () => {
   /**
    * Declared lock sites, each with the vault-relative root
    * {@link lockScanRoots} reaches it through. Verified against the path
-   * builders: every entry resolves under `Brain/` except the four that
+   * builders: every entry resolves under `Brain/` except the five that
    * live in the derived-store directory - the shared checkpoint substrate
    * (both the ingest and the session-import lanes lock through it), the
-   * ingest content manifest, the session import ledger, and the session
-   * mining ledger.
+   * ingest content manifest, the session import ledger, the session
+   * mining ledger, and the lessons-approval ledger (t_1e952e43).
    */
   const DECLARED: ReadonlyMap<string, string> = new Map([
     ["core/brain/architect/generate.ts", "Brain"],
@@ -325,11 +329,15 @@ describe("every module that takes a lock is under a scanned root", () => {
     ["core/brain/health/remediation.ts", "Brain"],
     ["core/brain/idempotency-ledger.ts", "Brain"],
     ["core/brain/ingest/content-manifest.ts", ".open-second-brain"],
+    // the lessons-approvals ledger read-modify-write (t_1e952e43), the
+    // fifth derived-store lock site
+    ["core/brain/lessons-promotion.ts", ".open-second-brain"],
     ["core/brain/lineage/ledger.ts", "Brain"],
     ["core/brain/metrics.ts", "Brain"],
     ["core/brain/link-graph/hallways.ts", "Brain"],
     ["core/brain/link-graph/orphan-repair.ts", "Brain"],
     ["core/brain/payload-registry.ts", "Brain"],
+    ["core/brain/pinned.ts", "Brain"],
     ["core/brain/pledge-intake.ts", "Brain"],
     ["core/brain/pledges.ts", "Brain"],
     ["core/brain/preference-txn.ts", "Brain"],
@@ -339,6 +347,9 @@ describe("every module that takes a lock is under a scanned root", () => {
     ["core/brain/session-mining-surveys.ts", ".open-second-brain"],
     ["core/brain/sessions/discover.ts", ".open-second-brain"],
     ["core/brain/skill-proposals.ts", "Brain"],
+    // the lane page store locks a record-lane page on an unswitched
+    // machine (task 2.10 WP6); its pages live under Brain/
+    ["core/store/lane-pages.ts", "Brain"],
   ]);
 
   /** Every `src/` file that calls the lock primitive, vault-relative to `src/`. */

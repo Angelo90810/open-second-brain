@@ -1,8 +1,12 @@
-import { describe, expect, test, beforeAll, afterAll } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../helpers/run-cli.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 describe("o2b mcp --writer-only alias", () => {
   test("--writer-only without --scope sets scope=writer", async () => {
@@ -98,8 +102,15 @@ describe("o2b mcp --probe", () => {
     expect(res.stdout).toMatch(/[1-9]\d* tools/);
   });
 
-  test("--probe without vault exits non-zero with FAIL message", async () => {
+  test("--probe without a vault starts the server with no vault (design D14)", async () => {
     const res = await runCli(["mcp", "--probe"], { stdin: "" });
+    expect(res.returncode).toBe(0);
+    expect(res.stdout).toContain("mcp probe ok");
+    expect(res.stdout).toContain("vault=none");
+  });
+
+  test("--probe with an explicitly empty --vault is still a FAIL", async () => {
+    const res = await runCli(["mcp", "--probe", "--vault", ""], { stdin: "" });
     expect(res.returncode).toBeGreaterThan(0);
     expect(res.stdout).toContain("mcp probe FAIL");
   });

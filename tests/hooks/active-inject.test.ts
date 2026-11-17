@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -8,6 +8,10 @@ import { CHMOD_CANNOT_DENY, homeEnv } from "../helpers/platform.ts";
 import { waitForSelfHealChildren } from "../helpers/self-heal-children.ts";
 import { untrustedBindingFramingHeader } from "../../src/core/brain/untrusted-source.ts";
 import { SOURCE_ACTIVE_BODY, SOURCE_LESSONS_BODY } from "../../hooks/lib/active-context.ts";
+import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
+
+// Tests here spawn processes; see tests/helpers/cli-timeout.ts.
+setDefaultTimeout(CLI_SPAWN_BUDGET_MS);
 
 const HOOK = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -635,8 +639,9 @@ describe("active-inject hook: tiered injection budgeting", () => {
     expect(injected).toContain("brain_context");
     expect(injected).not.toContain("Injection truncated");
     // The framed whole - header included - stays within the configured
-    // budget: the framing is charged, never stacked on top. The header
-    // must actually be present, or the slice below reads as vacuous.
+    // budget plus the tier notice's new cut-count clause (task 4.4): the
+    // framing is charged, never stacked on top. The header must actually
+    // be present, or the slice below reads as vacuous.
     expect(injected.indexOf(untrustedBindingFramingHeader(SOURCE_ACTIVE_BODY))).toBeGreaterThan(-1);
     const memory = injected.slice(
       injected.indexOf(untrustedBindingFramingHeader(SOURCE_ACTIVE_BODY)),

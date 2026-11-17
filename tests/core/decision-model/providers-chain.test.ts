@@ -10,7 +10,7 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -37,6 +37,8 @@ afterEach(() => {
 });
 function tempVault(): string {
   const v = mkdtempSync(join(tmpdir(), "osb-dm-chain-"));
+  // A legacy Brain/ tree: an unswitched machine (a vault without one is store-only).
+  mkdirSync(join(v, "Brain"), { recursive: true });
   dirs.push(v);
   return v;
 }
@@ -228,6 +230,10 @@ describe("chain fallback in runDecision", () => {
       expect(cfg.status).toBe("active");
       const result = await runDecision("rerank", build, QUESTIONS, { config: cfg, env: CHAIN_ENV });
       expect(result.status).toBe("ok");
+      // The result names the entry that answered, not the first one.
+      if (result.status === "ok") {
+        expect(result.answeredBy).toEqual({ provider: "typesafe", model: "fake-model-1.0" });
+      }
       const records = listDecisionModelCalls(vault);
       expect(records).toHaveLength(2);
       expect(records[0]?.payload).toMatchObject({

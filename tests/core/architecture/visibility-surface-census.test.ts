@@ -226,7 +226,7 @@ const NOTE_CONTENT_PRODUCERS: ReadonlyArray<ProducerRule> = Object.freeze([
     identifiers: ["buildConceptCluster"],
   },
   { specifierIncludes: "/brain/portability/sources.ts", identifiers: ["aggregateSources"] },
-  { specifierIncludes: "/brain/query.ts", identifiers: ["queryByPreference", "queryByTopic"] },
+  { specifierIncludes: "/brain/query.ts", identifiers: ["queryByPreference", "queryByRuleTopic"] },
   { specifierIncludes: "/brain/pref-audit.ts", identifiers: ["readPrefAudit"] },
   {
     specifierIncludes: "/brain/link-graph/bridge-discovery.ts",
@@ -483,10 +483,26 @@ function discoverMcpToolPopulation(
   for (const file of files) {
     constantsByFile.set(file.path, stringConstantsIn(lexedViews(file).withoutComments));
   }
+  // A file qualifies when it imports a note-content primitive itself, or
+  // when it imports ANY identifier from a file that does. The second
+  // reading exists because the registration site and the handlers it
+  // registers are different files since the 700-line split (task 3.19):
+  // the registry holds the `name:` literals while the handler module it
+  // imports holds the primitive, so the file-level rule needs the one
+  // step across that import to keep finding the same surfaces. One step,
+  // not a transitive closure: the aggregator that spreads every registry
+  // (brain-tools.ts, tools.ts) must not qualify through it.
+  const direct = new Set<string>();
+  for (const file of files) {
+    if (importsNoteContentPrimitive(lexedViews(file).withoutComments)) direct.add(file.path);
+  }
   const found = new Set<string>();
   for (const file of files) {
     const text = lexedViews(file).withoutComments;
-    if (!importsNoteContentPrimitive(text)) continue;
+    const qualifies =
+      direct.has(file.path) ||
+      [...importSources(file, text).values()].some((source) => direct.has(source));
+    if (!qualifies) continue;
     for (const literal of toolNameLiteralsIn(text)) {
       if (realToolNames.has(literal)) found.add(literal);
     }
@@ -642,9 +658,12 @@ function reasonProblems(entries: ReadonlyArray<VisibilitySurfaceEntry>): {
  * docblock above). Classified excluded: attestation evidence carries no
  * page content at any reach.
  */
-const MCP_TOOL_POPULATION_SIZE = 88;
+/** 88 -> 89: `brain_skill_rewrite_status` (agent-presence, Lane A) joins as a
+ * read-only, excluded-class status surface - it names no note content.
+ */
+const MCP_TOOL_POPULATION_SIZE = 89;
 /** Measured: MCP resources + templates. */
-const MCP_RESOURCE_POPULATION_SIZE = 8;
+const MCP_RESOURCE_POPULATION_SIZE = 9;
 /**
  * Measured: hand-enumerated CLI verb mirrors. 20 -> 21: `brain attest`
  * (delivery trust) joins as the CLI mirror of `brain_attestations`; the
@@ -799,7 +818,8 @@ describe("visibility surface census", () => {
         "osb://log/{date}",
         "osb://preference/{id}",
         "osb://preferences/active",
-        "osb://topic/{slug}",
+        "osb://rule-topic/{slug}",
+        "osb://topic/{id}",
       ]);
       expect(byCategory(VISIBILITY_SURFACE_CATEGORY.excluded)).toEqual(["osb://status"]);
     });
@@ -1015,8 +1035,18 @@ function directVaultReadFiles(files: ReadonlyArray<CensusFile>): ReadonlySet<str
 const SURFACE_SOURCE_TREE = SURFACE_TREES.flatMap((root) => readTree(root));
 const DIRECT_VAULT_READERS = directVaultReadFiles(SURFACE_SOURCE_TREE);
 
-/** Measured: files in the surface trees that read a vault path directly. */
-const DIRECT_VAULT_READ_POPULATION_SIZE = 5;
+/**
+ * Measured: files in the surface trees that read a vault path directly.
+ * 5 -> 4: the bootstrap receipt (`src/cli/bootstrap/receipt.ts`) resolves
+ * through `machineStatePath`, so it is no longer read under the vault's
+ * `.open-second-brain/` (task 2.10, machine state device-local once
+ * switched).
+ * 4 -> 3: brain_clusters and brain_bridges list their pages through the
+ * lane page store (task 2.10 WP6), asking the store-aware reach rule.
+ * 3 -> 2: the clusters verb's staleness check lists its pages through the
+ * lane page store in both modes too.
+ */
+const DIRECT_VAULT_READ_POPULATION_SIZE = 2;
 
 /**
  * ## What this sweep cannot see, stated rather than implied
