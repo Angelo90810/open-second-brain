@@ -5,6 +5,7 @@
  * jobs and shell scripts that cannot reach the MCP surface.
  */
 
+import { recordOriginOf } from "../../../core/brain/record-origin.ts";
 import { defaultConfigPath } from "../../../core/config.ts";
 import { appendBrainNote } from "../../../core/brain/note.ts";
 import {
@@ -14,7 +15,7 @@ import {
   ok,
   okJson,
   parse,
-  resolveOptionalVault,
+  servedOptionalVault,
 } from "../helpers.ts";
 
 const USAGE_ERROR_EXIT = 2;
@@ -55,7 +56,7 @@ export async function cmdBrainNote(argv: string[]): Promise<number> {
   if (vaultFlag !== undefined && normalizeFlagString(vaultFlag) === null) {
     throw new CliError(NO_VAULT_ERROR);
   }
-  const vault = resolveOptionalVault(vaultFlag, config);
+  const vault = servedOptionalVault(vaultFlag, config);
   const explicitAgent = normalizeFlagString(flags["agent"]);
 
   let res;
@@ -65,6 +66,8 @@ export async function cmdBrainNote(argv: string[]): Promise<number> {
       text,
       ...(explicitAgent ? { agent: explicitAgent } : {}),
       configPath: config,
+      // The project of the directory the command runs in (`record-origin.ts`).
+      origin: recordOriginOf(process.cwd(), vault),
     });
   } catch (exc) {
     process.stderr.write(`error: ${(exc as Error).message ?? String(exc)}\n`);

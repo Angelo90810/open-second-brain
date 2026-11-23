@@ -51,7 +51,9 @@ export function heldInStore(vault: string, path: string): boolean {
 /** Whether `path` lies under `<vault>/Brain/` (or is it). */
 export function insideBrain(vault: string, path: string): boolean {
   const rel = relative(join(vault, BRAIN_ROOT_REL), path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  // A parent step is the component `..`, not any name that starts with it
+  // (`Brain/..rules.md` is a page inside `Brain/`).
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 export function brainRelOf(vault: string, path: string): string {
@@ -98,6 +100,30 @@ export function laneEntryClockMs(vault: string, path: string): number | null {
 export function storeEntry(vault: string, path: string): LaneEntryValue | null {
   const { lane, entry } = placeOf(vault, path);
   return storeEntries().get(laneEntryKey(lane, entry)) ?? null;
+}
+
+/**
+ * The live entry at `path` and whether the fold it came from is whole (no
+ * `events` shard unreadable or gone, no record whose body is a pending
+ * blob), from ONE read of the lane fold: a read-modify-write judges the
+ * entry and the completeness of its read together.
+ */
+export function storeEntryRead(
+  vault: string,
+  path: string,
+): {
+  readonly value: LaneEntryValue | null;
+  readonly whole: boolean;
+  readonly authority: Authority | null;
+} {
+  const fold = laneStoreFold();
+  const { lane, entry } = placeOf(vault, path);
+  const key = laneEntryKey(lane, entry);
+  return {
+    value: fold.entries.get(key) ?? null,
+    whole: fold.unreadable.length === 0 && fold.pendingBlobs.length === 0,
+    authority: fold.authorities.get(key) ?? null,
+  };
 }
 
 /**
@@ -229,6 +255,8 @@ export function entryRecord(
    */
   placement: "judged" | "located" = "judged",
   raw?: string,
+  /** The record's authority; the lane's own (`authorityFor`) when absent. */
+  authority?: Authority,
 ): DualWriteRecord {
   const { lane, entry } = placeOf(vault, path);
   const agent =
@@ -242,7 +270,7 @@ export function entryRecord(
     fields,
     text,
     ...(kept !== undefined ? { raw: kept } : {}),
-    authority: authorityFor(lane),
+    authority: authority ?? authorityFor(lane),
     ...(agent !== undefined ? { agent } : {}),
     private: isPrivate,
     // The lanes the migration imports as blobs are private wherever this

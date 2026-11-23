@@ -37,6 +37,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
@@ -389,12 +390,21 @@ describe("docs/brain-store.md", () => {
     legacy = makeLegacyVault("osb-doc-brain-store-vault-");
     // A clean legacy install: drop the fixture's entries no mapping covers.
     for (const rel of [
-      "Brain/log/2026-11-01.sync-conflict-20261101-120000-ABC.jsonl",
+      "Brain/log/stray.sync-conflict-20261101-120000-ABC.txt",
       "Brain/log/stray.txt",
       "Brain/procedures/index.bin",
     ]) {
       rmSync(join(legacy.vault, ...rel.split("/")), { recursive: true });
     }
+    // The desktop (dev-b) is a machine in use: it wrote a legacy log row
+    // today, so it is pending until it migrates whatever the date the suite
+    // runs on. dev-c last wrote in 2026-09 and never upgrades: once more
+    // than 30 days old it is retired by silence.
+    const now = new Date();
+    writeFileSync(
+      join(legacy.vault, "Brain", "log", `${now.toISOString().slice(0, 10)}.dev-b.jsonl`),
+      `${JSON.stringify({ ts: now.toISOString(), kind: "note", payload: { text: "in use" }, prev: null, h: "0".repeat(64) })}\n`,
+    );
     // The fixture's cohort is dev-a, dev-b and dev-c; dev-c never upgrades.
     const machines = [
       makeMachine(root, "laptop", "dev-a", PARTITIONS),

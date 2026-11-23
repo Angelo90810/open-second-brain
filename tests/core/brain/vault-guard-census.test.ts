@@ -58,10 +58,11 @@ const WRITE_CALL_RE = new RegExp(
  * (`assertNoteVaultForWrite` is the vault adapter's note-tool guard;
  * `assertLaneWrite` is the lane page store's, the assertion itself on an
  * unswitched machine and nothing on a store-only one, where no vault file
- * is written).
+ * is written; `assertLifecycleWrite` is the single-record lifecycle
+ * verbs' (`lifecycle/memory-target.ts`), the same split).
  */
 const GUARD_RE =
-  /assertVaultIdentityForWrite|brainDirsForWrite|assertNoteVaultForWrite|assertLaneWrite/;
+  /assertVaultIdentityForWrite|brainDirsForWrite|assertNoteVaultForWrite|assertLaneWrite|assertLifecycleWrite/;
 
 /**
  * Every write-capable module that deliberately carries no guard, with the
@@ -69,6 +70,10 @@ const GUARD_RE =
  * be wrong, never because asserting was inconvenient.
  */
 const UNGUARDED_WITH_REASON: Readonly<Record<string, string>> = Object.freeze({
+  "src/core/brain/dream-owner/owner.ts":
+    "writes no vault file. Its one direct write is the dream owner's claim-seen note " +
+    "in the store's device-local state directory, never synced and never in a vault; " +
+    "the role's records go through the store appender.",
   "src/core/brain/architect/manifests.ts":
     "never writes. It names `openSync` only to open a project manifest " +
     "read-only (O_RDONLY | O_NOFOLLOW | O_NONBLOCK) through one descriptor so " +
@@ -161,7 +166,62 @@ const UNGUARDED_WITH_REASON: Readonly<Record<string, string>> = Object.freeze({
   "src/core/brain/sync-lockfile.ts":
     "lock primitive over a caller-supplied path; the writers that acquire it " +
     "are guarded at their own entry points.",
+  "src/core/brain/tar-extract.ts":
+    "extracts a snapshot's tar stream only into the private temp directory " +
+    "its caller made outside the vault; the restore that copies it into " +
+    "`Brain/` is guarded.",
+  "src/core/brain/tar-writer.ts":
+    "writes only the snapshot's tar stream into a private temp directory " +
+    "outside the vault; `createSnapshot`, its one caller, is guarded.",
 });
+
+/**
+ * The migration gate is asked by the guard every module above skips, so an
+ * unguarded module that writes into the vault asks the gate itself
+ * (`assertNoMigrationInProgress`, or `migrationGateRefuses` for a reader
+ * that skips its write), or says why the gate does not concern it. The
+ * runtime census of writers is `tests/core/architecture/migration-gate-census*`.
+ */
+const ASKS_THE_GATE = "asks the migration gate itself";
+
+const MIGRATION_GATE_FOR_UNGUARDED: Readonly<Record<string, string>> = Object.freeze({
+  "src/core/brain/architect/manifests.ts": "never writes",
+  "src/core/brain/ingest/source-read.ts": "never writes",
+  "src/core/brain/ingest/tail-read.ts": "never writes",
+  "src/core/brain/intake/source-trust.ts": "never writes",
+  "src/core/brain/doctor/migration-check.ts": "never writes",
+  "src/core/brain/dedup-index-cache.ts": "writes only outside the vault (the user cache dir)",
+  "src/core/brain/dream-owner/owner.ts":
+    "writes only outside the vault (the store and its device-local state)",
+  "src/core/brain/init.ts": ASKS_THE_GATE,
+  "src/core/brain/gitignore-guard.ts":
+    "called by the bootstrap, after `bootstrapBrain` asked the gate for the vault",
+  "src/core/brain/inject-failopen.ts": ASKS_THE_GATE,
+  "src/core/brain/anticipatory-prune.ts":
+    "runs only right after its caller's guarded write, which asked the gate",
+  "src/core/brain/log-append-io.ts":
+    "its only caller resolved the log directory through `brainDirsForWrite`",
+  "src/core/brain/maintenance/lease.ts": ASKS_THE_GATE,
+  "src/core/brain/inline-rewrite.ts": "its only caller, `applyMarkerWritebacks`, is guarded",
+  "src/core/brain/portability/pointer.ts": "writes outside the vault it names",
+  "src/core/brain/portability/profiles.ts": "writes the machine config directory, no vault",
+  "src/core/brain/portability/recall-sources.ts": "writes the machine config directory, no vault",
+  "src/core/brain/pretool-host-backup.ts":
+    "writes beside the host settings file; its audit receipt goes through the shared appender",
+  "src/core/brain/provenance/content-class.ts":
+    "its one call site asserted the vault identity ahead of the write",
+  "src/core/brain/schema-mutate-store.ts": "store-only: writes nothing under the vault",
+  "src/core/brain/secrets/crypto.ts": "reached only through the guarded `secrets/store.ts`",
+  "src/core/brain/secrets/envelope.ts": "reached only through the guarded `secrets/store.ts`",
+  "src/core/brain/sync-lockfile.ts":
+    "lock primitive; the writers that take it are guarded, and the guard asks the gate",
+  "src/core/brain/tar-extract.ts":
+    "writes outside the vault only (the restore's temp extraction folder); its caller `snapshot.ts` is guarded, and the guard asks the gate",
+  "src/core/brain/tar-writer.ts":
+    "writes outside the vault only (the snapshot's temp tar stream); its caller `snapshot.ts` is guarded, and the guard asks the gate",
+});
+
+const GATE_RE = /assertNoMigrationInProgress|migrationGateRefuses/;
 
 interface CensusRow {
   readonly path: string;
@@ -207,6 +267,20 @@ describe("vault write-guard census", () => {
     for (const excluded of Object.keys(UNGUARDED_WITH_REASON)) {
       expect(paths.has(excluded)).toBe(true);
     }
+  });
+
+  test("every unguarded module asks the migration gate or says why it need not", () => {
+    expect(Object.keys(MIGRATION_GATE_FOR_UNGUARDED).toSorted()).toEqual(
+      Object.keys(UNGUARDED_WITH_REASON).toSorted(),
+    );
+    const claimed = Object.entries(MIGRATION_GATE_FOR_UNGUARDED).filter(
+      ([, answer]) => answer === ASKS_THE_GATE,
+    );
+    const notAsking = claimed
+      .filter(([path]) => !GATE_RE.test(readFileSync(join(REPO_ROOT, path), "utf8")))
+      .map(([path]) => path);
+    expect(notAsking).toEqual([]);
+    expect(claimed.length).toBeGreaterThan(0);
   });
 
   test("the census is not vacuous", () => {

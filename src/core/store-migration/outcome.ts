@@ -43,6 +43,7 @@ import { removeLegacyTree, type RemovalResult } from "./removal.ts";
 export { MigrationSwitchedError } from "./migrate.ts";
 import { rollbackMigration, type RollbackHooks, type RollbackResult } from "./rollback.ts";
 import { importLateLegacyWrites, type TransitionResult } from "./transition.ts";
+import { cohortStatus, legacyEvidenceInput, type DeviceEvidenceDate } from "./cohort-status.ts";
 
 /**
  * What the transition did with a vault configured after this machine
@@ -60,6 +61,20 @@ export interface TransitionSettings {
   readonly permissions_conflict: boolean;
   /** Whether the vault is the one bound to the store after this run. */
   readonly bound: boolean;
+  /**
+   * The cohort as `cohort-status.ts` judges it, the one judgement the
+   * doctor, the status block and the removal report: `legacy_devices`
+   * holds only the PENDING devices (the transition's own list minus the
+   * devices retired by silence), with their last evidence here, beside
+   * the devices that switched and those retired by silence.
+   */
+  readonly pending_evidence: ReadonlyArray<DeviceEvidenceDate>;
+  readonly switched: ReadonlyArray<string>;
+  /** Cohort devices retired by hand (a human `device-retire` record). */
+  readonly retired: ReadonlyArray<string>;
+  readonly retired_by_silence: ReadonlyArray<DeviceEvidenceDate>;
+  readonly silence_threshold_days: number;
+  readonly as_of: string | null;
   /**
    * Held store shards whose records this machine could not all see
    * (`<partition>/<rel>`): a record of the vault's items may be in one,
@@ -129,6 +144,7 @@ export function migrateStore(vault: string, options: MigrationOptions = {}): Mig
     const result = importLateLegacyWrites(vault, store, agent, vaultId, {
       recordWatermark: true,
       ...(options.hooks !== undefined ? { hooks: options.hooks } : {}),
+      ...(options.spillAt !== undefined ? { spillAt: options.spillAt } : {}),
     });
     // Everything of the vault is in the store only when the import settled
     // and held nothing back for a partition this machine lacks, as the
@@ -156,11 +172,25 @@ export function migrateStore(vault: string, options: MigrationOptions = {}): Mig
     // is left alone: this command does not open its gate, and only its
     // own command finishes it.
     if (!rollbackMayHoldGate()) clearRollbackRecord(migrationDir(store));
+    // The devices still on the legacy layout, judged as every other surface
+    // judges them: a device retired by silence is not pending.
+    const cohort = cohortStatus(store, {
+      legacy: result.legacy_devices,
+      ...legacyEvidenceInput(vault),
+      now: new Date(),
+    });
     return {
       mode: "transition",
       ok: complete && !permissionsConflict,
       device: store.device,
       ...result,
+      legacy_devices: cohort.pending.map((d) => d.device),
+      pending_evidence: cohort.pending,
+      switched: cohort.switched,
+      retired: cohort.retired,
+      retired_by_silence: cohort.retired_by_silence,
+      silence_threshold_days: cohort.threshold_days,
+      as_of: cohort.as_of,
       settings,
       device_config: deviceConfig,
       permissions_conflict: permissionsConflict,
@@ -188,11 +218,21 @@ function rollbackMayHoldGate(): boolean {
 /** `--remove-legacy [--force]`: move the legacy tree out of the vault when the cohort allows. */
 export function removeLegacy(
   vault: string,
-  options: { readonly configPath?: string; readonly agent?: string; readonly force?: boolean } = {},
+  options: {
+    readonly configPath?: string;
+    readonly agent?: string;
+    readonly force?: boolean;
+    /** This machine's wall clock (the silence rule's cap and the archive's date). */
+    readonly now?: Date;
+  } = {},
 ): RemovalResult {
   const store = openMigrationStore(vault, options.configPath);
   const agent = options.agent ?? safeAgent(options.configPath);
-  return removeLegacyTree(vault, store, { agent, ...(options.force ? { force: true } : {}) });
+  return removeLegacyTree(vault, store, {
+    agent,
+    ...(options.force ? { force: true } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
+  });
 }
 
 /** `--rollback`: take this machine back to the legacy layout. */
@@ -202,6 +242,8 @@ export function rollback(
     readonly configPath?: string;
     readonly agent?: string;
     readonly hooks?: RollbackHooks;
+    /** Entries a per-item map holds in memory before it moves to disk (`MigrationOptions.spillAt`). */
+    readonly spillAt?: number;
   } = {},
 ): RollbackResult {
   const store = openMigrationStore(vault, options.configPath);
@@ -209,5 +251,6 @@ export function rollback(
   return rollbackMigration(vault, store, {
     agent,
     ...(options.hooks ? { hooks: options.hooks } : {}),
+    ...(options.spillAt !== undefined ? { spillAt: options.spillAt } : {}),
   });
 }

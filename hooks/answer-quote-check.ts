@@ -30,12 +30,26 @@
  * Brain-log event per turn with the unverified spans, so findings survive
  * the session - and never blocks.
  *
- * Channel. The annotation rides `hookSpecificOutput.additionalContext`
- * on the Stop event, which Claude Code renders into the turn. Codex and
- * grok accept the registration but render no Stop annotation - and grok
- * ships no `transcript_path` at all - so the check is silently inert on
- * them: fail-open silence, kept deliberately, with the `enforce`
- * Brain-log trail as the one finding surface that survives the session.
+ * Channel. This hook is synchronous and does every read and every durable
+ * write itself (the `reply_presence` record and the `enforce` Brain-log
+ * event below). On Claude Code with the default
+ * `stop_advisory_delivery: "async"` it prints nothing: the annotation -
+ * worded as a finding about "the previous answer" - is handed over
+ * (hooks/lib/stop-advisory-handover.ts) to the async `stop-advisory-deliver`
+ * hook, whose `hookSpecificOutput.additionalContext` reaches the model with
+ * the next user message, unprinted and without a model turn of its own. A
+ * one-shot `claude -p` run kills that async hook at teardown and so loses
+ * the annotation, never a record. With `"sync"` the annotation rides a
+ * synchronous Stop `additionalContext`, which Claude Code prints as "Stop
+ * hook says: ..." and answers with one more turn. Codex and grok accept the
+ * registration but read no Stop annotation - and grok ships no
+ * `transcript_path` at all - so the check is silently inert on them:
+ * fail-open silence, kept deliberately, with the `enforce` Brain-log
+ * trail as the one finding surface that survives the session.
+ *
+ * Switch. `quote_check_enabled: "false"` (machine config, env
+ * `OPEN_SECOND_BRAIN_QUOTE_CHECK_ENABLED`) turns the whole hook off
+ * before any read: no annotation, no Brain-log event, no presence record.
  *
  * Reply presence (t_f8510c55). Wherever a transcript exists - annotation
  * rendering or not - every checked turn also appends exactly one
@@ -74,10 +88,8 @@ import {
 import { createHash } from "node:crypto";
 
 import {
-  resolveAnswerQuoteCheckActive,
-  resolveAnswerQuoteCheckRecall,
-  resolveAnswerQuoteCheckSubagent,
   resolveAgentName,
+  resolveQuoteCheckEnabled,
   resolveRecallInjectEnabled,
   type AnswerQuoteCheckMode,
   type AnswerQuoteCheckPhase,
@@ -92,7 +104,9 @@ import {
   type AnswerQuoteVerdict,
 } from "../src/core/brain/answer-quotes/check.ts";
 import { findQuoteSpans } from "../src/core/brain/distill/quote-spans.ts";
-import { brainConfigPath } from "../src/core/brain/paths.ts";
+import { resolveAnswerQuoteCheckModes } from "../src/core/brain/quote-check-modes.ts";
+import { compiledDigestPath } from "../src/core/brain/compiled-digest-path.ts";
+import { insideBrain, lanePagesInStore } from "../src/core/store/lane-entry-store.ts";
 import {
   neutralizeUntrustedText,
   untrustedFramingHeader,
@@ -103,16 +117,21 @@ import { isoSecond } from "../src/core/brain/time.ts";
 import { appendContinuityRecord } from "../src/core/brain/continuity/store.ts";
 import { CONTINUITY_SESSION_ID_KEY } from "../src/core/brain/continuity/types.ts";
 import { ensureInsideVault } from "../src/core/path-safety.ts";
-import { asHookPayload, readHookInput } from "./lib/stdin.ts";
+import { asHookPayload, type HookPayloadBase, readHookInput } from "./lib/stdin.ts";
+import { stopAdvisoryHandsOver, writeStopAdvisoryHandover } from "./lib/stop-advisory-handover.ts";
 import {
   isRealSessionId,
   LEDGER_KEY_REGROUND,
+  LEDGER_PATH_ACTIVE_DIGEST,
+  LEDGER_PATH_LESSONS_DIGEST,
+  readActiveDelivered,
   readActiveEmittedPaths,
   readRecallInjected,
   readSubagentDeliveredPaths,
 } from "./lib/injection-ledger.ts";
 import { readHookStamp } from "./lib/session-state.ts";
 import { resolveHookTarget } from "./lib/hook-vault.ts";
+import { fitHostContextFor } from "./lib/host-context-ceiling.ts";
 
 /**
  * The last assistant messages of the turn the check reads. Everything
@@ -401,12 +420,38 @@ function citationMarks(text: string): ReadonlyArray<CitationMark> {
  * escapes the vault. Exists-checking is the caller's concern.
  */
 function resolveNotePath(vault: string, relativePath: string): string | null {
+  // The two digests the session start emitted: on a vault switched to the
+  // store they are not vault files but the device-local cache the session
+  // start read (rendered there, not again here), so the ledger's
+  // `Brain/active.md` and `Brain/lessons.md` name that cache.
+  const digest = DIGEST_LEDGER_PATHS.get(relativePath);
+  if (digest !== undefined) {
+    try {
+      return compiledDigestPath(vault, digest);
+    } catch {
+      return null;
+    }
+  }
+  let absolute: string;
   try {
-    return ensureInsideVault(`${vault}/${relativePath}`, vault);
+    absolute = ensureInsideVault(`${vault}/${relativePath}`, vault);
   } catch {
     return null;
   }
+  // Any other `Brain/` page of a switched vault lives in the store, which
+  // the Stop hook does not fold (a preference bullet the session start
+  // delivered is judged against its delivered text, `evidenceFor`): a
+  // legacy file still on disk there is a stale copy, never evidence of
+  // what the context carried.
+  if (insideBrain(vault, absolute) && lanePagesInStore(vault)) return null;
+  return absolute;
 }
+
+/** The ledger paths of the two session-start digests, and which digest each is. */
+const DIGEST_LEDGER_PATHS: ReadonlyMap<string, "active" | "lessons"> = new Map([
+  [LEDGER_PATH_ACTIVE_DIGEST, "active"],
+  [LEDGER_PATH_LESSONS_DIGEST, "lessons"],
+]);
 
 /**
  * The evidence one cited note offers: the exact bytes the context had -
@@ -417,12 +462,31 @@ function resolveNotePath(vault: string, relativePath: string): string | null {
  * `unavailable` / `not-text` evidence rather than throwing. Exported for
  * the bounded-read pins; the ceiling is injectable so a test needs no
  * multi-megabyte fixture.
+ *
+ * A preference page the session start delivered as a digest bullet is
+ * judged against the text that bullet delivered (`delivered`, from the
+ * session's injection ledger): verified means verified against what the
+ * session received, complete, whatever the page reads now. Without that
+ * text a `Brain/` page of a vault switched to the store is `unavailable`:
+ * the store page now may not be the version the session saw, and the hook
+ * does not fold the store for it.
  */
 export function evidenceFor(
   vault: string,
   mark: CitationMark,
   maxBytes: number = ANSWER_QUOTE_NOTE_MAX_BYTES,
+  delivered: ReadonlyMap<
+    string,
+    { readonly text: string; readonly truncated: boolean }
+  > = new Map(),
 ): AnswerQuoteEvidence {
+  const sent = delivered.get(mark.path);
+  if (sent !== undefined) {
+    // A bullet is one line and names no line range of the page; a bullet
+    // the host ceiling cut mid-line is evidence of its delivered part only.
+    if (mark.startLine !== undefined || mark.endLine !== undefined) return { kind: "unavailable" };
+    return { kind: "text", text: sent.text, truncated: sent.truncated };
+  }
   const absolute = resolveNotePath(vault, mark.path);
   if (absolute === null || !existsSync(absolute)) {
     return { kind: "unavailable" };
@@ -452,6 +516,11 @@ export function evidenceFor(
   } catch {
     return { kind: "not-text" };
   }
+  return evidenceOfText(whole, limited, mark);
+}
+
+/** The evidence of a note's text `whole`, cut at the ceiling when `limited`. */
+function evidenceOfText(whole: string, limited: boolean, mark: CitationMark): AnswerQuoteEvidence {
   if (mark.startLine === undefined || mark.endLine === undefined) {
     return { kind: "text", text: whole, truncated: limited };
   }
@@ -705,9 +774,10 @@ interface SpanOutcome {
   /**
    * The verdicts the reply-presence fold records for this span, in check
    * order (t_f8510c55). A span that verified somewhere records ONLY the
-   * verifying candidate's outcome - the span belongs to the note that
-   * carries it, and a candidate that missed it before the walk reached
-   * the verifier did not measure the span in any sense worth reporting.
+   * verifying candidates' outcomes - the span belongs to every note that
+   * carries it, and a candidate that missed it did not measure the span
+   * in any sense worth reporting - plus, when the deadline cut the walk,
+   * the candidates the cut left unread, as `note-unavailable`.
    * A span that verified nowhere records every candidate's miss. A
    * candidate left unmeasured appears here for no span, which the fold
    * reads as `absent`; a candidate the budget cut reads
@@ -717,6 +787,13 @@ interface SpanOutcome {
   readonly candidateOutcomes: ReadonlyArray<SpanCandidateOutcome>;
 }
 
+/** The outcomes of the candidates a verified span verified against. */
+function verifyingOutcomes(
+  outcomes: ReadonlyArray<SpanCandidateOutcome>,
+): ReadonlyArray<SpanCandidateOutcome> {
+  return outcomes.filter((outcome) => outcome.verdict === ANSWER_QUOTE_VERDICT.verified);
+}
+
 /** One span's verdict under the resolved evidence, inside the budget. */
 function checkSpan(
   span: QuotedSpan,
@@ -724,6 +801,7 @@ function checkSpan(
   candidates: ReadonlyArray<MergedCandidate>,
   vault: string,
   deadline: number,
+  delivered: ReadonlyMap<string, { readonly text: string; readonly truncated: boolean }>,
 ): SpanOutcome {
   // The cited note: the nearest mark before the span, else the first one
   // after it. A mark inside the span is span content, never a citation.
@@ -733,7 +811,7 @@ function checkSpan(
     const mark = before.length > 0 ? before[before.length - 1]! : after[0]!;
     const { outcomes } = checkAnswerQuotes({
       spans: [span.inner],
-      evidence: evidenceFor(vault, mark),
+      evidence: evidenceFor(vault, mark, ANSWER_QUOTE_NOTE_MAX_BYTES, delivered),
     });
     // The span was MEASURED against the cited note's evidence, so every
     // ledger candidate naming the cited note records the outcome -
@@ -778,6 +856,30 @@ function checkSpan(
   let preview = previewAnswerQuoteSpan(span.inner);
   for (const [index, candidate] of candidates.entries()) {
     if (Date.now() > deadline) {
+      // A span that already verified keeps its verdict: the notes it
+      // verified against are recorded, the unread ones stay unmeasured
+      // by it, as they were before the walk went past its first verifier.
+      if (verdicts.includes(ANSWER_QUOTE_VERDICT.verified)) {
+        // The candidates the cut left unread were NOT measured at all:
+        // the walk stopped before their turn. They are recorded here, as
+        // `note-unavailable`, so the fold cannot read them as `absent` -
+        // the verdict that claims the reply had every chance to touch
+        // them. A candidate another span measured keeps that span's
+        // verdict: the fold merges the outcomes, and a verified or a
+        // degraded measurement outranks this one.
+        return {
+          verdict: ANSWER_QUOTE_VERDICT.verified,
+          preview,
+          decidingPhases,
+          candidateOutcomes: [
+            ...verifyingOutcomes(candidateOutcomes),
+            ...candidates.slice(index).map((unread) => ({
+              candidate: unread,
+              verdict: ANSWER_QUOTE_VERDICT.noteUnavailable,
+            })),
+          ],
+        };
+      }
       // Budget spent with unread candidates left: the check did not
       // finish, so it never reports a readable-miss verdict. Every
       // unread candidate is recorded as `note-unavailable` for this
@@ -801,7 +903,7 @@ function checkSpan(
       ...(candidate.startLine !== undefined ? { startLine: candidate.startLine } : {}),
       ...(candidate.endLine !== undefined ? { endLine: candidate.endLine } : {}),
     };
-    let evidence = evidenceFor(vault, mark);
+    let evidence = evidenceFor(vault, mark, ANSWER_QUOTE_NOTE_MAX_BYTES, delivered);
     // The injection delivered only a prefix of this note: evidence is the
     // delivered prefix, whatever the file holds today. A miss under
     // clipped evidence is `source-truncated`, never a readable miss - a
@@ -819,20 +921,22 @@ function checkSpan(
     verdicts.push(verdict);
     candidateOutcomes.push({ candidate, verdict });
     for (const phase of candidate.phases) decidingPhases.push(phase);
-    if (verdict === ANSWER_QUOTE_VERDICT.verified) break;
+    // The walk does not stop at the first note that carries the span: one
+    // text can sit in several delivered notes - a preference bullet is in
+    // the active digest (`Brain/active.md`, which sorts first) and is the
+    // whole evidence of its own page - and every one of them carries it.
   }
   const merged = mergeAnswerQuoteVerdicts(verdicts);
-  // A span that verified somewhere belongs to the note it verified
-  // against: only that candidate's outcome is recorded. The misses the
-  // walk accumulated before reaching the verifier were measurements of
-  // the span against evidence that could not carry it - recording them
-  // would make an unrelated note's verdict depend on whether its path
-  // sorts before or after the verifying one. Per-candidate misses stay
-  // only for spans that verified nowhere, where every miss is the
+  // A span that verified somewhere belongs to the notes it verified
+  // against: only those candidates' outcomes are recorded. The misses
+  // the walk measured against notes that could not carry it are dropped
+  // - recording them would make an unrelated note's verdict depend on
+  // which other note happens to carry the span. Per-candidate misses
+  // stay only for spans that verified nowhere, where every miss is the
   // span's own history.
   const recordedOutcomes =
     merged === ANSWER_QUOTE_VERDICT.verified
-      ? candidateOutcomes.filter((outcome) => outcome.verdict === ANSWER_QUOTE_VERDICT.verified)
+      ? verifyingOutcomes(candidateOutcomes)
       : candidateOutcomes;
   return {
     verdict: merged,
@@ -856,8 +960,8 @@ function checkSpan(
  * measured while the budget was exhausted - the transcript went unread
  * past the cut, which is not evidence the note went untouched, so the
  * fold refuses to spend `absent` on it. A span that verified somewhere
- * measured only the note that carries it ({@link checkSpan} records the
- * verifying candidate alone), so a note's verdict is a fact about the
+ * measured only the notes that carry it ({@link checkSpan} records the
+ * verifying candidates alone), so a note's verdict is a fact about the
  * reply, never about where its path sorts. Rows carry identifiers and
  * verdicts only; no answer text rides the record.
  */
@@ -959,16 +1063,20 @@ function listedFindings(
  * to the reader as data: the frame is the last trusted line the
  * annotation emits, and the spans beneath it are answer text.
  */
-function annotation(findings: ReadonlyArray<AnswerQuoteSpanFinding>): string {
+function annotation(findings: ReadonlyArray<AnswerQuoteSpanFinding>, deferred: boolean): string {
   const listed = listedFindings(findings);
   const lines = [
-    `Open Second Brain quote check: ${findings.length} quoted span(s) were not found in the notes this turn had:`,
+    deferred
+      ? `Open Second Brain quote check: ${findings.length} quoted span(s) in the previous answer were not found in the notes that turn had:`
+      : `Open Second Brain quote check: ${findings.length} quoted span(s) were not found in the notes this turn had:`,
   ];
   if (listed.length < findings.length) {
     lines.push(`... and ${findings.length - listed.length} more unverified span(s) not listed.`);
   }
   lines.push(
-    "Advisory only; the answer is not blocked. Verify the quotes against the note, or reword.",
+    deferred
+      ? "Advisory only; the answer was not blocked. Verify those quotes against the note, and correct any that do not hold."
+      : "Advisory only; the answer is not blocked. Verify the quotes against the note, or reword.",
     untrustedFramingHeader(QUOTE_CHECK_FRAMING_ORIGIN),
   );
   for (const finding of listed) lines.push(findingLine(finding.span, finding.verdict));
@@ -988,30 +1096,60 @@ async function main(): Promise<void> {
   // Once per turn: the runtime already continued this turn on a Stop
   // hook's output, so re-annotating would loop.
   if (payload.stop_hook_active === true) return;
+  if (!resolveQuoteCheckEnabled()) return;
+  // Claude Code with the default async delivery: every read and every
+  // durable write happens here, in the synchronous hook, and only the text
+  // goes to the async `stop-advisory-deliver` hook - which a `claude -p`
+  // teardown may kill without losing a record.
+  const handsOver = stopAdvisoryHandsOver(payload);
+  let text: string | null = null;
+  try {
+    text = checkTurn(payload, handsOver);
+  } finally {
+    // Past the switch the deliver hook waits for this producer, so the
+    // hand-over is written on every path, "nothing" and a crash included.
+    if (handsOver) writeStopAdvisoryHandover(payload, "answer-quote-check", text);
+  }
+  if (handsOver || text === null) return;
+  process.stdout.write(
+    `${JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "Stop",
+        additionalContext: fitHostContextFor(payload, text),
+      },
+    })}\n`,
+  );
+}
+
+/**
+ * The check itself: the reads, the `reply_presence` record and the
+ * `enforce` Brain-log event. Returns the annotation, worded for the next
+ * turn when `deferred`, or null when there is nothing to report.
+ */
+function checkTurn(payload: HookPayloadBase, deferred: boolean): string | null {
   const transcriptPath = payload.transcript_path;
-  if (typeof transcriptPath !== "string" || transcriptPath.length === 0) return;
+  if (typeof transcriptPath !== "string" || transcriptPath.length === 0) return null;
   // A transcript the host has not created yet is a fresh session, not an
   // error: silence, like every other empty-handed arm.
-  if (!existsSync(transcriptPath)) return;
+  if (!existsSync(transcriptPath)) return null;
   // With no vault the hook does its store-side part (design D14, task 2.10).
   const target = resolveHookTarget();
-  if (target === null) return;
+  if (target === null) return null;
   const vault = target.vault;
   const sessionId = isRealSessionId(payload.session_id) ? payload.session_id : null;
   const started = Date.now();
   const deadline = started + ANSWER_QUOTE_BUDGET_MS;
   const now = started;
 
-  const configPath = brainConfigPath(vault);
-  const modes: Readonly<Record<AnswerQuoteCheckPhase, AnswerQuoteCheckMode>> = {
-    recall: resolveAnswerQuoteCheckRecall(configPath),
-    active: resolveAnswerQuoteCheckActive(configPath),
-    subagent: resolveAnswerQuoteCheckSubagent(configPath),
-  };
+  // `Brain/_brain.yaml` on a vault that has not switched to the store,
+  // the shared settings records on one that has (its `Brain/` tree may be
+  // gone after `--remove-legacy`).
+  const modes: Readonly<Record<AnswerQuoteCheckPhase, AnswerQuoteCheckMode>> =
+    resolveAnswerQuoteCheckModes(vault);
   // Every phase `off` reports nothing and enforces nothing, so the run
   // pays no ledger read at all: the injection ledgers - whose member
   // strings are prose that gets path-scanned - stay unopened.
-  if (ANSWER_QUOTE_CHECK_PHASES.every((phase) => modes[phase] === "off")) return;
+  if (ANSWER_QUOTE_CHECK_PHASES.every((phase) => modes[phase] === "off")) return null;
   const ledgerNotes: Readonly<Record<AnswerQuoteCheckPhase, ReturnType<typeof ledgerCandidates>>> =
     {
       recall: ledgerCandidates(vault, sessionId, "recall", now),
@@ -1033,10 +1171,17 @@ async function main(): Promise<void> {
   const running = ANSWER_QUOTE_CHECK_PHASES.filter(
     (phase) => gates[phase] && modes[phase] !== "off",
   );
-  if (running.length === 0) return;
+  if (running.length === 0) return null;
   const candidates = mergeCandidateViews(
     ANSWER_QUOTE_CHECK_PHASES.filter((phase) => gates[phase]).map((phase) => ledgerNotes[phase]),
   );
+
+  // What each preference bullet of the session start delivered: the text a
+  // quote of that page is verified against.
+  const delivered =
+    sessionId === null
+      ? new Map<string, { readonly text: string; readonly truncated: boolean }>()
+      : readActiveDelivered(vault, sessionId, now);
 
   const messages = lastAssistantMessages(transcriptPath);
   const findings: Array<AnswerQuoteSpanFinding> = [];
@@ -1070,7 +1215,7 @@ async function main(): Promise<void> {
         open: span.open,
         close: span.close,
       };
-      const outcome = checkSpan(quoted, marks, candidates, vault, deadline);
+      const outcome = checkSpan(quoted, marks, candidates, vault, deadline, delivered);
       presenceOutcomes.push(...outcome.candidateOutcomes);
       if (outcome.verdict !== ANSWER_QUOTE_VERDICT.verified) {
         // Attribution: the phases whose candidates decided this miss. A
@@ -1130,7 +1275,7 @@ async function main(): Promise<void> {
   }
 
   const unique = dedupeFindings(findings);
-  if (unique.length === 0) return;
+  if (unique.length === 0) return null;
 
   if (enforceable > 0) {
     // Exactly one Brain-log event per turn, best-effort: a failed append
@@ -1161,11 +1306,7 @@ async function main(): Promise<void> {
     }
   }
 
-  process.stdout.write(
-    `${JSON.stringify({
-      hookSpecificOutput: { hookEventName: "Stop", additionalContext: annotation(unique) },
-    })}\n`,
-  );
+  return annotation(unique, deferred);
 }
 
 // Run only as the hook process itself (the `o2b-hook` shim execs this

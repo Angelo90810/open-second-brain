@@ -13,6 +13,9 @@ on:
 permissions:
   contents: read
 
+env:
+  NPM_VERSION: 11.14.1
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -46,6 +49,8 @@ jobs:
   validate:
     name: validate
     runs-on: ubuntu-26.04
+    env:
+      O2B_REQUIRE_REGISTRY_INSTALL: "1"
     # The full suite outgrew twenty minutes on a slow runner, then thirty
     # once the pledges wave added its thousand; the bound is there so a hung
     # run cannot hold a runner for GitHub's six-hour default.
@@ -60,6 +65,12 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.4
+
+      - name: Pin npm for package manifests
+        run: |
+          npm_prefix="$RUNNER_TEMP/npm-global"
+          npm install --global --prefix "$npm_prefix" "npm@$NPM_VERSION"
+          echo "$npm_prefix/bin" >> "$GITHUB_PATH"
 
       - name: Set up Python (Hermes plugin tests)
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -97,6 +108,9 @@ jobs:
       - parallel:
           - name: Verify manifest version sync
             run: bun run sync-version:check
+
+          - name: Verify packed package manifest
+            run: bun run pack:check
 
           # Codex caches only `plugins/codex/` and drops symlinks, so the Codex
           # plugin carries real copies of `skills/` and `hooks/hooks.json`.
@@ -246,6 +260,38 @@ jobs:
   # that: on Windows the hook and CLI tests that spawn `bun` slow down far more
   # than the rest, so with them three shards came out at 5, 10 and 16 minutes.
   # The shards balance by `.github/windows-test-timings.json` instead, measured
+  package-macos:
+    name: package (macOS)
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      O2B_REQUIRE_REGISTRY_INSTALL: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      - name: Pin npm for package manifests
+        run: |
+          npm_prefix="$RUNNER_TEMP/npm-global"
+          npm install --global --prefix "$npm_prefix" "npm@$NPM_VERSION"
+          echo "$npm_prefix/bin" >> "$GITHUB_PATH"
+
+      - name: Install JS dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify packed package manifest
+        run: bun run pack:check
+
+      - name: Test package installed from tarball
+        run: bun test tests/scripts/registry-install.test.ts --timeout 30000
+
   # on Windows, and each uploads what it measured as `windows-timings-<shard>`;
   # `.github/scripts/windows-timings.sh` folds a run's uploads back into the
   # committed file. A test file the file does not list yet still runs, it just
@@ -258,6 +304,8 @@ jobs:
   windows-tests:
     name: windows (${{ matrix.shard }}/10)
     needs: changes
+    env:
+      O2B_REQUIRE_REGISTRY_INSTALL: "1"
     # Runs unless the filter positively said "prose only": a failed or
     # empty filter falls back to running the shards, never to skipping them.
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
@@ -296,6 +344,13 @@ jobs:
         with:
           bun-version: 1.4.4
 
+      - name: Pin npm for package manifests
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP 'npm-global'
+          npm install --global --prefix "$prefix" "npm@$env:NPM_VERSION"
+          $prefix | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
       - name: Set up Python (Hermes plugin tests)
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -305,11 +360,14 @@ jobs:
         run: bun install --frozen-lockfile
 
       # A copy, so `--update-timings` can write this shard's measurements
-      # without touching the checkout.
+      # without touching the checkout. The file system of C: and D: goes to
+      # the log: what a volume reports as a file id and how fast its clock
+      # moves decide what the store's readers can see of a rewrite.
       - name: Stage the Windows test timings
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/timings"
+          pwsh -NoProfile -Command "Get-Volume -DriveLetter C,D | Format-Table DriveLetter,FileSystemType,FileSystemLabel,DriveType -AutoSize | Out-String -Width 200" || true
+          mkdir -p "$RUNNER_TEMP/timings" "$RUNNER_TEMP/tmp" "$RUNNER_TEMP/bun-transpiler-cache"
           cp .github/windows-test-timings.json "$RUNNER_TEMP/timings/windows-timings.json"
 
       - name: Publish o2b on PATH (the anti-drift test needs the live server)
@@ -348,7 +406,11 @@ jobs:
 
       # Samples CPU, disk queue, free memory and the bun.exe count every 10 s
       # while the suite runs, so a slow day on a slow runner shows up as data
-      # in the job's artifact instead of a guess.
+      # in the job's artifact instead of a guess. The queue and the latency
+      # of each volume (C: is the system disk, D: holds the workspace and
+      # the runner's temp folder) say which one stalled: every child that
+      # hung did so while the total queue stayed at two or more with the
+      # processor idle.
       - name: Record runner load
         id: telemetry
         background: true
@@ -358,14 +420,23 @@ jobs:
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'telemetry\runner-load.csv'
           New-Item -ItemType Directory -Force (Split-Path $out) | Out-Null
-          'time,cpu_pct,disk_queue,free_mb,bun_procs' | Set-Content $out
+          'time,cpu_pct,disk_queue,free_mb,bun_procs,c_queue,d_queue,c_ms_per_io,d_ms_per_io' |
+            Set-Content $out
           $counters = '\Processor(_Total)\% Processor Time',
                       '\PhysicalDisk(_Total)\Current Disk Queue Length',
-                      '\Memory\Available MBytes'
+                      '\Memory\Available MBytes',
+                      '\LogicalDisk(C:)\Current Disk Queue Length',
+                      '\LogicalDisk(D:)\Current Disk Queue Length',
+                      '\LogicalDisk(C:)\Avg. Disk sec/Transfer',
+                      '\LogicalDisk(D:)\Avg. Disk sec/Transfer'
           while ($true) {
             $v = (Get-Counter $counters -ErrorAction SilentlyContinue).CounterSamples.CookedValue
             $n = @(Get-Process bun -ErrorAction SilentlyContinue).Count
-            '{0:HH:mm:ss},{1:N0},{2:N1},{3:N0},{4}' -f (Get-Date), $v[0], $v[1], $v[2], $n |
+            # Invariant culture, so no number carries a thousands separator
+            # that reads as one more column.
+            [string]::Format([cultureinfo]::InvariantCulture,
+              '{0:HH:mm:ss},{1:F0},{2:F1},{3:F0},{4},{5:F1},{6:F1},{7:F1},{8:F1}',
+              (Get-Date), $v[0], $v[1], $v[2], $n, $v[3], $v[4], ($v[5] * 1000), ($v[6] * 1000)) |
               Add-Content $out
             Start-Sleep -Seconds 10
           }
@@ -405,9 +476,22 @@ jobs:
       # GitHub's Windows runners are slower than Linux over the same suite,
       # so Bun's 5 s default - which also bounds beforeEach/afterEach hooks -
       # times out tests that pass locally. Tests with their own timeout keep it.
+      #
+      # TEMP and the transpiler cache on D:, the runner's temp folder, not
+      # on the system disk C:. A child that hung on the runner had started,
+      # used a fraction of a second of processor time and then waited on
+      # the kernel with no output, while the disk queue stayed at two or
+      # more with the processor idle, for half a minute to three and a half
+      # minutes, about eight minutes into the job. Every fixture the suite
+      # writes, and every transpiled file a bun child caches, went to C:
+      # until now.
       - name: TypeScript test suite (shard ${{ matrix.shard }}/10)
         env:
           O2B_TEST_INFLIGHT_DIR: ${{ runner.temp }}/test-inflight
+          TEMP: ${{ runner.temp }}\tmp
+          TMP: ${{ runner.temp }}\tmp
+          TMPDIR: ${{ runner.temp }}\tmp
+          BUN_RUNTIME_TRANSPILER_CACHE_PATH: ${{ runner.temp }}\bun-transpiler-cache
         run: >-
           bun test --shard=${{ matrix.shard }}/10
           --timings=${{ runner.temp }}/timings/windows-timings.json --update-timings

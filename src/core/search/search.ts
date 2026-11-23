@@ -34,7 +34,7 @@ import {
   withIndexStale,
 } from "./pipeline/outcome.ts";
 import { applyPostRankPhases } from "./pipeline/post-rank.ts";
-import { resolvePoolFilters } from "./pipeline/pool-filters.ts";
+import { cachedAnswerAdmitted, resolvePoolFilters } from "./pipeline/pool-filters.ts";
 import { resolveQueryShape } from "./pipeline/query-shape.ts";
 import {
   isRelationalArmActive,
@@ -55,7 +55,9 @@ import { resolveKindFilter } from "./property-pushdown.ts";
 import { noSecondPass, runSecondPassRecall } from "./pipeline/second-pass.ts";
 import { runSemanticLane, type SemanticLaneOutcome } from "./pipeline/semantic-lane.ts";
 import type { SemanticEmbedTiming } from "./semantic-phase.ts";
-import { openReadOrSelfHeal } from "./pipeline/store-open.ts";
+import { closeServedStore, indexBuildServed, openReadOrSelfHeal } from "./pipeline/store-open.ts";
+import { precomputedAnswerAdmitted } from "./brain-store/entity-filter.ts";
+import { describeIndexBuild } from "./build-progress.ts";
 import { catchUpBrainStore, type CatchUpResult } from "./brain-store/catch-up.ts";
 import { resolveEffectiveWeights } from "./pipeline/weights.ts";
 import { detectHybridDegrade } from "./enrich.ts";
@@ -432,7 +434,10 @@ export async function search(
   const store =
     opts.selfHeal === false
       ? await Store.open(effectiveConfig, { mode: "read" })
-      : await openReadOrSelfHeal(effectiveConfig);
+      : await openReadOrSelfHeal(effectiveConfig, { serveBuilding: true });
+  // The first index is still being built: this answer comes from what it
+  // has indexed so far, and says so.
+  const servedBuild = indexBuildServed(store);
   if (catchUps[0]?.skipped === "no-index" || catchUps[0]?.skipped === "not-current") {
     catchUps.push(await catchUpBrainStore(effectiveConfig, { force: true }));
   }
@@ -443,6 +448,18 @@ export async function search(
     // caller can tell an exhausted corpus from a broken embedder without
     // matching on prose.
     const degraded: RetrievalDegradationSink = [];
+    if (servedBuild !== null) {
+      warnings.push(
+        `${describeIndexBuild(servedBuild, nowMs)}; these results come from what it has indexed so far`,
+      );
+      noteDegradation(degraded, RETRIEVAL_DEGRADATION.indexBuilding, {
+        records: servedBuild.storeRecords,
+        percent:
+          servedBuild.storeBytesTotal > 0
+            ? Math.floor((100 * servedBuild.storeBytesDone) / servedBuild.storeBytesTotal)
+            : 0,
+      });
+    }
     const failedCatchUp = catchUps.findLast((c) => c.skipped === "failed");
     if (failedCatchUp !== undefined) {
       warnings.push(`brain store catch-up failed, records may be missing: ${failedCatchUp.error}`);
@@ -456,7 +473,8 @@ export async function search(
     const lastIndexedAt = store.getState(LAST_INDEXED_AT_STATE_KEY);
     maybeFreshenIndex(effectiveConfig, {
       lastIndexedAt,
-      readOnly: opts.selfHeal === false,
+      // A staging file is the rebuild's to finish, never freshened.
+      readOnly: opts.selfHeal === false || servedBuild !== null,
       nowMs,
       ...(opts.freshenSpawn !== undefined ? { spawn: opts.freshenSpawn } : {}),
     });
@@ -553,9 +571,31 @@ export async function search(
       // above already arbitrates replays.
       const cachedMarker = cache.hit.iterative;
       const cachedToken = cachedMarker?.phase === "needs-llm-step" ? cachedMarker.token : undefined;
+      // The row was cached before the store may have forgotten, marked or
+      // staged one of its records, and the store changes no index
+      // revision until a catch-up ingests it: a hit is served only while
+      // the store entity rule still admits every row, else it is
+      // recomputed (`brain-store/entity-filter.ts`). Every shape the row can
+      // hold is read: the walk covers every field, and a plan's pool ids.
+      const stillAdmitted = precomputedAnswerAdmitted(
+        cache.hit,
+        store,
+        cachedMarker?.phase === "needs-llm-step" ? cachedMarker.poolIds : [],
+      );
+      // The key partitions by the caller's reach and scopes; the pages the
+      // row names are judged again under them, since a frontmatter edit
+      // the index has not ingested changes what they admit.
+      const callerAdmitted =
+        stillAdmitted &&
+        cachedAnswerAdmitted(cache.hit, resolvePoolFilters(opts), {
+          vault: effectiveConfig.vault,
+          store,
+          frontmatterCache,
+        });
       if (
-        cachedToken === undefined ||
-        !iterativeTokenSpent(store, effectiveConfig, cachedToken, nowMs)
+        callerAdmitted &&
+        (cachedToken === undefined ||
+          !iterativeTokenSpent(store, effectiveConfig, cachedToken, nowMs))
       ) {
         return served(cache.hit);
       }
@@ -716,6 +756,10 @@ export async function search(
           // reach-readable node another agent owns is omitted from the
           // ordered path, never named and never counted in the trail.
           ...(opts.agentScope !== undefined ? { agentScope: opts.agentScope } : {}),
+          // Visibility and session/project scope gate them the same way,
+          // so provenance names no page the result list withholds.
+          ...(opts.visibility !== undefined ? { visibility: opts.visibility } : {}),
+          ...(opts.scope !== undefined ? { scope: opts.scope } : {}),
         })
       : noRelationalArm();
 
@@ -993,6 +1037,8 @@ export async function search(
       );
       const outcome = emptyOutcome({
         store,
+        vault: effectiveConfig.vault,
+        frontmatterCache,
         opts,
         query,
         pathPrefix,
@@ -1163,7 +1209,7 @@ export async function search(
     });
     return served(emit(built));
   } finally {
-    await store.close();
+    await closeServedStore(store);
   }
 }
 

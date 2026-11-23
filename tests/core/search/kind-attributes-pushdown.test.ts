@@ -304,7 +304,7 @@ describe("kind pushdown on the keyword lane", () => {
         [1, "lattice delta payload section", "section"],
       ] as const) {
         db.query(
-          "INSERT INTO chunks(document_id, chunk_index, chunk_kind, content, fts_content, content_hash, start_line, end_line, token_count, created_at, updated_at) " +
+          "INSERT INTO chunks(document_id, chunk_index, chunk_kind, content, fts_override, content_hash, start_line, end_line, token_count, created_at, updated_at) " +
             "VALUES (?, ?, ?, ?, ?, ?, 1, 1, 3, 'n', 'n')",
         ).run(docId, index, kind, text, text, `h${index}`);
       }
@@ -346,7 +346,7 @@ describe.skipIf(!VEC_AVAILABLE)("kind and pushdown on the semantic lane", () => 
           .get(path, type)!.id;
         const row = db
           .query<{ id: number }, [number]>(
-            "INSERT INTO chunks(document_id, chunk_index, chunk_kind, content, fts_content, content_hash, start_line, end_line, token_count, created_at, updated_at) " +
+            "INSERT INTO chunks(document_id, chunk_index, chunk_kind, content, fts_override, content_hash, start_line, end_line, token_count, created_at, updated_at) " +
               "VALUES (?, 0, 'page', 'x', 'x', 'h', 1, 1, 1, 'n', 'n') RETURNING id",
           )
           .get(docId)!;
@@ -773,7 +773,7 @@ describe("the unpromoted attribute narrowing (document_attributes)", () => {
           "VALUES (?, 'h', 0, 0, 'n', 'n', 'n') RETURNING id",
       );
       const insertChunk = db.query(
-        "INSERT INTO chunks(document_id, chunk_index, content, fts_content, content_hash, start_line, end_line, token_count, created_at, updated_at) " +
+        "INSERT INTO chunks(document_id, chunk_index, content, fts_override, content_hash, start_line, end_line, token_count, created_at, updated_at) " +
           "VALUES (?, 0, ?, ?, 'h', 1, 1, 3, 'n', 'n')",
       );
       const insertAttr = db.query(
@@ -974,14 +974,26 @@ describe("the freshness gate on attribute narrowing", () => {
     // indexed (mtime, size) pair and the live stat: its signature admits no
     // file read, which is the no-per-row-file-read pin. The floor matches
     // the indexer's own (`Math.floor(mtimeMs / 1000)` at upsert time).
+    // The row was written an hour after the file's mtime: settled.
+    const indexed = { mtime: 1700000000, size: 10, indexedAtMs: 1700003600_000 };
+    expect(indexedSnapshotStale(indexed, { mtimeMs: 1700000000_500, size: 10 })).toBe(false);
+    expect(indexedSnapshotStale(indexed, { mtimeMs: 1700000005_000, size: 10 })).toBe(true);
+    expect(indexedSnapshotStale(indexed, { mtimeMs: 1700000000_500, size: 11 })).toBe(true);
+  });
+
+  test("a row indexed within the racy window of the file's mtime proves nothing", () => {
+    // A same-size edit saved in the second of the indexed version keeps
+    // both fields, so such a row reads as stale until a later pass
+    // re-reads the file and re-arms it (`fs-stamp.ts`).
+    const live = { mtimeMs: 1700000000_500, size: 10 };
     expect(
-      indexedSnapshotStale({ mtime: 1700000000, size: 10 }, { mtimeMs: 1700000000_500, size: 10 }),
-    ).toBe(false);
-    expect(
-      indexedSnapshotStale({ mtime: 1700000000, size: 10 }, { mtimeMs: 1700000005_000, size: 10 }),
+      indexedSnapshotStale({ mtime: 1700000000, size: 10, indexedAtMs: 1700000001_900 }, live),
     ).toBe(true);
     expect(
-      indexedSnapshotStale({ mtime: 1700000000, size: 10 }, { mtimeMs: 1700000000_500, size: 11 }),
+      indexedSnapshotStale({ mtime: 1700000000, size: 10, indexedAtMs: 1700000003_000 }, live),
+    ).toBe(false);
+    expect(
+      indexedSnapshotStale({ mtime: 1700000000, size: 10, indexedAtMs: Number.NaN }, live),
     ).toBe(true);
   });
 

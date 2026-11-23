@@ -41,8 +41,19 @@ import {
 import type { TopicFold, TopicState } from "./fold.ts";
 import { reviewTopics } from "./plan.ts";
 import { readTopics, type TopicRead } from "./read.ts";
+import { canonicalTopicScope } from "./records.ts";
+import {
+  HELD_WITHHELD_MESSAGE,
+  type HeldWithheldReason,
+  heldRecordIds,
+  holdRefusal,
+  readHeldRecords,
+} from "./held-records.ts";
+import { readDecisionEvents, withHeldDecisions } from "./held-decisions.ts";
+import { configuredStore } from "../store/read/store-entities.ts";
 import { createTopicEvent, writeTopicEvents, type TopicEvent } from "./write.ts";
 import { privateWithheld } from "../store/caller-reach.ts";
+import { SESSION_FIELD } from "../agent-context/session-identity.ts";
 import { SETTING_TOPIC_QUIET_DAYS } from "../store/constants.ts";
 
 export const TOPIC_ACTIONS = Object.freeze([
@@ -106,6 +117,8 @@ export interface TopicActionInput {
   readonly fields?: Readonly<Record<string, unknown>>;
   /** `list`: the scope to list (default: every topic). */
   readonly listScope?: string;
+  /** `show`: also list the records the topic holds (`held-records.ts`). */
+  readonly held?: boolean;
 }
 
 export interface TopicActionContext {
@@ -118,6 +131,19 @@ export interface TopicActionContext {
    * `brain_topic`) defaults to `agent` and must name `human` to claim it.
    */
   readonly humanRequest?: boolean;
+  /**
+   * The writing session's stamp (`agent-context/session-identity.ts`),
+   * set on the body of every record the action writes. A caller cannot
+   * name it: `fields` takes no `session`.
+   */
+  readonly session?: string;
+}
+
+/** An event with the writing session's stamp in its body, when there is one. */
+function stampSession(event: TopicEvent, session: string | undefined): TopicEvent {
+  return session === undefined
+    ? event
+    : { ...event, body: { ...event.body, [SESSION_FIELD]: session } };
 }
 
 function need(input: TopicActionInput, field: keyof TopicActionInput): string {
@@ -303,9 +329,10 @@ export function topicHead(topic: TopicState): Record<string, unknown> {
   };
 }
 
-function topicDetail(topic: TopicState): Record<string, unknown> {
+function topicDetail(topic: TopicState, held: number): Record<string, unknown> {
   return {
     ...topicHead(topic),
+    held_records: held,
     links: topic.links,
     goal_proposals: topic.goalProposals.map((p) => ({
       agent: p.agent,
@@ -327,6 +354,71 @@ function topicDetail(topic: TopicState): Record<string, unknown> {
       ...(i.doneProposed !== undefined ? { looks_done: true } : {}),
       ...(i.resolved !== undefined ? { resolved: new Date(i.resolved.at).toISOString() } : {}),
     })),
+  };
+}
+
+/** The records `topic` holds, read from the store (`show` with `held`). */
+function heldListing(
+  read: TopicRead,
+  topic: TopicState,
+  configPath: string | undefined,
+): Record<string, unknown> {
+  const store = configuredStore(configPath);
+  const ids = heldRecordIds(read.fold, topic.id);
+  if (store === null) return { records: [], records_missing: ids.length };
+  const held = readHeldRecords(store, ids);
+  return {
+    records: held.records.map((r) => ({
+      id: r.id,
+      kind: r.kind,
+      ...(r.text !== undefined ? { text: delivered(r.text) } : {}),
+      at: r.at,
+      project: r.project,
+      ...(r.private ? { private: true } : {}),
+      ...(r.withheld !== undefined ? { withheld: r.withheld } : {}),
+    })),
+    ...(held.missing > 0 ? { records_missing: held.missing } : {}),
+    // Signals listed without their text: how many, and why.
+    ...(Object.keys(held.withheld).length > 0
+      ? {
+          records_withheld: Object.entries(held.withheld).map(([reason, count]) => ({
+            reason,
+            count,
+            message: HELD_WITHHELD_MESSAGE[reason as HeldWithheldReason],
+          })),
+        }
+      : {}),
+    // Below local reach the shards are not named, as every topic reader
+    // withholds them (they may be private ones): only how many.
+    ...(held.unreadable.length > 0
+      ? privateWithheld()
+        ? { records_unreadable_count: held.unreadable.length }
+        : { records_unreadable: held.unreadable }
+      : {}),
+  };
+}
+
+/**
+ * `read` with the decision items its topics' held decision events give
+ * (`held-decisions.ts`), read at the caller's reach: the `log` stream of
+ * the partitions the caller may read.
+ */
+function withHeldDecisionsOf(
+  read: TopicRead,
+  configPath: string | undefined,
+): { readonly read: TopicRead; readonly incomplete: boolean } {
+  const store = configuredStore(configPath);
+  if (store === null) return { read, incomplete: false };
+  const events = readDecisionEvents(store);
+  return {
+    read: {
+      ...read,
+      fold: withHeldDecisions(read.fold, events.records, events.privateIds, events.titles),
+    },
+    // A `log` shard not read in full may hold a decision of the topic; an
+    // `events` read that missed a page version named no decision by its
+    // page's title.
+    incomplete: events.unreadable.length > 0 || !events.titles.complete,
   };
 }
 
@@ -362,10 +454,31 @@ function quietDays(configPath?: string): number {
 }
 
 function listJson(fold: TopicFold, scope: string | undefined): Record<string, unknown>[] {
+  // The fold keys every scope (`canonicalTopicScope`); the filter is keyed
+  // the same way, so `project:Café` lists the topics of `café`.
+  const wanted = scope === undefined ? undefined : canonicalTopicScope(scope.trim());
   return [...fold.topics.values()]
-    .filter((t) => t.mergedInto === null && (scope === undefined || t.scope === scope))
+    .filter((t) => t.mergedInto === null && (wanted === undefined || t.scope === wanted))
     .toSorted((a, b) => b.updatedAt - a.updatedAt || (a.id < b.id ? -1 : 1))
     .map(topicHead);
+}
+
+/**
+ * An assign names a record a topic can hold (`holdRefusal`). A store that
+ * cannot be read here is refused too, although the topic read before
+ * succeeded: the write would otherwise land unchecked, since the writer
+ * checks that the topic exists, not the record.
+ */
+function refuseUnholdable(record: string, configPath: string | undefined): void {
+  const store = configuredStore(configPath);
+  if (store === null) {
+    throw new TopicActionError(
+      `assign: the brain store could not be read to check record ${record}; nothing was ` +
+        "written, try again once it can be read",
+    );
+  }
+  const refusal = holdRefusal(store, record);
+  if (refusal !== null) throw new TopicActionError(`assign: ${refusal}`);
 }
 
 /** The events of a write action, against what the caller can see. */
@@ -495,10 +608,16 @@ export function runTopicAction(
       return { action: "list", topics: listJson(read.fold, input.listScope) };
     case "show": {
       const topic = visibleTopic(read, need(input, "topic"));
+      const held = heldRecordIds(read.fold, topic.id).length;
+      const derived =
+        held > 0 ? withHeldDecisionsOf(read, context.configPath) : { read, incomplete: false };
+      const shown = derived.read;
       return {
         action: "show",
-        topic: topicDetail(topic),
-        page: shownMarkdown(read, topic, context.configPath),
+        ...(derived.incomplete ? { decisions_incomplete: true } : {}),
+        topic: topicDetail(shown.fold.topics.get(topic.id) ?? topic, held),
+        ...(input.held === true ? heldListing(read, topic, context.configPath) : {}),
+        page: shownMarkdown(shown, topic, context.configPath),
       };
     }
     case "review": {
@@ -520,9 +639,12 @@ export function runTopicAction(
       };
     }
   }
+  if (input.action === "assign") refuseUnholdable(need(input, "record"), context.configPath);
   const events = eventsOf(input, read, now, context.humanRequest === true);
   const written: AppendResult[] = writeTopicEvents(
-    events.map((e) => (context.agent !== undefined ? { ...e, agent: context.agent } : e)),
+    events
+      .map((e) => stampSession(e, context.session))
+      .map((e) => (context.agent !== undefined ? { ...e, agent: context.agent } : e)),
     {
       ...(context.configPath !== undefined ? { configPath: context.configPath } : {}),
       ...(input.private !== undefined ? { private: input.private } : {}),

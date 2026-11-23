@@ -11,14 +11,13 @@ import {
   addObligation,
   completeObligation,
   listObligations,
+  obligationStemRel,
   removeObligation,
-  noObligationError,
+  resolveObligationTarget,
   showObligation,
   type ObligationListItem,
   type ObligationPage,
 } from "../../core/brain/obligations.ts";
-import { BRAIN_OBLIGATIONS_REL } from "../../core/brain/path-constants.ts";
-import { slugify } from "../../core/vault.ts";
 import {
   synthesizeAgenda,
   type AgendaEventInput,
@@ -57,16 +56,6 @@ function listItemJson(item: ObligationListItem): Record<string, unknown> {
   };
 }
 
-/** The vault-relative page of an obligation file stem, as listed (no slug fold). */
-function obligationStemRel(stem: string): string {
-  return `${BRAIN_OBLIGATIONS_REL}/${stem}.md`;
-}
-
-/** The vault-relative page a caller's slug argument names. */
-function obligationRel(slug: string): string {
-  return obligationStemRel(slugify(slug));
-}
-
 function toolBrainObligation(
   ctx: ServerContext,
   args: Record<string, unknown>,
@@ -79,8 +68,6 @@ function toolBrainObligation(
   // one would be, so neither its text nor its existence crosses, and it
   // is never written. `undefined` at local reach with the owner gate off.
   const readable = readableAtContextReachOrUndefined(ctx);
-  const withheld = (slug: string): boolean =>
-    readable !== undefined && !readable(obligationRel(slug));
   try {
     if (operation === "list") {
       const items = listObligations(vault, { overdueOnly: args["overdue"] === true });
@@ -104,28 +91,29 @@ function toolBrainObligation(
         agent: resolveAgentName(ctx.configPath ?? undefined),
         ...(anchor ? { anchor } : {}),
         ...(notes ? { notes } : {}),
+        ...(readable !== undefined ? { readable } : {}),
       });
       return { operation, obligation: pageJson(page) };
     }
     const slug = coerceStr(args, "slug", true)!;
-    if (withheld(slug)) {
-      if (operation === "show") return { operation, slug, present: false };
-      if (operation === "done" || operation === "remove") {
-        throw noObligationError(slugify(slug));
-      }
-    }
+    // Resolved once, at the caller's reach: a page the caller may not read
+    // is never parsed and resolves as an absent one would (the value's own
+    // slug, not found), an obligation an older release stored under its
+    // Latin-only slug included, and a page another writer adds under the
+    // preferred slug in between is not taken instead.
+    const target = resolveObligationTarget(vault, slug, readable);
     if (operation === "show") {
-      const page = showObligation(vault, slug);
+      const page = showObligation(vault, target);
       if (page === null) return { operation, slug, present: false };
       return { operation, present: true, obligation: pageJson(page) };
     }
     if (operation === "done") {
       const date = coerceStr(args, "date", false);
-      const page = completeObligation(vault, { slug, ...(date ? { date } : {}) });
+      const page = completeObligation(vault, { slug: target, ...(date ? { date } : {}) });
       return { operation, obligation: pageJson(page) };
     }
     if (operation === "remove") {
-      const removed = removeObligation(vault, slug);
+      const removed = removeObligation(vault, target);
       // The archive name steps past every name already taken in archive/,
       // readable or not, so below local reach it is left out of the answer.
       if (readable !== undefined) return { operation, slug: removed.slug };

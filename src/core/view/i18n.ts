@@ -49,12 +49,18 @@ export interface ViewStrings {
   readonly questionAnswer: (answer: string) => string;
   readonly goalProposal: (agent: string, goal: string) => string;
   readonly serves: (list: string) => string;
+  /** The mark of a decision item that closed an open decision. */
+  readonly decisionResolved: string;
+  /** The outcome backfilled for a decision item. */
+  readonly decisionOutcome: (outcome: string) => string;
   readonly logClass: Readonly<Record<EarnedLogClass, string>>;
   readonly because: (reason: string) => string;
   readonly scopePersonal: string;
   readonly scopeProject: (project: string) => string;
   readonly mergedFrom: (title: string) => string;
   readonly archiveLink: string;
+  /** The related line naming how many records a topic holds and the command that lists them. */
+  readonly heldRecords: (count: number, command: string) => string;
   readonly archiveTitle: (title: string) => string;
   readonly archiveIntro: string;
   readonly archiveBack: string;
@@ -105,6 +111,8 @@ const EN: ViewStrings = {
   questionAnswer: (answer) => `answer: ${answer}`,
   goalProposal: (agent, goal) => `Goal proposed by ${agent}: ${goal}`,
   serves: (list) => `serves: ${list}`,
+  decisionResolved: "resolved open decision",
+  decisionOutcome: (outcome) => `outcome: ${outcome}`,
   logClass: {
     correction: "correction",
     decision: "decision",
@@ -118,6 +126,8 @@ const EN: ViewStrings = {
   scopeProject: (project) => `Project: ${project}`,
   mergedFrom: (title) => `Merged from: ${title}`,
   archiveLink: "Older entries",
+  heldRecords: (count, command) =>
+    `Holds ${count} record(s) (notes, signals, decisions): \`${command}\` lists them`,
   archiveTitle: (title) => `${title}: archive`,
   archiveIntro: "Entries that moved off the topic page, newest first.",
   archiveBack: "Back to the topic",
@@ -168,6 +178,8 @@ const RU: ViewStrings = {
   questionAnswer: (answer) => `ответ: ${answer}`,
   goalProposal: (agent, goal) => `Цель, предложенная ${agent}: ${goal}`,
   serves: (list) => `служит: ${list}`,
+  decisionResolved: "решённый открытый вопрос",
+  decisionOutcome: (outcome) => `итог: ${outcome}`,
   logClass: {
     correction: "исправление",
     decision: "решение",
@@ -181,6 +193,8 @@ const RU: ViewStrings = {
   scopeProject: (project) => `Проект: ${project}`,
   mergedFrom: (title) => `Объединена из: ${title}`,
   archiveLink: "Старые записи",
+  heldRecords: (count, command) =>
+    `Записей в теме: ${count} (заметки, сигналы, решения): их список выводит \`${command}\``,
   archiveTitle: (title) => `${title}: архив`,
   archiveIntro: "Записи, ушедшие со страницы темы, сначала новые.",
   archiveBack: "Назад к теме",

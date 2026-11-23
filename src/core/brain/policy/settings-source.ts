@@ -33,7 +33,9 @@
 import { readFileSync, statSync } from "node:fs";
 
 import { defaultConfigPath, discoverConfig } from "../../config.ts";
+import { stampKey } from "../../fs-stamp.ts";
 import { foldSettings } from "../../store/fold-settings.ts";
+
 import { protectionStore, StoreUnavailableError } from "../../store/read/protection-store.ts";
 import { readStreamRecords } from "../../store/read/stream-read.ts";
 import { quarantineStamp } from "../../store/shard-quarantine.ts";
@@ -86,6 +88,27 @@ function place(
     target[block] = {};
   }
   (target[block] as Record<string, unknown>)[field] = value;
+}
+
+/**
+ * The machine config the device settings come from could not be read.
+ * The message keeps the read error's text for a local reader; `code` is
+ * its errno code alone (or `unreadable`), for a refusal that may cross
+ * to a remote caller and must not name the config's host path.
+ */
+export class MachineConfigUnreadableError extends BrainConfigError {
+  readonly code: string;
+
+  constructor(cause: unknown) {
+    super(
+      `machine config could not be read: ${(cause as Error)?.message ?? String(cause)}`,
+      null,
+      STORE_SETTINGS_SOURCE,
+    );
+    this.name = "MachineConfigUnreadableError";
+    const code = (cause as NodeJS.ErrnoException | null)?.code;
+    this.code = typeof code === "string" && code.length > 0 ? code : "unreadable";
+  }
 }
 
 /** The folded shared `brain.*` settings, as `_brain.yaml` keys. */
@@ -211,8 +234,12 @@ const SETTINGS = { stream: "settings" } as const;
 
 function statStamp(path: string): string {
   try {
-    const stat = statSync(path);
-    return `${stat.size}:${stat.mtimeMs}`;
+    // The machine config is a small file people edit in place, and the
+    // settings shards are seldom written: a stamp too recent to vouch for
+    // the bytes never matches (`fs-stamp.ts`), at the price of a re-fold
+    // for a couple of seconds after a change.
+    const observedAtMs = Date.now();
+    return stampKey(statSync(path, { bigint: true }), observedAtMs);
   } catch {
     return "missing";
   }
@@ -323,11 +350,7 @@ function mergedRawSettings(
   try {
     device = deviceBrainSettings(configPathOption);
   } catch (err) {
-    throw new BrainConfigError(
-      `machine config could not be read: ${(err as Error).message ?? String(err)}`,
-      null,
-      STORE_SETTINGS_SOURCE,
-    );
+    throw new MachineConfigUnreadableError(err);
   }
   const merged: Record<string, unknown> = { schema_version: 1 };
   for (const source of [sharedBrainSettings(store), device]) {

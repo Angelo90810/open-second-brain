@@ -66,6 +66,40 @@ export function renderDerivedStoreCoverage(
 }
 
 /**
+ * What a rollback dry run does not list, for `--json`: the folders a
+ * restore leaves in place and the links the differ never reads.
+ */
+export const ROLLBACK_DRY_RUN_NOT_LISTED: ReadonlyArray<string> = Object.freeze([
+  ".snapshots/",
+  ".artifacts/",
+  "symbolic links",
+]);
+
+/**
+ * The closing section of a rollback dry run: what its list leaves out and
+ * why, so the list reads as the whole of what a rollback would change.
+ * The derived store is put back from an archive of its own, never through
+ * the `Brain/` list, so its coverage is named here.
+ */
+export function renderRollbackDryRunNotListed(record: BrainManifestDerivedStore | null): string {
+  const coverage = renderDerivedStoreCoverage(record);
+  const store =
+    record === null
+      ? "a rollback puts it back only when the snapshot holds its archive"
+      : record.included
+        ? "a rollback puts it back from its own archive"
+        : "a rollback leaves it as it is";
+  return [
+    "## Not listed",
+    "- .snapshots/ and .artifacts/: no snapshot holds them and a rollback leaves them as they are.",
+    "- Symbolic links: this diff never reads them; a rollback replaces each one with what the " +
+      "snapshot holds.",
+    `- Derived store (search index): ${coverage}; ${store}.`,
+    "",
+  ].join("\n");
+}
+
+/**
  * One-line outcome for a completed restore, and the one place the
  * no-record case is put into words.
  *
@@ -118,5 +152,25 @@ export function renderSnapshotListingSkips(skipped: ReadonlyArray<SnapshotEntryS
   return (
     `warning: ${skipped.length} archive(s) in the snapshots directory could not be listed, so ` +
     `this listing is INCOMPLETE: ${skipped.map(describeSnapshotEntrySkip).join(", ")}`
+  );
+}
+
+/**
+ * The refusal of a snapshot restore or a diff against the live tree on a
+ * machine switched to the brain store (design D14). There the vault may
+ * have no `Brain/` at all, and a snapshot holds only this machine's
+ * device-local state, never the memory: comparing it with the vault's
+ * `Brain/` would report an empty tree, and restoring it would bring no
+ * record back (and could write a `Brain/` folder the store-only check
+ * reads as a legacy tree). The sentence names the commands that do what
+ * the operator is after.
+ */
+export function renderStoreOnlySnapshotRefusal(verb: string): string {
+  return (
+    `${verb} refused: this machine keeps its memory in the brain store, not in the vault's ` +
+    "Brain/ folder, and a snapshot here holds only this machine's device-local state. To go " +
+    "back to the legacy Brain/ tree, run `o2b brain migrate-store --rollback`; to restore an " +
+    "older version of a page of the human view, run `o2b view recover <page>`. " +
+    "`o2b brain snapshot log` still lists the snapshots."
   );
 }

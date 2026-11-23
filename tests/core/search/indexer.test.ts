@@ -1,5 +1,6 @@
-import { test, expect, beforeEach, afterEach } from "bun:test";
-import { existsSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { test, expect, beforeEach, afterEach, setSystemTime, spyOn } from "bun:test";
+import * as fs from "node:fs";
+import { existsSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -9,6 +10,7 @@ import {
   indexCheck,
 } from "../../../src/core/search/indexer.ts";
 import { Store } from "../../../src/core/search/store.ts";
+import { acquireWriterLockSync } from "../../../src/core/search/store/writer-lock.ts";
 import { LATEST_SCHEMA_VERSION } from "../../../src/core/search/schema.ts";
 import { createTempVault, makeConfig, writeMd } from "../../helpers/search-fixtures.ts";
 
@@ -24,6 +26,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setSystemTime();
   cleanup();
 });
 
@@ -118,7 +121,7 @@ test("indexCheck reports vault readable, sqlite ok, fts ok", async () => {
   expect(report.fatal.length).toBe(0);
 });
 
-test("reindexVault rebuilds atomically and preserves .bak", async () => {
+test("reindexVault rebuilds atomically and leaves no second copy of the index", async () => {
   writeMd(vault, "a.md", "# A");
   const cfg = makeConfig({ vault, dbPath });
   await indexVault(cfg);
@@ -130,7 +133,10 @@ test("reindexVault rebuilds atomically and preserves .bak", async () => {
   const stats = await reindexVault(cfg);
   expect(stats.added).toBeGreaterThanOrEqual(2);
   expect(existsSync(dbPath)).toBe(true);
-  expect(existsSync(dbPath + ".bak")).toBe(true);
+  // The previous index is parked at `.bak` only through the swap: once
+  // the new one is live and verified, a keyword-only index holds nothing
+  // the new one lacks, so the backup goes.
+  expect(existsSync(dbPath + ".bak")).toBe(false);
   expect(existsSync(dbPath + ".new")).toBe(false);
 
   // Stats reflect the rebuilt index (2 docs from scratch).
@@ -138,14 +144,42 @@ test("reindexVault rebuilds atomically and preserves .bak", async () => {
   expect(status.documents).toBe(2);
 });
 
+test("reindexVault removes a .bak an earlier release left beside the index", async () => {
+  writeMd(vault, "a.md", "# A");
+  const cfg = makeConfig({ vault, dbPath });
+  await indexVault(cfg);
+  fs.copyFileSync(dbPath, dbPath + ".bak");
+
+  await reindexVault(cfg);
+
+  expect(existsSync(dbPath + ".bak")).toBe(false);
+});
+
+test("the rebuild's duration is its wall time, the wait for the writer lock included", async () => {
+  writeMd(vault, "a.md", "# A");
+  const cfg = makeConfig({ vault, dbPath });
+  await indexVault(cfg);
+  const HELD_MS = 600;
+  const release = acquireWriterLockSync(dbPath);
+  const timer = setTimeout(release, HELD_MS);
+  try {
+    const started = Date.now();
+    const stats = await reindexVault(cfg);
+    const wall = Date.now() - started;
+    expect(stats.durationMs).toBeGreaterThanOrEqual(HELD_MS);
+    expect(stats.durationMs).toBeLessThanOrEqual(wall);
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
 test("Store.open auto-restores from .bak when main file is missing", async () => {
   writeMd(vault, "a.md", "# A");
   const cfg = makeConfig({ vault, dbPath });
   await indexVault(cfg);
-  await reindexVault(cfg);
-
-  // Simulate crash mid-reindex by removing the main file (we still have .bak).
-  rmSync(dbPath);
+  // What a crash between the swap's two renames leaves: the previous
+  // index at `.bak` and no live file.
+  fs.renameSync(dbPath, dbPath + ".bak");
   expect(existsSync(dbPath + ".bak")).toBe(true);
 
   const status = await indexStatus(cfg);
@@ -191,6 +225,65 @@ test("mtime+size fastpath skips read; hash fallback detects same-content touch",
   expect(second.unchanged).toBe(1);
   expect(second.updated).toBe(0);
   expect(second.added).toBe(0);
+});
+
+test("a same-size edit saved in the second of the indexed version is re-indexed", async () => {
+  // The index keeps the file's mtime in whole seconds. A same-size edit
+  // saved in the same second as the indexed version (or the same tick of
+  // a coarse volume clock) keeps both fields, so a row that young does
+  // not take the fastpath (`fs-stamp.ts`, racily clean).
+  writeMd(vault, "a.md", "# Hello World\n\nalpha content.");
+  const p = join(vault, "a.md");
+  const mtime = statSync(p).mtime;
+  const cfg = makeConfig({ vault, dbPath });
+  expect((await indexVault(cfg)).added).toBe(1);
+
+  writeFileSync(p, "# Hello World\n\ngamma content.");
+  utimesSync(p, mtime, mtime);
+  const second = await indexVault(cfg);
+  expect(second.updated).toBe(1);
+  expect(second.unchanged).toBe(0);
+});
+
+test("a row proves the note only as of the moment the indexer looked, not when it wrote", async () => {
+  // A run reads the note, then pauses for longer than the racy window
+  // before it writes the row; a same-size edit lands in the same second
+  // as the indexed version during the pause. A row stamped with its write
+  // time would vouch for the old bytes; one stamped with the time the
+  // walk observed the note does not.
+  writeMd(vault, "b.md", "# Hello World\n\nalpha content.");
+  const p = join(vault, "b.md");
+  // The walker reads through the vault's real path: on macOS the temp
+  // directory is a symlink (`/var` -> `/private/var`), so the read the
+  // edit must land in is matched by its real path, not the joined one.
+  const pReal = realpathSync(p);
+  const second = Math.floor(Date.now() / 1000);
+  utimesSync(p, second, second);
+  const cfg = makeConfig({ vault, dbPath });
+  const realRead = fs.readFileSync;
+  let edited = false;
+  const read = spyOn(fs, "readFileSync").mockImplementation(((
+    path: unknown,
+    ...rest: unknown[]
+  ) => {
+    const out = (realRead as (...a: unknown[]) => unknown)(path, ...rest);
+    if ((String(path) === p || String(path) === pReal) && !edited) {
+      edited = true;
+      writeFileSync(p, "# Hello World\n\ngamma content.");
+      utimesSync(p, second, second);
+      setSystemTime(new Date(Date.now() + 3_000));
+    }
+    return out;
+  }) as typeof fs.readFileSync);
+  try {
+    expect((await indexVault(cfg)).added).toBe(1);
+  } finally {
+    read.mockRestore();
+  }
+  expect(edited).toBe(true);
+  const again = await indexVault(cfg);
+  setSystemTime();
+  expect(again.updated).toBe(1);
 });
 
 test("declaring vault.include_paths and reindexing PRUNES what is now out of scope", async () => {

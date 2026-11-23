@@ -17,6 +17,13 @@
  * Every other machine is unswitched: the legacy writers keep the legacy
  * tree and dual-write behind the flag exactly as in phase 1.
  *
+ * A machine that is not switched and cannot examine `<vault>/Brain` (the
+ * vault cannot be traversed, an I/O error) cannot tell which it is: a
+ * failed look is not an absent folder. {@link storeOnlyAnswer} says so
+ * (`undetermined`), and {@link storeOnlyMode} and {@link isStoreOnly}
+ * throw {@link StoreOnlyUndeterminedError}, so no writer lands in the store
+ * on a guess and no reader answers "nothing here" from an empty store.
+ *
  * The switch is sticky per machine. The migration records it in a
  * device-local marker beside the stores' state as it switches the device
  * ({@link recordSwitchMarker}), and the first answer that sees a switch
@@ -29,7 +36,7 @@
  * switched use {@link deviceSwitchedHere}, which reads the same marker.
  */
 
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { BRAIN_ROOT_REL } from "../brain/path-constants.ts";
@@ -40,6 +47,7 @@ import {
   isDeviceSwitched,
 } from "../store-migration/migration-records.ts";
 import { processDirsEnv } from "../platform-dirs.ts";
+import { lookAtDirectory, VaultUnexaminableError } from "../vault-unexaminable.ts";
 import { withLocalLock } from "./local-lock.ts";
 import { inspectStore, type StoreHandle, type StoreInspection } from "./store-open.ts";
 import { resolveConfiguredStoreRoot, storesStateDir } from "./store-paths.ts";
@@ -94,15 +102,57 @@ export interface StoreOnlyMode {
 export const readSwitchRecords: DeviceSwitchedReader = (store, deviceId) =>
   isDeviceSwitched(store, deviceId);
 
+/** The answer when this machine cannot tell whether it is store-only. */
+export interface StoreOnlyUndetermined {
+  readonly reason: "undetermined";
+  readonly vault: string;
+  /** The error the look at `<vault>/Brain` failed with. */
+  readonly cause: Error;
+}
+
+/**
+ * This machine is not switched and cannot tell whether `vault` holds a
+ * legacy tree: `<vault>/Brain` could not be examined. Thrown by
+ * {@link storeOnlyMode} and {@link isStoreOnly}; a caller that branches on
+ * the mode fails with it instead of reading or writing either layout.
+ */
+export class StoreOnlyUndeterminedError extends VaultUnexaminableError {
+  constructor(vault: string, cause: Error) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    super(
+      vault,
+      cause,
+      `cannot tell whether ${vault} holds a ${BRAIN_ROOT_REL}/ tree: ${join(vault, BRAIN_ROOT_REL)} ` +
+        `cannot be examined (${code ?? cause.message}); nothing is read from or written to ` +
+        "the store or the vault until the vault can be read (check its permissions)",
+    );
+    this.name = "StoreOnlyUndeterminedError";
+  }
+}
+
+/** Whether `<vault>/Brain` exists, is absent, or cannot be examined. */
+type LegacyTreeLook = "present" | "absent" | { readonly failed: Error };
+
+function lookAtLegacyTree(vault: string | null): LegacyTreeLook {
+  if (vault === null || vault.trim() === "") return "absent";
+  // A missing vault or folder, or a name no file can have: no tree. A look
+  // that fails otherwise (EACCES, EPERM, ELOOP, EIO, ENOTDIR through a
+  // file), a Brain/ that is no directory, or one this process cannot list
+  // and traverse (mode 000) says nothing (`lookAtDirectory`).
+  return lookAtDirectory(join(vault, BRAIN_ROOT_REL));
+}
+
 /**
  * Whether `vault` holds a `Brain/` folder: an unswitched machine with one
  * writes the legacy tree. Whether that folder holds anything to migrate is
  * `legacy-tree.ts`; a bootstrap-only folder becomes store-only through the
- * fresh-install switch (`fresh-switch.ts`).
+ * fresh-install switch (`fresh-switch.ts`). Throws
+ * {@link StoreOnlyUndeterminedError} when the folder cannot be examined.
  */
 export function hasLegacyTree(vault: string | null): boolean {
-  if (vault === null || vault.trim() === "") return false;
-  return existsSync(join(vault, BRAIN_ROOT_REL));
+  const look = lookAtLegacyTree(vault);
+  if (typeof look === "object") throw new StoreOnlyUndeterminedError(vault ?? "", look.failed);
+  return look === "present";
 }
 
 function markerPath(): string {
@@ -264,18 +314,177 @@ function isSwitched(context: StoreOnlyContext, options: StoreOnlyOptions): boole
   return switched;
 }
 
-/** Whether, and why, this machine writes to the store only. */
+/**
+ * Whether, and why, this machine writes to the store only, or that it
+ * cannot tell (`undetermined`): for a caller that reports the answer (a
+ * status or doctor line) rather than branching on it.
+ */
+export function storeOnlyAnswer(
+  context: StoreOnlyContext = {},
+  options: StoreOnlyOptions = {},
+): StoreOnlyMode | StoreOnlyUndetermined {
+  const vault = vaultOf(context);
+  if (isSwitched(context, options)) return { storeOnly: true, reason: "device-switched", vault };
+  const look = lookAtLegacyTree(vault);
+  if (typeof look === "object")
+    return { reason: "undetermined", vault: vault!, cause: look.failed };
+  if (look === "absent") return { storeOnly: true, reason: "no-legacy-tree", vault };
+  return { storeOnly: false, reason: "legacy", vault };
+}
+
+/**
+ * The refusal for a vault a switched machine cannot reach, or `null` when
+ * the vault is there to read or the machine has not switched.
+ *
+ * On a switched machine the brain lives in the store, and the vault is
+ * only the human view and the user's notes (design D14 items 2 and 8): a
+ * vault folder that cannot be examined (its permissions, an I/O error) or
+ * is gone (an unmounted disk) leaves the store readers and writers working
+ * as on a machine with no vault, and only what needs the vault refuses,
+ * with this error. A machine that has not switched answers `null` here and
+ * keeps its refusal of every read and write ({@link storeOnlyMode}).
+ *
+ * A machine that has not switched and whose vault is gone is store-only
+ * too (`no-legacy-tree`): it reads its brain from the store, its READ
+ * answers keep their own checks, and a WRITE into the vault refuses
+ * where it writes - a note write never creates the folder that is missing
+ * (`../vault-unexaminable.ts`).
+ */
+export function switchedVaultUnreachable(
+  vault: string,
+  context: Pick<StoreOnlyContext, "configPath"> = {},
+): VaultUnexaminableError | null {
+  const look = lookAtDirectory(vault);
+  if (look === "present") return null;
+  // A look, never a write: every surface asks this before it does
+  // anything, a dry run and a hook included, so it never records a newly
+  // observed switch (the writers and readers that follow do).
+  if (!isSwitched({ vault, ...context }, { persistSwitch: false })) return null;
+  if (look === "absent") {
+    const gone = Object.assign(new Error(`ENOENT: no such directory, '${vault}'`), {
+      code: "ENOENT",
+    });
+    return new VaultUnexaminableError(
+      vault,
+      gone,
+      `the vault ${vault} is not there (ENOENT); this machine's brain is in the store, so ` +
+        "the brain tools keep working, and a tool that needs the vault answers once the folder " +
+        "is back (mount or restore it, or point the machine config at the vault)",
+    );
+  }
+  return new VaultUnexaminableError(
+    vault,
+    look.failed,
+    `the vault ${vault} cannot be examined (${
+      (look.failed as NodeJS.ErrnoException).code ?? look.failed.message
+    }); this machine's brain is in the store, so the brain tools keep working, and a tool ` +
+      "that needs the vault answers once it can be read (make it and every parent directory " +
+      "traversable, chmod u+rx)",
+  );
+}
+
+/** A switched machine's vault that cannot be reached, and why. */
+export interface UnreachableVault {
+  /** The configured vault. */
+  readonly vault: string;
+  /** The refusal a step that needs the vault answers with. */
+  readonly error: VaultUnexaminableError;
+  /** The short reason: the vault and what the look at it failed with. */
+  readonly reason: string;
+}
+
+/** The vault a caller works on, after the reachability decision. */
+export interface ServedVault {
+  /** The vault to work on; `null` serves the brain from the store, as with no vault. */
+  readonly vault: string | null;
+  /** Set when a switched machine's vault cannot be reached. */
+  readonly unreachable: UnreachableVault | null;
+}
+
+/**
+ * The one decision every surface (MCP, the command line, the hooks)
+ * takes about a configured vault: on a switched machine whose vault
+ * folder is gone or cannot be examined the brain is served from the
+ * store, as on a machine with no vault, and a step that needs vault files
+ * refuses with {@link UnreachableVault.error}. Every other vault is served
+ * as it is ({@link switchedVaultUnreachable}).
+ */
+export function servedVault(
+  vault: string | null,
+  context: Pick<StoreOnlyContext, "configPath"> = {},
+): ServedVault {
+  if (vault === null || vault.trim() === "") return { vault, unreachable: null };
+  const error = switchedVaultUnreachable(vault, context);
+  if (error === null) return { vault, unreachable: null };
+  const code = error.code ?? (error.cause as Error | undefined)?.message;
+  const reason =
+    code === "ENOENT"
+      ? `the vault ${vault} is not there (ENOENT)`
+      : `the vault ${vault} cannot be examined (${code})`;
+  return { vault: null, unreachable: { vault, error, reason } };
+}
+
+/**
+ * The notice a machine that has NOT switched gives when the vault its
+ * machine config names is gone: the folder may sit on a disk that is not
+ * mounted, and initialising a new brain beside it hides the real one.
+ */
+export interface ConfiguredVaultMissing {
+  /** The configured vault, whose folder is not there. */
+  readonly vault: string;
+  /** The notice, in words: what is missing and what to do about it. */
+  readonly notice: string;
+}
+
+/**
+ * The notice for a configured vault whose folder is not there, or `null`
+ * when there is nothing to report.
+ *
+ * It answers only on a machine that has NOT switched: a switched machine's
+ * brain is in the store, and its vault is only the human view, so
+ * {@link servedVault} already answers that case (and its folder being gone
+ * is not a fault there). A machine with no vault configured never reaches
+ * it - there is no folder to be missing - and a machine whose vault folder
+ * is there never reaches it either.
+ *
+ * A failed look is not an absence: a vault this process cannot examine
+ * (mode 000, an I/O error) is answered by {@link switchedVaultUnreachable}
+ * on a switched machine and refused by the readers otherwise. Only a
+ * folder that is simply not there is this notice.
+ */
+export function configuredVaultMissing(
+  vault: string | null,
+  context: Pick<StoreOnlyContext, "configPath"> = {},
+): ConfiguredVaultMissing | null {
+  if (vault === null || vault.trim() === "") return null;
+  if (lookAtDirectory(vault) !== "absent") return null;
+  // A look, never a write, as in `switchedVaultUnreachable`.
+  if (isSwitched({ vault, ...context }, { persistSwitch: false })) return null;
+  return {
+    vault,
+    notice:
+      `the configured vault folder ${vault} is missing; it may be on a disk that is not ` +
+      "mounted: mount it, or point the machine config at the vault, before initialising " +
+      "a new brain.",
+  };
+}
+
+/**
+ * Whether, and why, this machine writes to the store only. Throws
+ * {@link StoreOnlyUndeterminedError} when it cannot tell.
+ */
 export function storeOnlyMode(
   context: StoreOnlyContext = {},
   options: StoreOnlyOptions = {},
 ): StoreOnlyMode {
-  const vault = vaultOf(context);
-  if (isSwitched(context, options)) return { storeOnly: true, reason: "device-switched", vault };
-  if (!hasLegacyTree(vault)) return { storeOnly: true, reason: "no-legacy-tree", vault };
-  return { storeOnly: false, reason: "legacy", vault };
+  const answer = storeOnlyAnswer(context, options);
+  if (answer.reason === "undetermined") {
+    throw new StoreOnlyUndeterminedError(answer.vault, answer.cause);
+  }
+  return answer;
 }
 
-/** Whether this machine writes to the store only; see the module docblock. */
+/** Whether this machine writes to the store only; see the module docblock. Throws when it cannot tell. */
 export function isStoreOnly(
   context: StoreOnlyContext = {},
   options: StoreOnlyOptions = {},

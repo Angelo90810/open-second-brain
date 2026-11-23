@@ -26,11 +26,62 @@ The product SHALL ship one migration command that converts an existing legacy br
 - **THEN** the update names the migration it is about to run and the next session start (or the update itself) runs it, and the machine reports `done` when it has switched
 
 ### Requirement: Dry run first
-The migration command SHALL support a dry run that writes nothing and reports, per source path, how many items would move, to which stream or view page, and which items it cannot map.
+The migration command SHALL support a dry run that writes nothing and reports, per source path, how many items would move, to which stream or view page, and which items it cannot map. A sync tool's conflict copy of a file a mapping reads, and a sync tool's in-flight temp file, SHALL NOT be an unmapped entry; the dry run and the migration report (text and `--json`) SHALL carry a section that says, per surface, how many conflict-copy items would be or were imported as records, how many were identical to their original and added nothing, which copies were kept in the backup and not imported (each named with the file it is a version of), how many were dropped with their original's rule, and how many temp files were ignored. An entry the product does not know, a conflict copy of such an entry included, SHALL stay unmapped and SHALL stop the run. A file the product itself keeps beside a mapped file (the search index store's own database files and their journals, a writer's temp file, a lock) SHALL follow that file's rule and SHALL NOT be an unmapped entry.
 
 #### Scenario: Dry run on a live install
 - **WHEN** the user runs the migration with the dry-run flag
 - **THEN** no file changes anywhere, and the report lists counts per source and every unmapped item
+
+#### Scenario: A vault synced by Syncthing between two machines
+- **WHEN** the legacy tree holds Syncthing conflict copies of log shards, audit week shards, signal pages, the pinned context, the freshen state and a lock, and a `.syncthing.*.tmp` file
+- **THEN** the dry run exits 0, lists none of them as unmapped, and its sync conflict copies section names what each would become
+
+#### Scenario: An unknown file and a copy of it
+- **WHEN** the legacy tree holds a file no mapping covers and a conflict copy of it
+- **THEN** both are unmapped entries and the dry run exits 1
+
+### Requirement: Sync tool names are recognised in one place
+One function SHALL recognise the conflict copies of the sync tools the product names (the Syncthing `.sync-conflict-<date>-<time>-<device>` marker, the Dropbox and Nextcloud `(... conflicted copy <date> ...)`) and give the name of the file a copy is a version of, and one sibling SHALL recognise their in-flight temp files (`.syncthing.<name>.tmp`, `~syncthing~<name>.tmp`, the Nextcloud `.<name>.~<hex>`). A name that only contains the word conflict SHALL match neither.
+
+#### Scenario: A note about conflicts
+- **WHEN** the legacy tree holds `Brain/inbox/conflict-notes.md`
+- **THEN** it is read as the signal page it is, not as a conflict copy
+
+### Requirement: A record-shaped conflict copy is imported exactly once
+A conflict copy SHALL take the destination of the file it is a copy of. A JSONL copy's rows SHALL be imported like its original's; a row whose records its original or an earlier copy holds SHALL be stored once, and any other row SHALL be imported under a key built from the copy's own path and line, exactly once while the copy file is unchanged, across a resumed run, a later machine with the same copy and the transition import. A row a person later moves into the original, or a copy rewritten with its rows at other lines, is a new row and SHALL be imported as one. The rollback SHALL restore the copy byte for byte and SHALL NOT write its rows into the original.
+
+#### Scenario: A row only the copy holds
+- **WHEN** a Brain log shard and its conflict copy share one row and the copy holds one more
+- **THEN** the store holds the shared row once and the copy's own row once, and a resumed run, a later machine and the transition import add no second record
+
+#### Scenario: A copy that arrives after the switch
+- **WHEN** sync delivers a conflict copy of a log shard to a machine that already switched
+- **THEN** the transition import imports its own rows once
+
+### Requirement: A differing version is kept, not merged
+A copy of a one-item-per-file record (a signal page, a preference page, a lane entry) or of a single document (the pinned context, the settings file) that equals its original SHALL add nothing. One that differs SHALL be kept in the migration backup and named in the report as kept, not imported, never merged and never a second record; a record copy whose original is gone SHALL be imported as that item. After the switch the doctor SHALL name the kept copies once, as advice that stops nothing.
+
+#### Scenario: Two versions of one signal
+- **WHEN** a signal page has two conflict copies that differ from it
+- **THEN** the signal is imported once, both copies are kept in the backup and named as kept, not imported, and the doctor names them once as advice
+
+### Requirement: Dropped copies and temp files never block
+A copy of a device-local, derived or dropped surface SHALL follow its original's rule and SHALL never be moved into device-local state. A sync temp file SHALL be ignored by the dry run, every import pass, the transition import and the removal's convergence check, and counted in the report; once it becomes the real file, the next pass SHALL import it. The removal SHALL move every conflict copy and temp file to its archive with the tree.
+
+#### Scenario: A temp file that becomes the real file
+- **WHEN** a `.syncthing.<name>.tmp` file is renamed onto its real name between two passes
+- **THEN** the next pass imports the file and the migration verifies it
+
+#### Scenario: The removal with copies present
+- **WHEN** the legacy tree leaves the vault while it holds conflict copies and a temp file
+- **THEN** the removal converges and every copy and the temp file are in its archive
+
+### Requirement: A running migration says how far it is
+While a migration of this machine runs, the status block and the doctor SHALL say how many legacy items its import has journaled of about how many its dry run planned, read from a small file the run rewrites after every batch it writes, never by counting the journal.
+
+#### Scenario: Status during a long import
+- **WHEN** the automatic migration has imported part of a large vault
+- **THEN** the status block and the doctor name the run as running and say how many legacy items it has imported so far of about how many
 
 ### Requirement: Quiesce and back up before moving
 A real migration SHALL first stop this machine's legacy writers through a device-local gate that drains in-flight writes, then snapshot the `Brain/` tree and back up every non-rebuildable per-vault surface (secrets, keys, attestations, checkpoints) explicitly, verify each backup by a test restore, and SHALL refuse to start if any step fails. Writes attempted on this machine during the migration SHALL be refused with a message saying a migration is in progress.
@@ -42,6 +93,32 @@ A real migration SHALL first stop this machine's legacy writers through a device
 #### Scenario: Snapshot fails
 - **WHEN** the snapshot cannot be written because the disk is full
 - **THEN** the migration stops before moving anything and says why
+
+### Requirement: Every writer of the vault is refused while the gate names it
+While this machine's migration gate names a vault, every write into that vault SHALL be refused: from any CLI verb, MCP tool, hook or background worker, on every path (content, Brain log and audit records, per-vault state, caches kept in the vault). The rollback and the legacy tree removal hold the same gate and SHALL refuse the same writes. Only the run's own snapshot SHALL pass. Writes into another vault SHALL proceed.
+
+#### Scenario: A log note during migration
+- **WHEN** `o2b brain note` or `brain_note` runs on the migrating machine mid-migration
+- **THEN** it is refused and no Brain log file is written or changed
+
+#### Scenario: Another vault's migration
+- **WHEN** the gate on this machine names another vault
+- **THEN** writes into this vault proceed
+
+#### Scenario: A hook during migration
+- **WHEN** the session start, prompt or stop hook runs while the gate names the vault
+- **THEN** the hook exits successfully, writes nothing into the vault, and shows at most one notice line
+
+### Requirement: The refusal says what runs and what to do
+The refusal SHALL name the run that holds the gate (a migration, its rollback or the legacy tree removal), since when it holds it, how far it is when the run reported that, and, when its process is gone, what continues it: the next start for an automatic migration, or the command. An MCP caller SHALL receive the structured refusal `migration_in_progress` saying whether to retry later or to recover the run first.
+
+#### Scenario: A running migration
+- **WHEN** a write is refused while the migration runs
+- **THEN** the message names the migration, since when it runs and its progress, and an MCP caller is told to retry later
+
+#### Scenario: A stopped migration still holds the gate
+- **WHEN** the migration's process is gone and its gate remains
+- **THEN** a write is refused with a message saying the run stopped, that the next start continues an automatic migration, and naming `o2b brain migrate-store --resume`
 
 ### Requirement: Verified counts
 After converting, the migration SHALL re-scan every source and import whatever changed or grew since it was journaled, repeating until a pass imports nothing. It SHALL then verify that every source record exists in the store with the same content checksum, and SHALL report the counts.
@@ -58,15 +135,23 @@ After the legacy tree leaves the vault, the vault SHALL contain no Open Second B
 - **THEN** a dated copy exists in device-local state and nothing was deleted
 
 ### Requirement: Removal waits for the migration cohort
-The legacy tree SHALL leave the vault only when every device in the durable migration cohort (every device id found in the legacy tree, with no age limit) has switched or been retired, or when the user forces it with a report naming the devices that will stop receiving data.
+The legacy tree SHALL leave the vault only when every device in the durable migration cohort (every device id found in the legacy tree) has switched, been retired by a human record, or been retired by silence, or when the user forces it with a report naming the devices that will stop receiving data. The removal SHALL stay the user's command: nothing SHALL remove the tree automatically. The removal report (text and `--json`) SHALL name the devices that switched and, apart from them, each device retired by silence with its last evidence date, and the `legacy-tree-removed` record SHALL carry the devices retired by silence and the threshold.
 
 #### Scenario: All machines switched
 - **WHEN** every roster device has switched and the view target is inside the vault
 - **THEN** the vault holds the view folder and the user's own notes, and no other Open Second Brain file
 
 #### Scenario: One machine still on the old release
-- **WHEN** machine B has not upgraded yet
-- **THEN** the legacy tree stays in the vault, B keeps working on it, and doctor on upgraded machines names B as still on the legacy layout
+- **WHEN** machine B has not upgraded yet and wrote within the threshold
+- **THEN** the legacy tree stays in the vault, B keeps working on it, and doctor on upgraded machines names B as pending with its last evidence date
+
+#### Scenario: A device id of a machine that no longer exists
+- **WHEN** the cohort names device C, whose last evidence is older than the threshold, and every other cohort device switched
+- **THEN** the removal without `--force` moves the tree, its report names C as retired by silence with its last evidence date, and the `legacy-tree-removed` record lists C
+
+#### Scenario: The rule turned off
+- **WHEN** `migration.silent_device_days` is 0
+- **THEN** no device is retired by silence and the cohort has no age limit
 
 ### Requirement: Machines migrate independently
 Each machine SHALL switch to the store when the user runs the migration on it. A later machine SHALL wait until its copy of the store holds every record named in the first machine's completion record, then import its own legacy records that the store lacks (matched by checksum), move its own device-local state and record that it switched.
@@ -87,11 +172,52 @@ Until the legacy tree leaves the vault, a switched machine SHALL import new or g
 - **THEN** an upgraded machine imports it into the store once, and doctor reports the old machine's device id as still on the legacy layout
 
 ### Requirement: Legacy tree regeneration is detected
-Doctor SHALL report when a legacy `Brain/` machine directory reappears in the vault after migration, and SHALL name the writer when the file carries one.
+Doctor SHALL report when a legacy `Brain/` machine directory reappears in the vault after migration, and SHALL name the writer when the file carries one. When the reappeared files name a device that the removal record lists as retired by silence, the report SHALL say so and SHALL tell the user to update that machine, whose migration then imports its legacy records as a later machine.
 
 #### Scenario: Agent follows stale instructions
 - **WHEN** an agent creates `Brain/preferences/` in the vault after migration
 - **THEN** doctor reports the directory and the agent name found in it
+
+#### Scenario: A device retired by silence comes back on an old release
+- **WHEN** device C, retired by silence when the tree left, writes a legacy log shard into the vault again
+- **THEN** doctor reports the directory, names C as retired by silence and says to update that machine and remove the tree again afterwards
+
+### Requirement: A silent device counts as retired
+A cohort device that has not switched SHALL count as retired by silence when its last evidence of life is older than the shared setting `migration.silent_device_days` (default 30; 0 turns the rule off). Its last evidence SHALL be the newest of its legacy shard name dates, their row times and the clocks of its store records, or else the earliest cohort record naming it; file modification times SHALL NOT be evidence. For every shard naming scheme the newest row time SHALL date the shard when it is later than the name's period (a day, a month, an ISO week), which SHALL only be a floor; a row time is any top-level ISO 8601 time field of the row (`ts`, `timestamp`, `time`, `at`, any `*_at` or `*At` field) except one that names a time still to come (an expiry, a retry, a schedule).
+
+#### Scenario: A monthly shard whose rows are later than the month
+- **WHEN** a device's only shard is a continuity shard named for the month and its newest row carries `createdAt` four days into that month
+- **THEN** its last evidence is that row time, not the month's first day, wherever the status, the doctor and the dry run show it
+
+#### Scenario: An id with no dated trace
+- **WHEN** the cohort record names device D and no legacy shard or store record of D carries a date
+- **THEN** D is retired by silence once the threshold has passed since the cohort record, and an id named by no cohort record and with no date is never retired by silence
+
+### Requirement: The age of a device is measured against the evidence
+The age of a device's last evidence SHALL be measured against the newest evidence of any device that is not later than this machine's wall clock, evidence later than the wall clock SHALL be left out of that reference rather than taken as the wall clock, and evidence later than the reference SHALL count as the reference, so a wrong clock is bounded by the dates actually written.
+
+#### Scenario: A clock far in the future on another machine
+- **WHEN** a device's rows carry a time years ahead of this machine's clock
+- **THEN** that device counts as alive now and no other device is retired because of it
+
+### Requirement: The state of each cohort device is shown and derived
+The retirement by silence SHALL be derived on every read and never recorded: a device that writes again SHALL be pending again at once when what it writes carries a date within the threshold of the reference (a date later than the reference counts as the reference), and a write stamped older than that SHALL leave it retired by silence. Doctor and the store status SHALL list each cohort device as switched, pending with its last evidence date, or retired by silence with the date and the threshold, and once none is pending SHALL say, as advice and not as a warning, that the legacy tree can leave the vault and name the removal command. Every surface that names the devices still on the legacy layout (`o2b brain migrate-store` on a switched machine, text and `--json`, the removal report, doctor, the store status) SHALL take them from that one judgement: a device retired by silence SHALL NEVER be named as still on the legacy layout.
+
+#### Scenario: The transition report on a switched machine
+- **WHEN** `o2b brain migrate-store` runs on a switched machine whose cohort holds a pending device and devices retired by silence
+- **THEN** its line of devices still on the legacy layout and its `legacy_devices` name the pending device only, with its last evidence date, and the devices retired by silence are named apart, as the doctor and the status name them
+
+#### Scenario: A stale id stops holding the tree
+- **WHEN** device C last wrote 40 days before the newest evidence of the store and the threshold is 30
+- **THEN** doctor lists C as retired by silence with its last evidence date and the threshold, and says the legacy tree can leave the vault with `o2b brain migrate-store --remove-legacy`
+
+#### Scenario: A retired device writes again
+- **WHEN** device C, retired by silence, writes a legacy log shard dated today while the tree is still in the vault
+- **THEN** doctor lists C as pending again and the removal without `--force` refuses and names it
+
+#### Scenario: A device that returns on the new release after the removal
+- **WHEN** device C, retired by silence, updates after the tree left the vault and its local copy of the tree is gone
+- **THEN** it writes the store only by the no-legacy-tree rule and its start records no switch from the removal record, because a vault without its tree carries no identity marker to match that record to and another vault whose tree has not arrived yet looks the same; `o2b init --vault` on that machine records its switch, and only records it wrote after its last sync and never synced are lost
 
 ### Requirement: Path discovery for outside readers
 The CLI and MCP server SHALL expose the current store root and view target, so skills, hooks and plugins resolve paths by asking instead of hard-coding them. Shipped skills SHALL refer only to tools and these commands, never to store file paths.
@@ -112,7 +238,15 @@ The user SHALL be able to roll a machine back to the legacy layout until the leg
 - **THEN** the topics stay in the store, and the rollback report lists them
 
 ### Requirement: The automatic migration runs in its own process
-The automatic migration SHALL NOT run inside the session start hook or the MCP server process. Detection at a start SHALL be a cheap read when nothing is to do; the migration itself SHALL run in a detached worker process that one per-vault, per-machine lock admits, and a slow or hung worker SHALL NOT delay the start.
+The automatic migration SHALL NOT run inside the session start hook or the MCP server process. Detection at a start SHALL be a cheap read when nothing is to do; the migration itself SHALL run in a detached worker process that one per-vault, per-machine lock admits, and a slow or hung worker SHALL NOT delay the start. The worker SHALL run under the runtime that runs the start, named by its absolute path, never one looked up on PATH, and SHALL be detached on every platform so it outlives the start's process and its terminal. A worker that cannot be started, or that exits before it confirms the claim it was handed, SHALL be recorded as a failed attempt (with the spawn error, or with its exit and the tail of its error output and the device-local log that holds it) under the retry and cooldown rules, and status, doctor and the session start notice SHALL say so with the manual command; such a worker SHALL NEVER leave a silent "pending".
+
+#### Scenario: A start with no Bun on PATH
+- **WHEN** a session starts under an absolute runtime path while PATH holds no Bun (an ssh session, an agent a macOS GUI started)
+- **THEN** the worker starts under that runtime and runs its attempt to its outcome
+
+#### Scenario: A worker that exits before it starts
+- **WHEN** the worker a start spawned exits before it confirms its claim
+- **THEN** the start that spawned it, when it still runs, or else the next start records a failed attempt naming the worker's process, its exit when seen, its error output and the log; that start starts nothing until the cooldown has run out, and status and doctor name the failure, also before any start recorded it
 
 #### Scenario: Two starts at once
 - **WHEN** two agents start at once on one machine while a migration is available

@@ -34,6 +34,12 @@ import { REMOTE_DENY_VISIBILITY_TOKEN, normToken } from "../core/graph/visibilit
 import { searchAcrossVaults } from "../core/search/cross-vault.ts";
 import { fileContextRecall } from "../core/brain/file-recall.ts";
 import { withTimeout } from "../core/search/with-timeout.ts";
+import { rethrowVaultUnreadable } from "./vault-unreachable.ts";
+import {
+  IndexBuildingError,
+  IndexBuildStartFailedError,
+  IndexBuildStartingError,
+} from "../core/search/build-progress.ts";
 import {
   defaultConfigPath,
   resolveRecallAdequacyThresholds,
@@ -818,6 +824,15 @@ export function searchErrorToMcp(e: SearchError): MCPError {
   if (e.code === "EMBEDDING_QUOTA_EXHAUSTED") {
     return new MCPError(INTERNAL_ERROR, EMBEDDING_QUOTA_MESSAGE, data);
   }
+  // A missing index that a running rebuild is building: its own message
+  // says how far it is, and the command below would only queue behind it.
+  if (
+    e instanceof IndexBuildingError ||
+    e instanceof IndexBuildStartingError ||
+    e instanceof IndexBuildStartFailedError
+  ) {
+    return new MCPError(INTERNAL_ERROR, e.message, data);
+  }
   if (e.code === "INDEX_MISSING") {
     return new MCPError(
       INTERNAL_ERROR,
@@ -1085,6 +1100,9 @@ async function toolBrainSearch(
     );
     if (e instanceof SearchError) throw searchErrorToMcp(e);
     if (e instanceof MCPError) throw e;
+    // A vault that cannot be reached keeps its class: the boundary answers
+    // it as the named refusal `vault_unreadable`, not a code-less error.
+    rethrowVaultUnreadable(e);
     throw new MCPError(INTERNAL_ERROR, e instanceof Error ? e.message : String(e));
   }
 
@@ -1712,6 +1730,9 @@ async function toolBrainEval(
   } catch (e) {
     if (e instanceof SearchError) throw searchErrorToMcp(e);
     if (e instanceof MCPError) throw e;
+    // A vault that cannot be reached keeps its class: the boundary answers
+    // it as the named refusal `vault_unreadable`, not a code-less error.
+    rethrowVaultUnreadable(e);
     throw new MCPError(INTERNAL_ERROR, e instanceof Error ? e.message : String(e));
   }
   return {
@@ -1828,10 +1849,17 @@ async function toolBrainFileContext(
         title: r.title,
         score: r.score,
       })),
+      // Present only when the search reported any: a partial index (still
+      // being built) must not read as "this file has no prior work".
+      ...(outcome.warnings.length > 0 ? { warnings: outcome.warnings } : {}),
+      ...(outcome.degraded.length > 0 ? { retrieval_degraded: outcome.degraded } : {}),
     };
   } catch (e) {
     if (e instanceof SearchError) throw searchErrorToMcp(e);
     if (e instanceof MCPError) throw e;
+    // A vault that cannot be reached keeps its class: the boundary answers
+    // it as the named refusal `vault_unreadable`, not a code-less error.
+    rethrowVaultUnreadable(e);
     throw new MCPError(INTERNAL_ERROR, e instanceof Error ? e.message : String(e));
   }
 }
@@ -1873,6 +1901,22 @@ const SEARCH_EXPAND_INPUT_SCHEMA: Record<string, unknown> = {
       description: "Pagination cursor returned as next_cursor by a prior expand call.",
     },
     agent_scope: AGENT_SCOPE_SCHEMA,
+    visibility: {
+      type: "array",
+      items: { type: "string" },
+      description:
+        "The brain_search visibility scope that gave the card: untagged pages always match, tagged ones only when it names one of their values. Absent = untagged pages only.",
+    },
+    session_scope: {
+      type: "string",
+      description:
+        "The session scope of the brain_search call that handed out the card. Absent = no session filtering.",
+    },
+    project_scope: {
+      type: "string",
+      description:
+        "The project scope of the brain_search call that handed out the card. Absent = no project filtering.",
+    },
   },
   required: ["chunk_id"],
   additionalProperties: false,
@@ -1935,6 +1979,11 @@ async function toolBrainSearchExpand(
   const rawLimit = coerceIntInRange(args, "raw_limit", 1, MCP_LIMIT_MAX);
   const cursor = coerceStringOptional(args, "cursor", 32);
   const expandScope = coerceAgentScope(ctx, args, false);
+  // The same visibility and session/project arguments brain_search takes,
+  // parsed the same way: the drill-down withholds what that search did.
+  const visibility = parseVisibilityArgument(args["visibility"]);
+  const sessionScope = coerceStringOptional(args, "session_scope", 128);
+  const projectScope = coerceStringOptional(args, "project_scope", 128);
   const config = resolveSearchConfig({
     vault: ctx.vault,
     configPath: ctx.configPath ?? undefined,
@@ -1946,6 +1995,15 @@ async function toolBrainSearchExpand(
         chunkId: rawChunk,
         transportReach: contextReach(ctx),
         ...(expandScope !== undefined ? { agentScope: expandScope } : {}),
+        ...(visibility !== undefined ? { visibility } : {}),
+        ...(sessionScope !== undefined || projectScope !== undefined
+          ? {
+              scope: {
+                ...(sessionScope !== undefined ? { session: sessionScope } : {}),
+                ...(projectScope !== undefined ? { project: projectScope } : {}),
+              },
+            }
+          : {}),
         ...(rawLimit !== undefined ? { rawLimit } : {}),
         ...(cursor !== undefined ? { cursor } : {}),
       }),
@@ -1955,6 +2013,9 @@ async function toolBrainSearchExpand(
   } catch (e) {
     if (e instanceof SearchError) throw searchErrorToMcp(e);
     if (e instanceof MCPError) throw e;
+    // A vault that cannot be reached keeps its class: the boundary answers
+    // it as the named refusal `vault_unreadable`, not a code-less error.
+    rethrowVaultUnreadable(e);
     throw new MCPError(INTERNAL_ERROR, e instanceof Error ? e.message : String(e));
   }
   // Delivery shaping (delivery-trust, lane A): the drill-down bodies are

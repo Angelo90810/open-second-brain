@@ -26,11 +26,15 @@
  * stale entry), so the list stays exactly the set of modules that still
  * name the tree.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 
 import { lexSource } from "../../helpers/source-lexer.ts";
+import { SOURCE_SCAN_BUDGET_MS } from "../../helpers/source-scan-timeout.ts";
+
+// A test here reads the whole source tree; see tests/helpers/source-scan-timeout.ts.
+setDefaultTimeout(SOURCE_SCAN_BUDGET_MS);
 
 const REPO = join(import.meta.dir, "..", "..", "..");
 const SRC = join(REPO, "src");
@@ -65,6 +69,7 @@ const FIXTURE = "builds a throwaway fixture vault (bench, doctor self-test) whos
 const ALLOWLIST: Readonly<Record<string, string>> = Object.freeze({
   "src/cli/aider.ts": TEXT,
   "src/cli/brain/help-text.ts": TEXT,
+  "src/cli/brain/snapshot-render.ts": TEXT,
   "src/cli/brain/verbs/bridges.ts": LANE,
   "src/cli/brain/verbs/clusters.ts": LANE,
   "src/cli/brain/verbs/continuity.ts": TEXT,
@@ -88,6 +93,7 @@ const ALLOWLIST: Readonly<Record<string, string>> = Object.freeze({
   "src/core/brain/architect/decisions.ts": LANE,
   "src/core/brain/architect/generate.ts": LANE,
   "src/core/brain/capture/capture-note.ts": TEXT,
+  "src/core/brain/claim-graph.ts": LABEL,
   "src/core/brain/config-template.ts": TEXT,
   "src/core/brain/context-pack.ts": LABEL,
   "src/core/brain/continuity/promote-host-memory.ts": TEXT,
@@ -131,7 +137,6 @@ const ALLOWLIST: Readonly<Record<string, string>> = Object.freeze({
   "src/core/brain/permissions/document.ts": ADAPTER,
   "src/core/brain/policy/load.ts": TEXT,
   "src/core/brain/portability/knowledge-pack.ts": TEXT,
-  "src/core/brain/portability/role-tokens.ts": ADAPTER,
   "src/core/brain/preference.ts": TEXT,
   "src/core/brain/procedural-graph.ts": LANE,
   "src/core/brain/procedural-memory.ts": LANE,
@@ -154,7 +159,7 @@ const ALLOWLIST: Readonly<Record<string, string>> = Object.freeze({
   "src/core/brain/upgrade.ts": MIGRATION,
   "src/core/brain/watchdog.ts": LABEL,
   "src/core/brain/wikilink.ts": LABEL,
-  "src/core/brain/write-session/panel.ts": NOTE_WALL,
+  "src/core/brain/write-session/panel-target.ts": NOTE_WALL,
   "src/core/brain/write-session/personas.ts": LANE,
   "src/core/brain/write-session/store.ts": LANE,
   "src/core/brain/write-session/validate.ts": NOTE_WALL,

@@ -16,7 +16,11 @@
  *    ones, newest done first. A completion proposed without standing (a
  *    decision model, an agent with no evidence) shows as "looks done,
  *    confirm" and the milestone stays open.
- *  - Decisions: newest first, each with the milestones it serves.
+ *  - Decisions: newest first, each with the milestones it serves. A
+ *    decision derived from a held decision event (`held-decisions.ts`,
+ *    when the caller passes a fold it augmented) says whether it closed
+ *    an open decision and its outcome, and takes only the page slots the
+ *    recorded decisions leave.
  *  - Open questions: unresolved questions, then the goal proposals that
  *    lost to the user's goal, attributed to their agent.
  *  - Log: earned entries only (`TOPIC_EARNED_LOG_CLASSES`), newest first.
@@ -34,6 +38,7 @@
  * what it shows, so an edit maps back to a topic record (`topic-edits.ts`).
  */
 
+import { heldRecordCounts } from "../topics/held-records.ts";
 import { compareCodeUnits } from "../store/compare.ts";
 import {
   TOPIC_EARNED_LOG_CLASSES,
@@ -135,9 +140,17 @@ function sections(topic: TopicState, includePrivate: boolean): Sections {
     .filter((i) => i.done !== undefined)
     .toSorted((a, b) => b.done!.at - a.done!.at);
   const decisions = shown
-    .filter((i) => i.kind === "decision")
+    .filter((i) => i.kind === "decision" && i.derived === undefined)
     .toReversed()
     .toSorted(newestFirst);
+  // Decisions derived from held decision events take only the page slots
+  // the recorded decisions leave, so none of those ever moves for one.
+  const derived = shown
+    .filter((i) => i.kind === "decision" && i.derived !== undefined)
+    .toReversed()
+    .toSorted(newestFirst);
+  const kept = decisions.slice(0, TOPIC_PAGE_BUDGET.decisions);
+  const free = TOPIC_PAGE_BUDGET.decisions - kept.length;
   const questions = shown.filter((i) => i.kind === "open-question");
   const log = shown
     .filter((i) => i.kind === "log-entry" && TOPIC_EARNED_LOG_CLASSES.has(i.logClass!))
@@ -147,8 +160,11 @@ function sections(topic: TopicState, includePrivate: boolean): Sections {
     milestonesOpen: milestones.filter((i) => i.done === undefined),
     milestonesDone: done.slice(0, TOPIC_PAGE_BUDGET.doneMilestones),
     milestonesArchived: done.slice(TOPIC_PAGE_BUDGET.doneMilestones),
-    decisions: decisions.slice(0, TOPIC_PAGE_BUDGET.decisions),
-    decisionsArchived: decisions.slice(TOPIC_PAGE_BUDGET.decisions),
+    decisions: [...kept, ...derived.slice(0, free)].toSorted(newestFirst),
+    decisionsArchived: [
+      ...decisions.slice(TOPIC_PAGE_BUDGET.decisions),
+      ...derived.slice(free),
+    ].toSorted(newestFirst),
     questions: questions.filter((i) => i.resolved === undefined),
     resolved: questions
       .filter((i) => i.resolved !== undefined)
@@ -173,6 +189,8 @@ interface LineContext {
   readonly topic: TopicState;
   readonly strings: ViewStrings;
   readonly key: (rest: string) => string;
+  /** How many records the topic holds (`heldRecordCounts`, built once per render). */
+  readonly held: number;
 }
 
 /**
@@ -206,7 +224,15 @@ function decisionLine(c: LineContext, item: TopicItem): PageLine {
     return milestone === undefined ? [] : [plainText(milestone.text)];
   });
   const serves = served.length > 0 ? ` (${c.strings.serves(served.join("; "))})` : "";
-  return { key: itemKey(item, `d:${item.id}`), text: `- ${plainText(item.text)}${serves}` };
+  const resolved = item.derived?.resolved === true ? ` (${c.strings.decisionResolved})` : "";
+  const outcome =
+    item.derived?.outcome != null
+      ? ` (${c.strings.decisionOutcome(plainText(item.derived.outcome))})`
+      : "";
+  return {
+    key: itemKey(item, `d:${item.id}`),
+    text: `- ${plainText(item.text)}${serves}${resolved}${outcome}`,
+  };
 }
 
 function questionLine(c: LineContext, item: TopicItem): PageLine {
@@ -270,6 +296,18 @@ function relatedLines(
       text: `- ${strings.mergedFrom(plainText(merged.title))}`,
     });
   }
+  // The notes and signals the topic holds are not page items (routine
+  // unless earned, spec "Log entries are earned", design D10 `event_kind`;
+  // its decisions show as decision items when the reader derived them,
+  // `held-decisions.ts`); the line says how many records there are and how
+  // to list them.
+  const held = c.held;
+  if (held > 0) {
+    out.push({
+      key: c.key("held"),
+      text: `- ${strings.heldRecords(held, `o2b topic show ${topic.id} --held`)}`,
+    });
+  }
   if (archive) {
     out.push({
       key: c.key("archive"),
@@ -286,10 +324,17 @@ function topicPage(
   folders: ReadonlyMap<string, string>,
   strings: ViewStrings,
   includePrivate: boolean,
+  held: ReadonlyMap<string, number>,
 ): PageModel[] {
   const folder = folders.get(topic.id)!;
   const page = `${folder}/${VIEW_TOPIC_PAGE}`;
-  const c: LineContext = { includePrivate, topic, strings, key: (rest) => `t:${topic.id}:${rest}` };
+  const c: LineContext = {
+    includePrivate,
+    topic,
+    strings,
+    key: (rest) => `t:${topic.id}:${rest}`,
+    held: held.get(topic.id) ?? 0,
+  };
   const s = sections(topic, includePrivate);
   const archive = hasArchive(s);
   const lines: PageLine[] = [topicIdLine(storeId, page, topic.id), BLANK];
@@ -385,7 +430,8 @@ export function topicPages(
 ): PageModel[] {
   const folders = topicFolders(fold, options);
   const includePrivate = options.includePrivate === true;
+  const held = heldRecordCounts(fold);
   return renderedTopics(fold, options).flatMap((topic) =>
-    topicPage(storeId, fold, topic, folders, strings, includePrivate),
+    topicPage(storeId, fold, topic, folders, strings, includePrivate, held),
   );
 }

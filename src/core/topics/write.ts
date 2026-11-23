@@ -48,7 +48,7 @@ import {
   type TopicRecordKind,
 } from "./constants.ts";
 import { readTopics, type TopicRead } from "./read.ts";
-import { isTopicItemKind, topicBodyRejection } from "./records.ts";
+import { canonicalTopicScope, isTopicItemKind, topicBodyRejection } from "./records.ts";
 
 /** One topic record to write. */
 export interface TopicEvent {
@@ -63,6 +63,19 @@ export interface TopicEvent {
 }
 
 export type TopicWriteFailure = "invalid" | "unknown-topic" | "unreadable";
+
+/**
+ * The code a refused topic action or write answers with on the MCP wire
+ * (`brain_topic`): `topic_` and the reason. A refused action
+ * (`TopicActionError`, an assign of a record no topic can hold among
+ * them) is `topic_invalid`, the code of an invalid write.
+ */
+export type TopicRefusalCode = `topic_${TopicWriteFailure}`;
+
+/** The wire code of a refused topic write, or of a refused action (`invalid`). */
+export function topicRefusalCode(reason: TopicWriteFailure): TopicRefusalCode {
+  return `topic_${reason}`;
+}
 
 /** A topic write refused before anything was written. */
 export class TopicWriteError extends Error {
@@ -100,7 +113,7 @@ export function createTopicEvent(input: {
     authority: input.authority,
     body: {
       title: input.title.trim(),
-      scope: input.scope,
+      scope: canonicalTopicScope(input.scope),
       ...(input.description !== undefined ? { description: input.description } : {}),
       ...(input.goal !== undefined ? { goal: input.goal } : {}),
     },

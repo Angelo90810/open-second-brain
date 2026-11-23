@@ -253,7 +253,7 @@ store into the `view_target` folder:
 | --- | --- |
 | `about-me.md` | What the brain knows about you: confirmed rules, grouped by subject |
 | `history/<YYYY>-W<ww>.md` | One page per week of what happened, in plain language |
-| `decisions.md` | Decisions that were recorded |
+| `decisions.md` | Decisions that were recorded, each as its title with the option chosen (an event that carries no title is named by the title of its decision page, a shared one; the choice alone when there is none) |
 | `topics/<date>-<slug>/topic.md` | One page per shared topic: status, goal, milestones, decisions, open questions, log and related, with an `archive.md` beside it for older entries |
 | `reports/<entry>.md` | One page per research report |
 | `sources/<entry>.md` | One page per ingested source summary |
@@ -349,6 +349,77 @@ If the view writer stays silent for more than 3 days, doctor on every
 machine reports `view-writer-silent` and names the command to move the
 role. Pages go stale meanwhile, but no data is lost.
 
+### The dream owner
+
+Exactly one device runs live dream passes on the brain: the **dream
+owner**, one agent installation on one device. The installation that
+creates the brain (`o2b init`, `o2b store init`) becomes the owner when
+its agent name is known; with no agent name the brain has no owner and
+the command prints how to choose one. Attaching another device, running
+init again, the migration and starting another agent's plugin never
+change the owner. Ask who it is on any machine:
+
+```bash
+o2b dream owner
+```
+
+The answer names the owner's device and agent, whether this machine is
+the owner, the revision and a transfer in progress. To move the role,
+run `o2b dream owner --here` on the machine that should own dream: on
+the owner's machine `--agent <name>` changes the agent at once; on
+another machine it records a request, and the owner's machine hands the
+role over the next time it looks (a dream pass, `o2b dream owner`, or a
+session start). `--here --force` takes the role at once when the old
+owner is lost; that machine may keep running passes until its first
+catch-up after the forced claim reaches it. `--release` gives the role
+up. Agents use the MCP tool `brain_dream_owner` (`status`, and `take`
+and `release` at local reach).
+
+On every other machine a live `o2b brain dream`, its staged lifecycle,
+`brain_dream` and the maintenance lane's dream task are refused with
+`dream_not_owner` before anything is asked or written (the lane skips
+its dream task and runs the rest); dry runs answer everywhere. A machine
+that took the role by its own claim runs its first live pass from the
+look after the one that first saw it, so a rival claim still in transit
+has a chance to arrive.
+
+A brain from before the dream owner has no owner record and works as
+before (a live pass from any machine) until you adopt it with
+`o2b dream owner --here` on the machine that should own dream; a
+declared `primary_agent` is shown as the requested owner. Run a release
+with the dream owner on every machine of the brain before you rely on
+the role: an older binary does not know the gate.
+
+### The dream work queue
+
+Some dream work needs a model: today the summary a fired rollup rung
+asks for. A live pass on the dream owner's machine records that work as
+an item in the store's `dream-work` stream instead of dropping it, so it
+survives a crash, a restart and an owner transfer. An item built from
+private records stays in the `private` partition with everything later
+written about it; a machine without that partition sees none of it.
+
+```bash
+o2b dream queue
+```
+
+lists the items by state (waiting, leased, accepted, parked, finished,
+closed), how long the oldest ready item has waited and every parked
+item with its reason; `o2b dream owner` and doctor show the same
+counts. Work on one chain waits behind a stuck item, unrelated work
+does not.
+
+This version has nothing that answers queued work yet. Waiting means
+exactly that: the item is kept, it is never decided by a fixed rule in
+place of an answer, and no surface counts it as done; the pass summary
+reports it under `model_work` and doctor says so once
+(`dream-queue-no-executor`). A later release adds the executors that
+take and answer items. An item that fails its checks five times is
+parked and named by doctor; `o2b dream queue retry <id>` offers it
+again and `o2b dream queue cancel <id> --reason <text>` closes it, both
+on the owner's machine. A brain with no dream owner, and one whose
+records still live in the legacy tree, has no queue.
+
 ### Editing pages on a phone
 
 Sync the view folder to your phone and edit a page in any Markdown editor.
@@ -395,6 +466,36 @@ background worker (`o2b brain migrate-store --auto`) and goes on at once:
 the check is a cheap read, and nothing in the hook or the server waits for
 the worker. One worker runs per vault per machine; a second agent starting
 at the same moment finds it running and starts nothing.
+
+The worker runs under the same Bun that runs the session start or the
+server, named by its absolute path, so a start whose `PATH` holds no Bun
+(an ssh session, an agent started from the macOS desktop) still starts it;
+only a process that does not run under Bun (the OpenClaw bundle under Node)
+falls back to the `scripts/o2b` launcher, which looks Bun up on `PATH`
+and in `~/.bun/bin`. The worker is detached on every platform: it leads a
+session of its own on Linux and macOS and is not ended with its parent on
+Windows, so it outlives the hook process and the terminal that started it.
+Its log goes to a small device-local file beside its state
+(`<state dir>/open-second-brain/stores/auto-migration/<vault key>.worker.log`:
+one timed line when it starts, one per step of the migration (each new
+step at once, the import's counts at most every 30 seconds), its outcome
+with how long it took, and any error output;
+replaced at every start of a worker, and cut to its newest 16 KiB of
+whole lines whenever it passes 64 KiB within one run). When this checkout
+lost its dependency tree while the start was running (a marketplace
+replacement that removed `node_modules`), the worker starts through a
+small bootstrap entry that first runs `bun install --frozen-lockfile` in
+the checkout with the same Bun, as the launcher would; the rule is the
+launcher's own (the probe file its precheck reads, and
+`O2B_SKIP_DEP_BOOTSTRAP`). A worker that cannot be started, or
+that exits before it confirms the claim the start handed it, is recorded
+as a failed attempt with the reason (the error of the start, or the
+worker's exit, the end of its error output and the log's path), by the
+start that spawned it when that process still runs, or else by the next
+start, which then starts nothing until the cooldown below has run out.
+Status, doctor and the session start notice name it, with
+`o2b brain migrate-store` to run it by hand, already before a start
+recorded it.
 
 The worker:
 
@@ -580,7 +681,12 @@ the next start will do about it, and the `migration.automatic` field of
 `o2b status --json` and doctor report the state: not needed, pending,
 running, waiting for another device, failed, done, or rolled back. All of
 these, and the session start line, restate the one decision the worker
-takes, so they never disagree with what the next start does.
+takes, so they never disagree with what the next start does. While a
+migration runs they also say how far its import is: how many legacy items
+it has imported so far of about how many its dry run planned (`progress`,
+with `journaled` and `planned`, under `--json`), read from a small file
+the run rewrites after every batch it writes. The import writes items in
+batches, so a vault of several hundred thousand items migrates in minutes.
 
 To keep a machine from migrating on its own, set
 `auto_store_migration: false` in its machine config (consent is per
@@ -638,13 +744,24 @@ and the command that clears it:
 6. Legacy items with no destination or that cannot be parsed: status and
    doctor report the refusal with `o2b brain migrate-store --dry-run`; fix
    the items, or run the migration by hand, which keeps unparseable items
-   in its backup archive.
+   in its backup archive. A sync tool's conflict copy of a legacy file and
+   its in-flight temp file are never such items (see "Sync conflict
+   copies" below); a conflict copy of a file no mapping covers is unknown
+   like that file.
 7. This machine's migration run state cannot be read: status reports a
    wait; fix the file's permissions or restore it.
 8. The vault binding cannot be read: status names `o2b init --vault`.
 9. A vault configured after the switch whose deny rules differ from the
    store's: it stays unbound, and doctor names the file
    (`permissions-legacy-only`) until you reconcile the two policies.
+10. Every device of the migration cohort switched or is retired, by you or
+    by silence, and the legacy tree is still in the vault: doctor reports
+    `legacy-tree-can-leave` and the `migration.cohort` block of the status
+    says `can_leave`. Nothing is removed on its own; run
+    `o2b brain migrate-store --remove-legacy` when you want the tree gone.
+11. A device retired by silence writes the legacy layout after the
+    removal: doctor reports `legacy-tree-reappeared` and names it. Update
+    Open Second Brain on that machine, then run the removal again.
 
 A rollback that finished every step but could not open its gate (another
 process held the gate lock past its wait) needs no one either: the next
@@ -697,7 +814,63 @@ legacy tree (the **migration cohort**), where each surface would go (a
 store stream and partition, the device-local state, an explicit backup, or
 drop with the reason), every item it cannot read, and every legacy file no
 mapping covers. It exits 1 while anything is unmapped; move such a file out
-of `Brain/` (or report it) and run the dry run again.
+of `Brain/` (or report it) and run the dry run again. Its "Sync conflict
+copies" section says what the sync tool's leftovers in the legacy tree
+would become; they never stop the run. Nor do the files Open Second Brain itself keeps
+beside a legacy file: the search index's parked previous index (`.bak`,
+`.old`), its `.new` staging and a restore's staged index, each with its
+SQLite journals, and a running rebuild's progress file (`.building.json`) with the claims of the searches reading its staging file (`.building.reader-*`), go by the index's rule (rebuilt on this machine: never
+read, imported or archived), and a writer's temp file or lock goes with
+the file it belongs to. The search freshen claim (`freshen.claim`, which a
+start whose process died can leave behind) and its pending marker go with
+the freshen state: never carried over.
+
+#### Sync conflict copies
+
+A vault that a sync tool keeps in step between machines collects that
+tool's conflict copies (Syncthing
+`<name>.sync-conflict-<date>-<time>-<device>.<ext>`, the Dropbox and
+Nextcloud `<name> (... conflicted copy <date> ...).<ext>`) and its
+in-flight temp files (`.syncthing.<name>.tmp`, `~syncthing~<name>.tmp`,
+the Nextcloud `.<name>.~<hex>`). The migration treats them as versions of
+the file the copy is named after, never as unknown files:
+
+- A copy of a JSONL ledger or log shard: its rows are imported like the
+  original's. A row the original already holds is stored once; a row only
+  the copy holds is imported under the copy's own path and line, exactly
+  once while the copy file is unchanged: a resumed run, a later machine
+  with the same copy, the transition import and a rollback do not import
+  it again. A row a person later moves into the original, or a copy
+  rewritten with its rows at other lines, is a new row and is imported as
+  one, so the store can then hold that event twice.
+- A copy of a signal page, a preference page or a lane entry: a copy equal
+  to its original adds nothing. A copy that differs is another version of
+  the same record, not a second record: it is kept in the migration
+  backup, not imported, and named in the report.
+- A copy of a single document (the pinned context, the settings file):
+  the original is imported; a copy that differs is kept in the backup and
+  named, never merged.
+- A copy of device-local, derived or dropped state (the freshen state, a
+  lock, a cache, a log day page): it goes with its original's rule and is
+  not carried over.
+- A temp file holds no data of its own: it is ignored and counted. When it
+  becomes the real file before the run ends, the next pass imports that
+  file.
+
+The dry run and the migration report (text and `--json` `sync_copies`)
+list, per surface, the copy rows or files imported as records, those
+identical to their original, those kept and not imported (each with the
+file it is a version of), those dropped with their original, and the temp
+files ignored. The kept copies are in
+`<migration folder>/backup/sync-conflict-copies/`, listed in
+`backup/sync-conflict-copies.json`; after the switch doctor names them once
+as advice (`sync-conflict-copies-kept`). Look at them, copy what you want
+into the brain, and delete the list to end the advice. A copy that
+arrives after the switch is imported by the transition import, and the
+legacy tree's removal moves every copy and temp file to its archive with
+the tree. The migration cohort is built from the original files only: a
+device known only from a conflict copy's name is not a device the removal
+waits for.
 
 ### 2. Migrate the first machine
 
@@ -708,14 +881,20 @@ o2b brain migrate-store
 
 The migration:
 
-1. closes a migration gate on this machine, so agents here are refused
-   with a "migration in progress" message while it runs (other machines
-   keep working);
+1. closes a migration gate on this machine, so every write into this vault
+   made here (agents, the CLI, hooks and background workers; notes and
+   Brain log lines, per-vault state and caches included) is refused while
+   it runs, with a "migration in progress" message that names the run,
+   since when it runs and how far it is (other machines keep working, and
+   so do this machine's other vaults); a hook writes nothing and does not
+   fail the session;
 2. snapshots `Brain/` and backs up every surface nothing can rebuild
    (secrets, keys, attestations, checkpoints) into the device-local state,
    each verified by a test restore;
-3. imports every item through a journal, then re-scans until a pass
-   imports nothing, and verifies every item against the store;
+3. imports every item through a journal, in batches, then re-scans until a
+   pass imports nothing, and verifies every item against the store; a sync
+   tool's conflict copies go where their originals go (see "Sync conflict
+   copies"), and each differing version it keeps is named in the report;
 4. records `migration-done` and this machine's `device-switched`, and makes
    this machine the view writer if no machine is.
 
@@ -726,16 +905,72 @@ the legacy shard it came from. A history written on several days by one
 agent therefore still counts as several sessions and forms topics (see
 `docs/topics.md`).
 
+The migration, the import of late legacy writes, the rollback and the
+removal read the store one record at a time, so their memory does not
+grow with the vault. What they must keep for every item or record (the
+journal, the items a pass saw, the store's checksums, the restored tree's
+items) moves into a temporary SQLite file under `scratch/` in the
+device-local migration folder once it passes 20,000 entries. That file is
+scratch only: each run rebuilds it from the journal and the store,
+deletes it when it ends, and removes one a killed run left behind. Give
+the device-local state disk room for it, about the size of the journal.
+
 The legacy tree stays in the vault. If the run is interrupted,
 `o2b brain migrate-store --resume` continues without importing anything
 twice. If verification finds a gap, the legacy tree is left untouched and
 the report names each missing item. If a run that is gone (a crash, a
-closed terminal) still holds the gate and you will not resume it right
-away, `o2b brain migrate-store --force-release-gate` opens it again; it
-refuses while the run that holds the gate is still running.
+closed terminal) still holds the gate, writes stay refused and the refusal
+says so: the next start resumes an automatic migration, or run
+`o2b brain migrate-store --resume`. The rollback and the removal of the
+legacy tree hold the same gate and refuse the same writes. If you will not
+resume the run right away, `o2b brain migrate-store --force-release-gate`
+opens the gate again; it refuses while the run that holds the gate is
+still running.
 
-From now on this machine writes only to the store. Render the view twice
-(the first render after the claim only catches up), and check doctor:
+The search index of a switched machine lives in its device-local state
+and is built anew in the background: by the first session start or MCP
+server start after the switch, or by the first search when nothing has
+started it yet (a search never builds the index of a store in its own
+process; a small vault is often built within the few seconds that first
+search waits, a larger one answers from what is indexed so far). The
+build reads the brain store first and then the vault's notes; until it
+ends, a search answers from what it has indexed so far and says so. The
+legacy `Brain/` tree is not indexed once the machine has switched: it is
+an archive that `--remove-legacy` moves out, and its signals,
+preferences and log are indexed as store records, so each answers once.
+A record whose entity no reader shows any more (a forgotten signal, a
+removed preference or lane entry, an entity marked `_status:
+tombstoned` before or after the migration) is never indexed, and a
+search refuses one an index still holds. A signal waiting for write
+approval is kept out the same way until it is approved. A log event
+that references such a record (by its id, its page path or a link to it:
+its `feedback` event, its `tombstone` event) is left out of every search
+answer too, so a forgotten record's name is not found through the log; a
+bare word an event shares with a forgotten page's name hides nothing; the log itself
+keeps the event as the audit trail.
+
+To forget one record on a switched machine, tombstone it: `o2b brain
+lifecycle tombstone <target> --reason <text>` (or the `brain_lifecycle`
+tool), where the target is the record's legacy path, its bare id or
+`store:<id>`. The tombstone is a field change of the store record, never
+a write to the legacy tree (still on disk or not, and whatever the path's
+case, Unicode form or separators, or a link that leads into the tree), and every reader drops
+the record at once; `supersede`, `temporal-replace` and `correct` write
+the store record the same way. A target the store does not hold is
+refused. `o2b brain signal retire` is not a way to forget: a retired
+signal leaves the dream pass and stays searchable as history.
+
+From now on this machine writes only to the store. Doctor reads the store
+too: while the legacy tree is still in the vault it does not walk or judge
+it (its log, its pages and its lanes are an archive the store already
+holds), and says only what `--remove-legacy` needs said about it (the
+cohort devices, a tree that came back, a failed or available migration),
+beside the store's own checks and the vault-side ones that still matter
+here (a frozen vault, secrets the sync exposes, state git tracks, a link
+that leaves the vault, the deny rules, free disk, the managed rules
+blocks, the search index's health), so it costs about what it costs once
+the tree has left. Render the view
+twice (the first render after the claim only catches up), and check doctor:
 
 <!-- doc-test: scenario=migration machine=laptop exit=0 -->
 ```sh
@@ -749,7 +984,9 @@ o2b brain doctor
 ```
 
 Doctor now reports `legacy-devices-pending` with the devices of the cohort
-that have not switched yet.
+that have not switched yet, and lists every cohort device with its state:
+`switched`, `pending` with the date of its last evidence of life, or
+`retired by silence` (see "Removing the legacy tree" below).
 
 ### 3. Migrate the later machines
 
@@ -795,9 +1032,23 @@ start. To import them right away:
 o2b brain migrate-store
 ```
 
+An import reads what changed since the last one, not the whole tree: a
+legacy log or ledger file whose size, modification time, change time and
+inode are all unchanged is not opened, and a file that only grew is read
+from where the last import stopped, once the lines read before check out
+unchanged. Any other change (a line edited in the middle, a file replaced
+by a shorter one) is read whole, as before. The migration leaves the
+first such record, so the first import after the switch is quick too.
+
 A switched machine never writes into the legacy tree. Doctor on every
 switched machine names the devices still on the legacy layout
-(`legacy-devices-pending`) until each has migrated or been retired.
+(`legacy-devices-pending`) until each has migrated or been retired, by you
+or by silence. The `migration` block of `o2b status --json` carries the
+same list as `cohort`, and the report of `o2b brain migrate-store` on a
+switched machine names the same devices (`legacy_devices` in `--json`,
+each with its last evidence in `pending_evidence`), the devices that
+switched and, apart from them, those retired by silence: a device retired
+by silence is never named as still on the legacy layout.
 
 ### 5. Rolling back a machine
 
@@ -826,9 +1077,10 @@ machine reports `migration-available` again; to switch again, run
 ### 6. Removing the legacy tree
 
 The legacy tree leaves the vault only when every device of the migration
-cohort (every device id found anywhere in the legacy tree, however old) has
-switched or been retired. Until then the removal refuses and names the
-devices it waits for:
+cohort (every device id found anywhere in the legacy tree) has switched,
+been retired by you, or been retired by silence. Until then the removal
+refuses and names the devices it waits for, each with the date of its last
+evidence of life:
 
 <!-- doc-test: scenario=migration machine=laptop exit=1 expect="the legacy layout" -->
 ```sh
@@ -844,11 +1096,76 @@ was `retired`:
 o2b store device list
 ```
 
-Migrate each named machine that is still in use. Retire a machine that is
-gone for good, from any other machine (never from the machine itself,
-which is refused). Retiring writes one record in the shared settings that
-takes the machine off the digest roster (`store-digest-silent` stops naming
-it) and out of the devices the removal waits for:
+Migrate each named machine that is still in use.
+
+**Retired by silence.** A vault usually carries ids of machines that no
+longer exist (a reinstalled laptop, an old phone, a test device). A cohort
+device that has not switched counts as retired by silence once its last
+evidence of life is older than the shared setting
+`migration.silent_device_days` (30 days by default; `0` turns the rule off,
+and then the cohort has no age limit). Its last evidence is the newest of:
+the dates in the names of its legacy per-device files (`2026-11-01.dev-c.jsonl`
+counts as that day, a month file as the month's first day, a week file as
+its Monday), the times its rows carry, and the clocks of the records it
+wrote to the store. A file name's date is only a floor: the newest row time
+of the file dates the device when it is later, whatever the file's naming
+scheme. A row time is any top-level time field of the row (`ts`,
+`timestamp`, `time`, `at`, or any field ending in `_at` or `At`, such
+as the continuity ledger's `createdAt`), except a field that names a time
+still to come (an expiry, a retry, a schedule, a reminder, a fire or
+start time, a sunset, a wake, a not-before). A field that records when
+something was done counts, such as a trigger's `snoozed_at` or a metrics
+row's `run_at`. Row times
+are read from the end of each shard: its last 64 KiB, or more when its
+newest row is longer, so that row always counts. File modification
+times never count: the sync tool rewrites them. An id with no
+dated trace at all takes the date of the migration's cohort record, so it
+is retired one threshold after the migration began.
+
+The age is measured against the newest evidence of any device, this
+machine's own records included, that is not later than this machine's
+clock. Evidence stamped in the future is left out of that reference rather
+than taken as now, so ages stay relative to what this machine has seen. A
+machine whose clock runs years ahead therefore counts as alive now and
+retires no one; a clock that runs behind retires fewer devices. A clock
+set far ahead on this machine changes nothing until this machine writes
+under it; after that, nothing tells it from a machine that really outlived
+the others, so the report prints the date it measured against (`as of`).
+Check that date before you run the removal.
+
+Nothing is recorded: a device retired by silence that writes again is
+pending again at once when what it writes carries a date within the
+threshold of the reference (a date later than the reference counts as the
+reference); a write stamped older than that leaves it retired by silence.
+A device whose evidence this machine cannot read whole (a store shard of
+it that is a link or special file, cannot be read, holds a rejected line
+where its newest clock is, or was seen before and is gone, or a legacy
+shard of it that cannot be read) is never retired by silence, and a
+device retired by hand whose newest record cannot be read counts as
+having written again: it stays pending, and the tree stays until the read
+is whole again. `--force` removes the tree past a pending device, but not
+past a store shard this machine cannot read at all (a link, a permission
+or I/O error): the removal refuses then, even with `--force`, because the
+tree may be the only other copy of what that shard holds; fix the shard
+(let sync finish, or its permissions) and run the removal again. A shard
+read only in part (a record whose blob has not arrived) is the case
+`--force` goes past.
+The setting is shared by every machine of the store,
+and only you set it:
+
+<!-- doc-test: scenario=migration machine=laptop exit=0 expect="migration.silent_device_days" -->
+```sh
+o2b brain settings set migration.silent_device_days 30
+```
+
+A change of the threshold takes effect on a machine once the setting has
+synced to it, and the removal report prints the threshold it used.
+
+Retire a machine that is gone for good before its silence counts, from any
+other machine (never from the machine itself, which is refused). Retiring
+writes one record in the shared settings that takes the machine off the
+digest roster (`store-digest-silent` stops naming it) and out of the
+devices the removal waits for:
 
 <!-- doc-test: scenario=migration machine=laptop exit=0 expect="Retired dev-c" -->
 ```sh
@@ -867,10 +1184,13 @@ again first:
 o2b brain migrate-store
 ```
 
-Now every cohort device has switched or been retired, and the removal
-goes ahead:
+Now every cohort device has switched or been retired, so doctor reports
+`legacy-tree-can-leave` with the command. It is advice: nothing is removed
+until you run it. The removal goes ahead, and its report names the devices
+that switched and, apart from them, each device retired by silence with its
+last evidence (`switched` and `retired_by_silence` under `--json`):
 
-<!-- doc-test: scenario=migration machine=laptop exit=0 expect="nothing was deleted" -->
+<!-- doc-test: scenario=migration machine=laptop exit=0 expect="Everything else was moved into the archive, not deleted" -->
 ```sh
 o2b brain migrate-store --remove-legacy
 ```
@@ -882,9 +1202,21 @@ them.
 
 The removal first imports any late legacy writes, then moves `Brain/` and
 `.open-second-brain/` out of the vault into a dated archive in this
-machine's device-local state. Nothing is deleted; the archive leaves out
-only what a rebuild recreates (the search index, caches, generated pages),
-and the report lists those. Afterwards the vault holds your notes and, if
+machine's device-local state. The archive leaves out only what a rebuild
+recreates (the search index, caches, generated pages): those are deleted,
+and the report says how many and how large they are and names the first
+few (`skipped`, `skipped_sizes` and `skipped_bytes` under `--json`);
+everything else is moved, not deleted. A long list in the report is its
+count and its first few entries.
+
+On another machine of the vault the removal reaches it by sync, which
+deletes what it carried. What it never carried stays: that machine's own
+search index and caches in `.open-second-brain/` (often hundreds of MB).
+Doctor names them (`legacy-local-files-left`, with their sizes), and
+`o2b brain migrate-store --remove-legacy` run on that machine clears them
+the same way (the cohort no longer matters there: the tree is gone). Where
+nothing of the tree is left at all (the sync also deleted that folder), the
+command says so, lists the cohort as above, moves nothing and exits 0. Afterwards the vault holds your notes and, if
 `view_target` points into it, the view folder. A rollback is no longer
 possible:
 
@@ -895,8 +1227,46 @@ o2b brain migrate-store --rollback
 
 If a `Brain/` folder appears in the vault again (an agent or tool still
 follows old instructions), doctor reports `legacy-tree-reappeared` with the
-writer when a file names it. Nothing reads that folder; stop the writer and
-move the folder out of the vault.
+writer when a file names it. Stop the writer and move the folder out of the
+vault.
+
+The `legacy-tree-removed` record names the devices retired by silence when
+the tree left, so the doctor on every machine can say why it left. A
+machine whose tree had already left by sync, running the removal to clear
+its own leftover files, reports and records the verdict of the removal
+that moved the tree; its own record says it moved no tree
+(`tree_already_left`), so it never replaces that verdict for a later
+machine.
+
+#### A device retired by silence that comes back
+
+1. **On an old release** it writes `Brain/` again. Doctor reports
+   `legacy-tree-reappeared`, names the device as retired by silence and
+   tells you to update Open Second Brain on that machine. Until then the
+   switched machines import what it writes there. Once it has updated, its
+   migration imports its legacy records as a later machine and records its
+   switch; then remove the tree again with
+   `o2b brain migrate-store --remove-legacy`.
+2. **On the new release, with its own copy of the tree still in place**
+   (the sync tool has not removed it yet), its automatic migration runs as
+   a later machine and imports every legacy record the store lacks,
+   including what it wrote while it was offline.
+3. **On the new release, with its tree gone** (the sync tool applied the
+   removal), it is store-only: it writes the store and nothing waits for
+   it. Its start records no switch for it, because the identity marker
+   left with the tree and one store serves every vault of a machine, so a
+   vault without its tree looks the same as another vault whose tree has
+   not arrived yet, and switching there would leave that vault's legacy
+   records unimported. `o2b store device list` shows it on the `legacy`
+   layout until you run `o2b init --vault <vault>` on that machine, which
+   records its switch.
+
+**What the threshold costs.** In the third case the records that device
+wrote into its legacy tree after its last sync, and that never synced
+before its copy of the tree was removed, are lost. Everything it synced
+before is in the store. A longer `migration.silent_device_days` makes that
+window less likely; `0` rules it out and keeps the tree until every device
+switched or you retired it.
 
 ## Shards read only in part
 
@@ -1063,6 +1433,158 @@ machine has no store. These checks read the machine config the write
 itself was made with. A `shared_namespace` path that is not a directory
 (an unmounted share, a missing path, a file) is reported as failed.
 
+## Standing rules and other Brain pages after the switch
+
+On a switched machine the vault may have no `Brain/` folder at all, and
+every reader below reads the store instead, also while a legacy tree is
+still on disk (the store is the truth there):
+
+- **Standing rules.** The migration imports `Brain/standing-rules.md` and
+  the scoped rule files under `Brain/standing-rules/` into the
+  `standing-rule` lane with your authority. The session start, the
+  sub-agent carrier and `brain_context` read them from there, as the files
+  said them: a lane entry keeps the file's text byte for byte when its
+  fields and text would not reproduce it (no frontmatter, CRLF line ends,
+  a quoted value). To change them, run
+  `o2b brain standing-rules set --file my-rules.md`;
+  `o2b brain standing-rules show` prints them, `clear` removes them, and
+  `--project <name>`, `--harness <id>` or `--host <device id>` names one
+  scoped rule file instead. No agent tool writes them.
+- **Forgetting.** `o2b brain forget-source` and `brain_delete_by_source`
+  find the derived signals, preferences and lane entries in the store and
+  remove them with the store's own removal records (`signal-removed`,
+  `preference-remove`, `lane-entry-remove`), whatever name the migrated
+  page had; a removal the store does not reflect afterwards is reported as
+  failed, never as nothing to remove. The forget and its plan name any
+  part of the store they could not read (`unreachable`); a confirmed
+  `forget-source` that carries it exits 1, and running it again once the
+  shard reads removes the rest.
+- **Claims, report snapshots, the signal dedup index.** `o2b brain claims`
+  and `brain_claims` build the claim graph from the store's preferences,
+  signals and `theses` entries; the explorer console lists report snapshot
+  surfaces from the `reports` lane; the capture paths skip a signal the
+  store already holds.
+- **Lessons promotion and the budget watermark.** `o2b brain lessons`
+  reads its candidates and judges its approvals against the store's
+  preferences, and the doctor's `active-budget-pressure` check reads the
+  active digest the session start reads.
+- **Maintenance and hygiene readers.** Page dedup candidates, the
+  semantics backfill plan, `o2b brain sources`, knowledge packs (list,
+  conflicts, uninstall, the owner block of an export), the schema report's
+  log event kinds, the capture-scope and document-dedup detectors, the
+  orphan-session check and `o2b brain orphan-repair`, the skill rewrite
+  verbs, the supersession chain lookup, source freshness and the recompile
+  plan, and `privacy-marker-restamp` read the store's records and lane
+  pages, and write through the store where they write.
+  `doctor --repair` prunes a dead `evidenced_by` of a stored preference
+  with a store record, in the private partition when the store holds the
+  preference as private. `privacy-marker-restamp` skips by name a lane page
+  whose stored text holds a line its fields omit, as it skips such a file,
+  and one edited while it reads it: the page is read once under its lane
+  lock and written only while the store still holds that read. The
+  orphan-session check reports an uncertainty, and `o2b brain orphan-repair`
+  refuses, while an events shard cannot be read or a signal lifecycle
+  record waits for its blob. Every repair that writes from the store's
+  fold judges that fold whole on the read its write decision rests on:
+  while it may miss a record, `privacy-marker-restamp` stamps no lane page,
+  `orphan-repair` skips the signal (`skip-incomplete`), `doctor --repair`
+  leaves an evidence prune for a later run, and a knowledge-pack uninstall
+  removes no rule (each is reported in `refused`). `o2b brain attest sign` refuses once the legacy log
+  is gone: an attestation measures the legacy log and ledgers, which a
+  switched vault no longer holds.
+- **Quote check.** A quote of a `Brain/` page other than the two digests
+  (the standing rules, say) reads `note-unavailable` on a switched
+  machine, also while a legacy copy of the page is still on disk: that
+  copy is stale, and the Stop hook does not read the store.
+- **Snapshots.** A snapshot on a switched machine holds only its
+  device-local state, not the memory. `o2b brain rollback <run id>` and
+  `o2b brain snapshot diff <run id>` against the live tree refuse there and
+  name `o2b brain migrate-store --rollback` (back to the legacy tree) and
+  `o2b view recover <page>` (an older version of a view page);
+  `o2b brain snapshot log` and `rollback --list` still list the snapshots.
+  The recovery point a destructive operation takes there (`forget-source`,
+  a note delete, a dream pass) says so: its recoverability is not
+  `covered`, and it names `brain_records_in_store` as not covered, because
+  the records the operation removes are store records no archive holds.
+- **Vault map.** The migration imports `Brain/_vault-map.yaml` (the role
+  tokens of `o2b vault map`, the note walk and graph import) into the
+  operator-only shared setting `vault_map.document`, as it imports
+  `_permissions.yaml` into `permissions.document`. A machine that switched
+  before this import existed reads the copy its legacy-tree removal kept in
+  the device-local archive the first time the map is needed, and stores it
+  in the setting at your authority, unless the setting was ever recorded:
+  after `o2b brain settings unset vault_map.document` the built-in folder
+  names apply and the archive is not read again. While a settings shard
+  cannot be read, or a settings record waits for its blob, the archive is
+  not read either (your unset may be in it): the built-in folder names
+  apply and nothing is written until every shard reads again. Where that archive is gone (or the
+  tree was removed on another machine), the built-in folder names apply
+  until you set the map yourself:
+  `o2b brain settings set vault_map.document "$(cat _vault-map.yaml)"`.
+- **Consumed and archived signals.** A signal page's state on a legacy
+  machine is its folder. A page that sits in `Brain/inbox/processed/` or
+  `Brain/inbox/archived/` with no state of its own (moved there by hand)
+  reads as consumed or archived after the switch too, also on a store
+  migrated before this release, because the store reads the state from
+  the folder the migration recorded. That folder also wins over a state
+  recorded before the switch (a signal approved and then moved into
+  `processed/` by hand stays consumed, as the legacy reader showed it); a
+  state set after the switch wins over the folder.
+- **Rules migrated before the raw text was kept.** A rule file with
+  frontmatter that an earlier release migrated is stored as fields and
+  text only, and would read back with its YAML written anew (`'7'` as
+  `7`, an empty value as `""`). While this machine keeps the original file
+  (the legacy tree, or the archive of its removal) and that file still
+  says exactly what the entry says, the rules read back byte for byte from
+  it. Without it the entry's rendering applies; the values are the same.
+  `o2b brain standing-rules set` stores the text whole.
+- **A vault the process cannot examine.** A vault whose `Brain/` cannot
+  be looked at (its permissions, an I/O error, a `Brain/` at mode 000 that
+  still stats, a vault below a parent that cannot be traversed) on a
+  machine that has not switched is neither store-only nor legacy: nothing
+  is read from or written to either layout, and no reader answers as if
+  the brain were empty. The doctors report it as a failing check, and
+  `o2b brain migrate-store --dry-run` lists the folders it could not read
+  and does not pass. A folder deeper inside `Brain/` that cannot be
+  traversed is not this condition: its readers report it as uncertainty
+  and the rest of the vault stays usable. Commands fail with one line naming the vault
+  and the error, MCP tools with `vault_unreadable` (the server still
+  starts and lists its tools, and answers normally once the vault can be
+  read again, with no restart), the session start shows the rules as
+  unavailable, and a lineage observation is dropped with a named notice.
+  A switched machine knows where its brain is: while its vault cannot be
+  examined or is gone, its MCP server answers each call as a server with
+  no vault does (the brain tools from the store, a tool that needs the
+  vault refuses with `vault_unreadable`), and never recreates a vault
+  folder that is gone. The command line and the hooks take the same
+  decision, in both shapes alike. The store-backed `o2b brain` verbs
+  (`feedback`, `note`, `query`, `doctor`, `dream`, `export`, `claims`,
+  `rollback --list`) answer from the store. A verb that needs the vault's
+  own files (`migrate-store`, which inventories the legacy tree) refuses
+  with one line naming the reason. The session start injects the digest
+  from the store, led by an `UNAVAILABLE:` line for the operator's rules,
+  which live in the vault and are therefore unknown, never absent. Every
+  other hook serves the store as on a machine with no vault.
+- **A vault folder that is gone, on a machine that has not switched.**
+  The machine config names a vault and the folder is not there (an
+  unmounted disk, a renamed folder). This is not a fresh installation:
+  the brain is somewhere else, and the folder the config names is the
+  only trace of where. So every surface says so before it says "there is
+  nothing here yet". The session context leads with the notice - in the
+  slot the `UNAVAILABLE:` block uses, so the operator's rules are
+  reported as unknown rather than absent - and keeps `present: false`.
+  Every refusal names the missing folder before any advice to initialise
+  a new brain, and the advice it carried stays, second. The doctor
+  (`brain_doctor` and `o2b brain doctor`) reports the missing folder
+  ahead of the "brain root absent" entry, whose `o2b brain init` advice
+  stays, behind the new `o2b status` exit. The command line writes the
+  notice on stderr before the verb's own error, and the session start
+  carries it in its runtime notices; that start no longer runs the
+  background maintenance either, which would have created the very
+  folder that is missing. A machine with no vault configured is not in
+  this case: there is no folder to be missing, and a new installation
+  keeps today's guidance word for word.
+
 ## What the partitions protect, and what they do not
 
 The partitions decide **which machines receive which records**. They are a
@@ -1128,9 +1650,14 @@ that come from the store, the migration and the view:
 | `migration-available` | This machine still keeps its brain in the vault's `Brain/` tree, or it switched before this vault was configured and the vault's legacy tree was never imported. | Follow [Moving an existing install](#moving-an-existing-install); on a switched machine run `o2b brain migrate-store`, which imports the tree and binds the vault. |
 | `store-migration-failed` | The last automatic migration attempt on this machine failed; the finding gives the reason and when the next automatic attempt is due. | Fix the cause the reason names and wait for the next start, or run `o2b brain migrate-store` yourself. |
 | `legacy-devices-pending` | This machine switched, but the named devices still write the legacy tree. | Migrate each named machine, and retire the ones that are gone with `o2b store device retire <device-id>`. |
+| `sync-conflict-copies-kept` | The migration kept sync conflict copies that differ from their originals (another version of a record or a single document) in its backup and imported none of them. Advice: nothing waits on it. | Look at the copies in the folder the finding names, copy what you want into the brain, then delete the list file it names. |
 | `legacy-tree-reappeared` | A `Brain/` folder is back in the vault after the legacy tree was removed. | Stop the writer the finding names and move the folder out of the vault. |
 | `migration-done-twice` | Two devices each ran the first migration of this vault, before either completion record had synced, so items both imported are in the store twice. | Nothing is lost and both records stay. Migrate every other machine only after one completion record has synced. |
 | `view-writer-silent` | The view writer has published nothing for more than 3 days. | Run `o2b view writer --here` on the machine that should render the view, with `--force` if the old writer is unreachable. |
+| `dream-owner-unbound` | No dream owner is bound, so a live dream pass runs from any machine; a declared `primary_agent` is named as the requested owner. Advice. | Run `o2b dream owner --here --agent <name>` on the machine that should run dream. |
+| `dream-owner-elsewhere` | Another machine is the dream owner although the declared `primary_agent` is the agent this machine runs as; this one runs no live pass and its maintenance lane skips dream. Not reported on a machine that merely previews, the normal state of every machine but the owner. Advice. | Nothing, or move the role with `o2b dream owner --here`. |
+| `dream-owner-pending` | A transfer of the dream owner role waits for the owner's machine to release it. Advice. | On the owner's machine, run `o2b dream owner` or start a session. |
+| `dream-owner-agent-differs` | The declared `primary_agent` is not the dream owner's agent. Advice. | On the owner's machine, run `o2b dream owner --here --agent <name>` or `o2b brain set-primary <name>`; both change the owner's agent, and `set-primary` also sets the declared name. On any other machine `set-primary <name>` refuses. |
 
 Other questions that come up:
 
@@ -1140,6 +1667,19 @@ Other questions that come up:
 - **Records from another machine are missing.** Check that your sync tool
   has delivered the partition folders (`o2b store path` on both machines
   shows the same store id and both partitions as held where expected).
+- **A write says `store lock busy` or `cannot take the lock`.** Several
+  sessions writing at once take turns on short device-local locks; on
+  Windows a lock that was just released can be refused for a moment, and
+  that is waited out too. `store lock busy` means the lock stayed held past
+  the wait (five seconds by default, `OPEN_SECOND_BRAIN_LOCK_WAIT_MS`
+  raises it): retry. `cannot take the lock <path>: its directory <dir>
+  refuses new entries` means the device-local state directory is not
+  writable by this account (an ACL, Controlled Folder Access): fix its
+  permissions. The check uses the same create operation as the lock, so
+  ACLs can distinguish a file lock from a directory lock. The same message
+  ending in `(EROFS); it is on a read-only mount` means the directory is
+  on a read-only mount: move that data to a writable mount, since no
+  permission change helps there.
 - **A later machine's migration exits 1 and names missing shards.** The
   first machine's files have not arrived yet. Wait for sync and run it
   again, or use `--wait <seconds>`.

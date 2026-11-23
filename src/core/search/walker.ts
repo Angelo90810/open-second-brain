@@ -20,7 +20,9 @@
 import { readdirSync, statSync, realpathSync, type Dirent, type Stats } from "node:fs";
 import { join, relative, sep } from "node:path";
 
+import { BRAIN_ROOT_REL } from "../brain/path-constants.ts";
 import { canonicalNotePath } from "../path-safety.ts";
+import { storeOnlyMode } from "../store/store-only.ts";
 import { admitToIndex } from "../vault-scope/index-admission.ts";
 import { matchScope, mayDescend } from "../vault-scope/index.ts";
 import type { ResolvedSearchConfig } from "./types.ts";
@@ -31,12 +33,45 @@ export interface WalkedFile {
   /** Vault-relative POSIX path. */
   readonly relPath: string;
   readonly stat: Stats;
+  /**
+   * Wall-clock time (ms) captured before `stat` was taken: the moment the
+   * index observed the file. A row proves the bytes it holds only as of
+   * then (`indexedSnapshotStale`), never as of a later write of the row.
+   */
+  readonly observedAtMs: number;
 }
 
 function isInsideVault(absTarget: string, vaultReal: string): boolean {
   try {
     const r = realpathSync(absTarget);
     return r === vaultReal || r.startsWith(vaultReal + sep);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the vault's legacy `Brain/` tree is an archive the index leaves
+ * out: this machine switched to the brain store its index reads, so the
+ * signals, preferences and log there are records of the store, indexed as
+ * such, and the tree only waits for `o2b brain migrate-store
+ * --remove-legacy` to move it out of the vault. Indexed as notes it
+ * answered every migrated item twice and, with the log day pages, made the
+ * index twice the size. A vault that never migrated (or a store-only
+ * machine that never had a legacy brain) keeps its `Brain/` pages. A
+ * machine whose switch cannot be read is taken as not switched.
+ */
+export function legacyTreeArchived(config: ResolvedSearchConfig): boolean {
+  if (config.vault === null || config.brainStore === null || config.brainStore === undefined) {
+    return false;
+  }
+  try {
+    return (
+      storeOnlyMode({
+        vault: config.vault,
+        ...(config.configPath !== null ? { configPath: config.configPath } : {}),
+      }).reason === "device-switched"
+    );
   } catch {
     return false;
   }
@@ -66,6 +101,22 @@ export function* walkVault(config: ResolvedSearchConfig): Generator<WalkedFile> 
   // vault but is not acyclic on its own.
   const seenDirs = new Set<string>([vaultReal]);
   const rules = config.scopeRules;
+  // The legacy tree of a switched machine, by its canonical path: the
+  // vault's top-level `Brain/` folder.
+  const skipBrainRoot = legacyTreeArchived(config);
+  // Its real path too: a link elsewhere in the vault that resolves into
+  // the archived tree (a folder or a single page) is the archive as well.
+  const brainReal = skipBrainRoot
+    ? (() => {
+        try {
+          return realpathSync(join(vaultReal, BRAIN_ROOT_REL));
+        } catch {
+          return null;
+        }
+      })()
+    : null;
+  const inArchive = (real: string): boolean =>
+    brainReal !== null && (real === brainReal || real.startsWith(brainReal + sep));
 
   function* walk(dir: string): Generator<WalkedFile> {
     let entries: Dirent[];
@@ -92,6 +143,7 @@ export function* walkVault(config: ResolvedSearchConfig): Generator<WalkedFile> 
       const isLinkHint = entry.isSymbolicLink();
 
       let stat: Stats;
+      const observedAtMs = Date.now();
       try {
         stat = statSync(absPath);
       } catch {
@@ -102,6 +154,7 @@ export function* walkVault(config: ResolvedSearchConfig): Generator<WalkedFile> 
         // Descent, not membership: an allowlist root may live below a
         // directory that holds no included file of its own.
         if (!mayDescend(relPath, rules)) continue;
+        if (skipBrainRoot && relPath === BRAIN_ROOT_REL) continue;
         // Index-admission predicate (seam 2): skip descending into an
         // excluded lane directory (e.g. the exact-state lane) entirely.
         if (!admitToIndex(relPath).admit) continue;
@@ -112,6 +165,7 @@ export function* walkVault(config: ResolvedSearchConfig): Generator<WalkedFile> 
           continue;
         }
         if (dirReal !== vaultReal && !dirReal.startsWith(vaultReal + sep)) continue;
+        if (inArchive(dirReal)) continue;
         if (seenDirs.has(dirReal)) continue;
         seenDirs.add(dirReal);
         yield* walk(absPath);
@@ -121,6 +175,15 @@ export function* walkVault(config: ResolvedSearchConfig): Generator<WalkedFile> 
       if (!stat.isFile()) continue;
       if (!entry.name.toLowerCase().endsWith(".md")) continue;
       if (isLinkHint && !isInsideVault(absPath, vaultReal)) continue;
+      if (isLinkHint && brainReal !== null) {
+        let fileReal: string;
+        try {
+          fileReal = realpathSync(absPath);
+        } catch {
+          continue;
+        }
+        if (inArchive(fileReal)) continue;
+      }
       // File-level rule too: a `path/to/file.md` entry in
       // `vault.ignore_paths` excludes that exact file, and a declared
       // `vault.include_paths` admits only what it names.
@@ -130,7 +193,7 @@ export function* walkVault(config: ResolvedSearchConfig): Generator<WalkedFile> 
       // admit, so all existing non-lane content is yielded unchanged.
       if (!admitToIndex(relPath).admit) continue;
 
-      yield { absPath, relPath, stat };
+      yield { absPath, relPath, stat, observedAtMs };
     }
   }
 

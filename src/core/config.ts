@@ -12,8 +12,6 @@ import { createHmac, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
-import lockfile from "proper-lockfile";
-
 import { atomicWriteFileSync, sleepSync } from "./fs-atomic.ts";
 import { isSecretReferenceValue, SecretReferenceError } from "./secret-ref.ts";
 import { APP_DIR_NAME, configBaseDir } from "./platform-dirs.ts";
@@ -31,6 +29,7 @@ import {
 import type { LinkOutputFormat } from "./brain/wikilink.ts";
 import { STORE_DUAL_WRITE_CONFIG_KEY, STORE_DUAL_WRITE_ENV } from "./store/constants.ts";
 import type { ConfigDiscovery } from "./types.ts";
+import { lockDirSync } from "./fs-lock.ts";
 
 /**
  * The named-secret resolver port (trust-surface-hardening, t_e5807974).
@@ -605,7 +604,7 @@ export function resolveDeviceId(configPath?: string): string {
   try {
     for (let attempt = 0; attempt < 10; attempt++) {
       try {
-        release = lockfile.lockSync(dir, { stale: 10_000, realpath: false });
+        release = lockDirSync(dir, { stale: 10_000 });
         break;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ELOCKED") break;
@@ -720,7 +719,7 @@ export function resolveInstallationSecret(configPath?: string, secretsVault?: st
   try {
     for (let attempt = 0; attempt < 10; attempt++) {
       try {
-        release = lockfile.lockSync(dir, { stale: 10_000, realpath: false });
+        release = lockDirSync(dir, { stale: 10_000 });
         break;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ELOCKED") break;
@@ -1584,7 +1583,8 @@ export const ANSWER_QUOTE_CHECK_PHASES = Object.freeze(["recall", "active", "sub
 export type AnswerQuoteCheckPhase = (typeof ANSWER_QUOTE_CHECK_PHASES)[number];
 
 /** The mode every phase resolves to when nothing is configured. */
-const QUOTE_CHECK_DEFAULT: AnswerQuoteCheckMode = "shadow";
+export const ANSWER_QUOTE_CHECK_DEFAULT: AnswerQuoteCheckMode = "shadow";
+const QUOTE_CHECK_DEFAULT = ANSWER_QUOTE_CHECK_DEFAULT;
 
 /** Paths and keys whose unknown-field warning already fired in this process. */
 const quoteCheckWarnedUnknownKeys = new Set<string>();
@@ -1685,7 +1685,10 @@ function resolveAnswerQuoteCheckPhase(
  * The brain config file the resolvers read when the caller names none:
  * the standard vault's `Brain/_brain.yaml`. `null` when no vault
  * resolves, which leaves every phase at its default - a vaultless install
- * has no operator settings to contradict.
+ * has no operator settings to contradict. This is the legacy layout only:
+ * a vault switched to the store keeps the block in its shared settings,
+ * which `resolveAnswerQuoteCheckModes` (`src/core/brain/quote-check-modes.ts`)
+ * reads - the entry point the Stop hook uses.
  */
 function defaultAnswerQuoteCheckConfigPath(): string | null {
   const vault = resolveVault();
@@ -1892,6 +1895,76 @@ export function resolveHygieneDigestEnabled(configPath?: string): boolean {
     "hygiene_digest_enabled",
     configPath,
   );
+}
+
+/**
+ * Shared body for a default-ON switch: env var (trimmed) wins, falling
+ * back to the config key (trimmed); only the literal strings `"false"` and
+ * `"0"` turn it off, anything else (including absence) leaves it on - the
+ * `recall_inject_dedupe` reading.
+ */
+function resolveConfigSwitchDefaultOn(
+  envKey: string,
+  configKey: string,
+  configPath?: string,
+): boolean {
+  const raw = readSetting(envKey, configKey, () => discoverConfig(configPath).data);
+  return raw !== "false" && raw !== "0";
+}
+
+/**
+ * End-of-turn brain-event nudge (`hooks/stop-log-guardrail.ts`). Default
+ * ON: after a turn that changed files but recorded no brain event, the
+ * model is reminded once. `stop_guardrail_enabled: "false"` (or `"0"`, or
+ * the env override) turns the nudge off on this machine entirely.
+ */
+export function resolveStopGuardrailEnabled(configPath?: string): boolean {
+  return resolveConfigSwitchDefaultOn(
+    "OPEN_SECOND_BRAIN_STOP_GUARDRAIL_ENABLED",
+    "stop_guardrail_enabled",
+    configPath,
+  );
+}
+
+/**
+ * Answer-time quote check (`hooks/answer-quote-check.ts`) master switch.
+ * Default ON. `quote_check_enabled: "false"` (or `"0"`, or the env
+ * override) turns the whole hook off on this machine: no annotation, no
+ * `enforce` Brain-log event, no `reply_presence` record - whatever the
+ * per-phase `quote_check.<phase>` modes in `_brain.yaml` say. With it on,
+ * those modes decide as before.
+ */
+export function resolveQuoteCheckEnabled(configPath?: string): boolean {
+  return resolveConfigSwitchDefaultOn(
+    "OPEN_SECOND_BRAIN_QUOTE_CHECK_ENABLED",
+    "quote_check_enabled",
+    configPath,
+  );
+}
+
+/** How the end-of-turn advisories reach the model on Claude Code. */
+export type StopAdvisoryDelivery = "async" | "sync";
+
+/**
+ * Delivery form of the end-of-turn advisories on Claude Code (the brain-event
+ * nudge, the quote check and the hygiene digest). Default `async`: the
+ * synchronous Stop hooks compute and write their durable records, and the
+ * background `stop-advisory-deliver` hook hands the text to the model with
+ * the next user message - not printed in the chat, no extra model turn. A
+ * one-shot `claude -p` run kills that background hook at teardown, so the
+ * text never arrives there. `stop_advisory_delivery: "sync"` (or the env
+ * override `OPEN_SECOND_BRAIN_STOP_ADVISORY_DELIVERY`) selects the
+ * synchronous form instead: the text is printed as "Stop hook says: ..." and
+ * the turn continues once so the model can act on it - the form for people
+ * who run headless. Any other value reads as `async`.
+ */
+export function resolveStopAdvisoryDelivery(configPath?: string): StopAdvisoryDelivery {
+  const raw = readSetting(
+    "OPEN_SECOND_BRAIN_STOP_ADVISORY_DELIVERY",
+    "stop_advisory_delivery",
+    () => discoverConfig(configPath).data,
+  );
+  return raw === "sync" ? "sync" : "async";
 }
 
 /**

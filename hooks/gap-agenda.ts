@@ -18,6 +18,7 @@ import { armProcessCeiling, resolveHookCeilingMs } from "./lib/process-ceiling.t
 import { asHookPayload, readHookInput } from "./lib/stdin.ts";
 import { isContextEventName } from "./lib/context-events.ts";
 import { resolveHookTarget } from "./lib/hook-vault.ts";
+import { fitHostContextFor } from "./lib/host-context-ceiling.ts";
 
 async function main(): Promise<void> {
   // Fast opt-out FIRST: default OFF means an immediate no-op, no output.
@@ -50,7 +51,7 @@ async function main(): Promise<void> {
     const out = {
       hookSpecificOutput: {
         hookEventName,
-        additionalContext: agenda,
+        additionalContext: fitHostContextFor(payload, agenda),
       },
     };
     process.stdout.write(JSON.stringify(out) + "\n");

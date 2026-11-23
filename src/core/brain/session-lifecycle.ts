@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { recordOriginOf } from "./record-origin.ts";
 import { basename, join } from "node:path";
 
 import { delegatedAgentName } from "../agent-identity.ts";
@@ -156,6 +157,22 @@ interface NormalizedPayload {
 }
 
 /**
+ * Whether a hook payload's tool is `brain_feedback`: the bare name, or
+ * the name a host gives an MCP tool by prefixing its server
+ * (`mcp__<server>__brain_feedback` in Claude Code and Codex,
+ * `<server>__brain_feedback` in Grok). A payload from a real host carries
+ * the prefixed name, so a bare comparison never replayed a live call.
+ */
+export function isBrainFeedbackToolName(name: string | undefined): boolean {
+  return (
+    name !== undefined &&
+    (name === BRAIN_FEEDBACK_TOOL || name.endsWith(`__${BRAIN_FEEDBACK_TOOL}`))
+  );
+}
+
+const BRAIN_FEEDBACK_TOOL = "brain_feedback";
+
+/**
  * Whether capturing this event may need the signal dedup index - the
  * one step whose cost grows with the vault: a read and a frontmatter
  * parse of every `Brain/inbox/sig-*.md` and `processed/sig-*.md`. On a
@@ -173,7 +190,7 @@ interface NormalizedPayload {
  */
 export function lifecycleEventNeedsDedup(payload: unknown): boolean {
   const normalized = normalizePayload(payload);
-  if (normalized.toolName === "brain_feedback") return true;
+  if (isBrainFeedbackToolName(normalized.toolName)) return true;
   if (normalized.event === "SessionEnd" && normalized.interrupted === true) return true;
   const text = normalized.promptText;
   if (text === undefined) return false;
@@ -364,7 +381,7 @@ export async function captureSessionLifecycleEvent(
   // the tool declined to create. The decline is counted rather than
   // swallowed, so a run that dropped something says so.
   let toolCallsFailed = 0;
-  if (mayWrite && normalized.toolName === "brain_feedback") {
+  if (mayWrite && isBrainFeedbackToolName(normalized.toolName)) {
     if (isToolResponseError(normalized.toolResponse)) {
       toolCallsFailed++;
     } else {
@@ -809,6 +826,12 @@ function emitSignal(
   signal: SignalPayload,
 ): void {
   const index = dedup();
+  // The dedup index is vault-wide and its hash leaves the project out, on
+  // purpose: an identical observation (topic, sign, principle, scope)
+  // captured again in another linked project is not new information for
+  // the preference it feeds, and a second signal would count it twice and
+  // inflate that preference's confidence. The first project to capture it
+  // keeps it; another project's topic planning does not see the repeat.
   if (index.has(signal.dedupHash)) {
     counters.signals_deduped++;
     return;
@@ -829,6 +852,9 @@ function emitSignal(
     dedup_hash: signal.dedupHash,
     session_ref: sessionRef,
     ...(signal.raw ? { raw: signal.raw } : {}),
+    // The host's facts: the session's working directory and its id
+    // (`record-origin.ts`); a payload without them stamps neither.
+    origin: recordOriginOf(payload.cwd, vault, payload.sessionId),
   });
   index.set(signal.dedupHash, { id: result.id, path: result.path });
   counters.signals_created++;

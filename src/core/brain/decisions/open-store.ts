@@ -36,23 +36,23 @@
  * brief and the transitions down with it.
  */
 
+import { originFields, type RecordOrigin } from "../record-origin.ts";
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import lockfile from "proper-lockfile";
-
 import { normalizeAgentArgument } from "../../agent-identity.ts";
 import { resolveAgentName } from "../../config.ts";
 import { sanitiseTextField } from "../../redactor.ts";
-import { parseFrontmatterText, SLUG_MAX_LEN, slugify } from "../../vault.ts";
+import { parseFrontmatterText, SLUG_MAX_LEN, titleSlug } from "../../vault.ts";
 import { appendLogEvent } from "../log.ts";
 import { BRAIN_DECISIONS_REL } from "../path-constants.ts";
 import { decisionsDir, decisionPath } from "../paths.ts";
 import { isoDate, isoSecond } from "../time.ts";
 import { BRAIN_LOG_EVENT_KIND } from "../types.ts";
-import { recordDecision } from "./record.ts";
+import { recordDecision, takenDecisionSlug } from "./record.ts";
 import { appendDecisionChangeReceipt, DECISION_CHANGE_REASON } from "./receipts.ts";
+import { lockDirSync } from "../../fs-lock.ts";
 import {
   assertLaneWrite,
   lanePageExists,
@@ -248,6 +248,18 @@ export interface ResolveOpenDecisionInput {
   readonly rationale?: string;
   readonly now?: Date;
   readonly configPath?: string;
+  /**
+   * The project and session the decision was made in (`record-origin.ts`),
+   * stamped into its log event so topic planning can group it.
+   */
+  readonly origin?: RecordOrigin;
+  /**
+   * The caller's reach. A decision page an older release minted under the
+   * title's Latin-only slug that the caller may not read does not push the
+   * mint to a derived title: the page is minted as over an absent one. A
+   * page at the title's own slug is never replaced, whoever may read it.
+   */
+  readonly readable?: (rel: string) => boolean;
 }
 
 export interface DiscardOpenDecisionInput {
@@ -584,7 +596,7 @@ function withOpenDirLock<T>(vault: string, body: () => T): T {
   // and no decisions directory land in the vault.
   if (lanePagesInStore(vault)) return withLaneLock(vault, dir, body);
   mkdirSync(dir, { recursive: true });
-  const release = lockfile.lockSync(dir, { stale: OPEN_LOCK_STALE_MS, realpath: false });
+  const release = lockDirSync(dir, { stale: OPEN_LOCK_STALE_MS });
   try {
     return body();
   } finally {
@@ -632,7 +644,7 @@ export function openDecision(vault: string, input: OpenDecisionInput): OpenDecis
     const agent = explicitAgent ?? resolveAgentName(input.configPath);
 
     const dir = decisionsDir(vault);
-    const slug = slugify(title);
+    const slug = titleSlug(title);
     let id = `${OPEN_FILE_PREFIX}${slug}`;
     let suffix = 2;
     while (lanePageExists(vault, join(dir, `${id}${OPEN_FILE_EXT}`))) {
@@ -759,7 +771,7 @@ function mintHead(title: string): string {
   for (const word of title.split(/\s+/u)) {
     if (word === "") continue;
     const next = head === "" ? word : `${head} ${word}`;
-    if (slugify(next).length > MINT_HEAD_MAX) break;
+    if (titleSlug(next).length > MINT_HEAD_MAX) break;
     head = next;
   }
   return head;
@@ -768,19 +780,19 @@ function mintHead(title: string): string {
 /**
  * A derived mint title: `<head> (<id>)`, numbered `<head> (<id> N)` from
  * the second candidate on. The id - unique among records - is PRE-SHAVED
- * so the whole tail sits INSIDE the slug cap: `slugify` truncates from the
+ * so the whole tail sits INSIDE the slug cap: `titleSlug` truncates from the
  * START of the slug, so a tail appended past the cap is silently dropped
- * and every candidate would slugify identically - an occupied slug then
+ * and every candidate would titleSlug identically - an occupied slug then
  * wedges the mint walk forever. With the tail budgeted inside the cap the
  * numbered candidates keep their counter on the slug too (the id's slice
- * shrinks as the counter grows), so successive candidates slugify
+ * shrinks as the counter grows), so successive candidates titleSlug
  * distinctly and the walk terminates by construction.
  */
 function derivedMintTitle(sanitisedTitle: string, id: string, suffix: number): string {
   const counter = suffix === 0 ? "" : ` ${suffix}`;
   const counterLen = suffix === 0 ? 0 : 1 + String(suffix).length;
   const head = mintHead(sanitisedTitle);
-  const headLen = head === "" ? 0 : slugify(head).length + 1;
+  const headLen = head === "" ? 0 : titleSlug(head).length + 1;
   let budget = SLUG_MAX_LEN - headLen - counterLen;
   let effectiveHead = head;
   if (budget < 1) {
@@ -819,18 +831,38 @@ interface ResolveMintTarget {
  * second "Pick DB" question would otherwise be wedged open forever (and
  * a crash between minting and stamping would wedge the first one too).
  */
-function resolveMintTarget(vault: string, record: OpenDecisionRecord): ResolveMintTarget {
+function resolveMintTarget(
+  vault: string,
+  record: OpenDecisionRecord,
+  readable: ResolveOpenDecisionInput["readable"],
+): ResolveMintTarget {
   const reference = `[[${record.id}]]`;
   const sanitised = sanitiseMintTitle(record.title);
   let title = sanitised;
-  let slug = slugify(title);
   let suffix = 0;
   for (;;) {
+    // The slug `recordDecision` would refuse this title for
+    // (`takenDecisionSlug`): the new slug, a page an older release minted
+    // under the Latin-only slug that stores exactly this title, or a slug
+    // another decision claims. A page there that names this record is the
+    // crashed attempt's own; anything else is taken, and the walk moves on
+    // to a derived title.
+    const slug = takenDecisionSlug(vault, title, readable);
+    if (slug === null) return { title, slug: titleSlug(title), ours: false };
+    // The page is read for the record's reference only when the caller
+    // may read it: a withheld page is another record's for this caller,
+    // so withheld text never decides the target.
     const path = decisionPath(vault, slug);
-    if (!lanePageExists(vault, path)) return { title, slug, ours: false };
-    if ((readLaneText(vault, path) ?? "").includes(reference)) return { title, slug, ours: true };
+    const visible =
+      readable === undefined || readable(`${BRAIN_DECISIONS_REL}/decision-${slug}.md`);
+    if (
+      visible &&
+      lanePageExists(vault, path) &&
+      (readLaneText(vault, path) ?? "").includes(reference)
+    ) {
+      return { title, slug, ours: true };
+    }
     title = sanitiseMintTitle(derivedMintTitle(sanitised, record.id, suffix));
-    slug = slugify(title);
     suffix = suffix === 0 ? 2 : suffix + 1;
   }
 }
@@ -880,7 +912,7 @@ export function resolveOpenDecision(
     // rather than inventing a belief, and the body always carries the
     // provenance link so a crashed resolve can converge (see
     // {@link resolveMintTarget}).
-    const target = resolveMintTarget(vault, record);
+    const target = resolveMintTarget(vault, record, input.readable);
     let decisionId: string;
     if (target.ours) {
       // A previous attempt minted this page and crashed before stamping
@@ -897,6 +929,8 @@ export function resolveOpenDecision(
         agent: actor,
         now,
         ...(input.configPath !== undefined ? { configPath: input.configPath } : {}),
+        ...(input.origin !== undefined ? { origin: input.origin } : {}),
+        ...(input.readable !== undefined ? { readable: input.readable } : {}),
       });
       decisionId = minted.record.id;
     }
@@ -920,8 +954,10 @@ export function resolveOpenDecision(
           body: {
             open: `[[${record.id}]]`,
             decision: `[[${decisionId}]]`,
+            title: record.title,
             choice,
             agent: actor,
+            ...originFields(input.origin),
           },
         },
         { failOpen: true },

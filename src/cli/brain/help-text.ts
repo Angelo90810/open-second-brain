@@ -70,6 +70,7 @@ Brain verbs (observing memory):
   pin              Mark a preference exempt from automatic retire (idempotent)
   unpin            Clear the pinned flag (idempotent)
   state            Overwrite-only exact-state lane (set/get/list/clear --aspect)
+  standing-rules   The operator's standing rules: show, set, clear (--project|--harness|--host)
   set-primary      Declare or clear primary_agent in the brain settings (--clear)
   settings         Shared brain settings: get, set, unset, list (<block>.<field>)
   migrate-store    Move the legacy brain into the brain store
@@ -325,7 +326,13 @@ export const VERB_HELP: Record<string, string> = {
     "record's correction - blast-radius report by default, --apply retires the target\n" +
     "(validity close, or tombstone when --flatly-wrong), retargets mentions, appends\n" +
     "ledger correction events and bundle-correlated receipts. Tombstoned entries stay\n" +
-    "on disk for audit but are excluded from recall, inject, and active.md.\n",
+    "on disk for audit but are excluded from recall, inject, search and active.md.\n" +
+    "A target is its vault-relative path, its bare id (sig-..., pref-..., a Brain\n" +
+    "page name) or store:<id>. Once the vault is switched to the brain store the\n" +
+    "change is written to the record in the store, never to a legacy page, and\n" +
+    "every read surface drops a tombstoned record at once. A target the store\n" +
+    "does not hold is refused and nothing is written. This is the way to forget\n" +
+    "one signal or preference; the log events naming it leave search too.\n",
   expire:
     "usage: o2b brain expire <id> --expires <YYYY-MM-DD|ISO-8601|none>\n" +
     "  [--agent <name>] [--vault <path>] [--json]\n" +
@@ -543,6 +550,14 @@ export const VERB_HELP: Record<string, string> = {
   state:
     "usage: o2b brain state <set|get|list|clear> [--aspect <slug>] [--value <text>] [--vault <path>] [--json]\n" +
     "Overwrite-only exact-state lane keyed by aspect (Brain/state/). Each set replaces the aspect's canonical value with no history. The lane is excluded from the search index so a stale value never resurfaces through recall.\n",
+  "standing-rules":
+    "usage: o2b brain standing-rules <show|set|clear> [--project <name> | --harness <id> | --host <device id>]\n" +
+    "                                [--file <path> | --stdin] [--vault <path>] [--json]\n" +
+    "The operator's standing rules: the vault-wide rules, or with --project, --harness or --host one scoped rule file.\n" +
+    "show prints them as stored, set replaces them with the text of --file or stdin byte for byte, clear removes them.\n" +
+    "On a machine switched to the brain store the rules live in the store, and the vault may have no Brain/ folder:\n" +
+    "this verb is how to change them there. Elsewhere it writes Brain/standing-rules.md or the scoped file.\n" +
+    "No agent tool writes the standing rules.\n",
   rollback:
     "usage: o2b brain rollback <run_id> [--vault <path>] [--yes]\n" +
     "                          [--force-rollback] [--json]\n" +
@@ -950,8 +965,9 @@ export const VERB_HELP: Record<string, string> = {
     "vault once every device of the store has migrated or been retired; --force removes\n" +
     "it anyway. --force-release-gate releases the migration gate a run that is gone left\n" +
     "on this machine, unless its holder is still running. The forms exclude each other.\n" +
-    "Exit codes: 0 done (or a plan that maps every entry), 1 refused, failed, a plan with\n" +
-    "unmapped entries or a legacy tree kept in place, 2 usage error.\n",
+    "Exit codes: 0 done (or a plan that maps every entry, or nothing of the legacy tree\n" +
+    "left to remove), 1 refused, failed, a plan with unmapped entries or a legacy tree\n" +
+    "kept in place, 2 usage error.\n",
   "set-primary":
     "usage: o2b brain set-primary <name> [--vault <path>] [--agent <name>] [--json]\n" +
     "       o2b brain set-primary --clear [--vault <path>] [--agent <name>] [--json]\n" +
@@ -1129,7 +1145,8 @@ export const VERB_HELP: Record<string, string> = {
     "User-owned content (preferences/, retired/, inbox/, log/) is\n" +
     "never touched.\n" +
     "--dry-run (default) prints a per-file plan with a unified diff\n" +
-    "for every pending update. Exit 0 regardless of pending count.\n" +
+    "for every pending update. Exit 0 regardless of pending count, 1 when a\n" +
+    "file could not be read or planned (its ERROR line names it).\n" +
     "--check is dry-run + exit 2 when anything is pending or in error\n" +
     "(CI-friendly).\n" +
     "--apply takes a pre-apply snapshot named upgrade-<ts> (rollback\n" +
@@ -1329,6 +1346,8 @@ export const VERB_HELP: Record<string, string> = {
     "Brain/retired/ with retire-shaped frontmatter (_status, retired_at,\n" +
     "retired_reason, optional superseded_by, old-id alias). The directory move\n" +
     "excludes it from the dream pass while it stays readable in Brain/retired/.\n" +
+    "A retired signal stays searchable as history; to forget a\n" +
+    "signal use `o2b brain lifecycle tombstone <id> --reason <text>` instead.\n" +
     "Retiring a missing, already-retired, or non-signal id exits 2 (never a\n" +
     "silent no-op).\n",
   capture:

@@ -24,6 +24,7 @@ import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -34,9 +35,11 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import lockfile from "proper-lockfile";
+import { Database } from "bun:sqlite";
 
 import { indexVault, reindexVault } from "../../../src/core/search/indexer.ts";
 import { Store } from "../../../src/core/search/store.ts";
+import { parkMarkerPath, writeParkMarker } from "../../../src/core/search/store/lifecycle.ts";
 import {
   acquireWriterLease,
   acquireWriterLeaseSync,
@@ -46,10 +49,12 @@ import {
   WRITER_LOCK_STALE_ENV,
   type WriterLease,
 } from "../../../src/core/search/store/writer-lock.ts";
+import { LockDirectoryRefusedError } from "../../../src/core/fs-lock.ts";
 import { SearchError } from "../../../src/core/search/types.ts";
 import { createTempVault, makeConfig, writeMd } from "../../helpers/search-fixtures.ts";
 import { CHMOD_CANNOT_DENY } from "../../helpers/platform.ts";
 import { tempDirs } from "../../helpers/temp-dir.ts";
+import { windowsRefusal } from "../../helpers/windows-lock-refusal.ts";
 
 setDefaultTimeout(30_000);
 
@@ -111,6 +116,31 @@ function runChild(name: string, source: string): string {
 }
 
 const importLease = `import { acquireWriterLeaseSync } from ${JSON.stringify(WRITER_LOCK_MODULE)};`;
+
+test("an ENOENT stat race never removes the next writer's fresh lock", () => {
+  mkdirSync(lockDir);
+  let raced = false;
+  const realStat = fs.statSync;
+  // Every other call reaches the real stat with its options intact, and
+  // the spy is undone before the test ends: other files in this process
+  // stat with `bigint` and `throwIfNoEntry`.
+  const spy = spyOn(fs, "statSync").mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
+    if (path === lockDir && !raced) {
+      raced = true;
+      rmSync(lockDir, { recursive: true, force: true });
+      mkdirSync(lockDir);
+      throw Object.assign(new Error("released before stat"), { code: "ENOENT" });
+    }
+    return (realStat as (...args: unknown[]) => unknown)(path, ...rest);
+  }) as typeof fs.statSync);
+  try {
+    expect(() => acquireWriterLeaseSync(dbPath)).toThrow();
+  } finally {
+    spy.mockRestore();
+  }
+  expect(raced).toBe(true);
+  expect(existsSync(lockDir)).toBe(true);
+});
 
 test("a holder blocked in a child process keeps the lock past two stale windows", () => {
   const lease = acquireWriterLeaseSync(dbPath);
@@ -336,6 +366,29 @@ test.skipIf(CHMOD_CANNOT_DENY)("a commit check that cannot read the lock refuses
   }
 });
 
+test.skipIf(CHMOD_CANNOT_DENY)(
+  "a folder that refuses new entries is that refusal on both acquire paths, not another writer",
+  async () => {
+    const guarded = join(dir, "readonly");
+    mkdirSync(guarded);
+    const path = join(guarded, "index.sqlite");
+    chmodSync(guarded, 0o500);
+    try {
+      expect(() => acquireWriterLeaseSync(path)).toThrow(LockDirectoryRefusedError);
+      let caught: unknown;
+      try {
+        await acquireWriterLease(path);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(LockDirectoryRefusedError);
+      expect((caught as LockDirectoryRefusedError).code).toBe("EACCES");
+    } finally {
+      chmodSync(guarded, 0o700);
+    }
+  },
+);
+
 test("a lock the filesystem refuses to stamp is reported as that fault, not as another writer", async () => {
   // Whichever call stamps the directory on this platform refuses it.
   const refuse = (): never => {
@@ -512,6 +565,187 @@ test("a reindex whose lock was taken over refuses its swap and leaves the live i
     expect(statSync(v.dbPath).ino).toBe(liveIno);
     expect(readFileSync(v.dbPath).equals(live)).toBe(true);
   } finally {
+    v.cleanup();
+  }
+});
+
+test("the rebuild keeps its writer lease fresh through the parked-name preflight", async () => {
+  const v = createTempVault("lease-preflight");
+  try {
+    writeMd(v.vault, "note.md", "# Note\n\nbody text\n");
+    const config = makeConfig({ vault: v.vault, dbPath: v.dbPath });
+    await indexVault(config);
+    // Both parked names are held and the prune can free neither: a parked
+    // index richer in stored vectors than the live one (the prune keeps it)
+    // and a parked index that cannot be read (the prune keeps it too). The
+    // preflight therefore weighs them, checks the live index - the same
+    // check the swap runs - and refuses.
+    copyFileSync(v.dbPath, `${v.dbPath}.old`);
+    const parked = new Database(`${v.dbPath}.old`);
+    try {
+      parked.run(
+        "INSERT INTO embeddings(chunk_id, model, dimension, embedding_hash, created_at, updated_at) " +
+          "SELECT id, 'probe', 4, 'h', '', '' FROM chunks LIMIT 5",
+      );
+    } finally {
+      parked.close(true);
+    }
+    writeFileSync(`${v.dbPath}.bak`, Buffer.from("not a database, only bytes. ".repeat(400)));
+
+    // The check blocks this thread for longer than the stale window, the
+    // way a scan of a large index does: the lease must be kept fresh off
+    // it, the way the swap keeps it fresh through the same check.
+    let lockAgeMs = -1;
+    let slowed = false;
+    const realQuery = Database.prototype.query;
+    const spy = spyOn(Database.prototype, "query").mockImplementation(function (
+      this: Database,
+      sql: string,
+      ...rest: unknown[]
+    ) {
+      const stmt = (realQuery as unknown as (...a: unknown[]) => unknown).apply(this, [
+        sql,
+        ...rest,
+      ]);
+      if (typeof sql === "string" && sql.includes("quick_check") && !slowed) {
+        slowed = true;
+        const realAll = (stmt as { all: (...a: unknown[]) => unknown }).all.bind(stmt);
+        (stmt as { all: unknown }).all = (...a: unknown[]) => {
+          Bun.sleepSync(2 * STALE_MS);
+          lockAgeMs = Date.now() - statSync(`${v.dbPath}.lock`).mtimeMs;
+          return realAll(...a);
+        };
+      }
+      return stmt;
+    } as unknown as typeof Database.prototype.query);
+    try {
+      // The preflight refuses before the build: nothing is written.
+      await expect(reindexVault(config)).rejects.toThrow(/could not be read/);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The lock is younger than the stale window: it was refreshed while
+    // the check ran, so no other writer could take it over and the rebuild
+    // could not lose its lease between the preflight and the swap.
+    expect(lockAgeMs).toBeGreaterThanOrEqual(0);
+    expect(lockAgeMs).toBeLessThan(STALE_MS);
+  } finally {
+    v.cleanup();
+  }
+});
+
+test("a Windows refusal while the previous writer releases the lock is waited out", () => {
+  // Windows answers a mkdir of a directory its holder is removing with
+  // EPERM, and the name can be gone again by the time anyone looks.
+  mkdirSync(lockDir);
+  const real = fs.mkdirSync;
+  let refusals = 0;
+  const spy = spyOn(fs, "mkdirSync").mockImplementation(((
+    path: fs.PathLike,
+    options?: fs.MakeDirectoryOptions,
+  ) => {
+    if (String(path) === lockDir && refusals < 2) {
+      refusals += 1;
+      rmSync(lockDir, { recursive: true, force: true });
+      throw windowsRefusal(lockDir);
+    }
+    return real(path, options);
+  }) as typeof fs.mkdirSync);
+  try {
+    const lease = acquireWriterLeaseSync(dbPath);
+    lease.release();
+  } finally {
+    spy.mockRestore();
+  }
+  expect(refusals).toBe(2);
+});
+
+test("a lock taken over while an open restores the parked index leaves the set and its record to the new holder", async () => {
+  const v = createTempVault("lease-restore-parked");
+  let successor: WriterLease | null = null;
+  try {
+    writeMd(v.vault, "note.md", "# Note\n\nbody text\n");
+    const config = makeConfig({ vault: v.vault, dbPath: v.dbPath });
+    await indexVault(config);
+    // A rebuild stopped after parking: the index at `.bak` with a sibling,
+    // no live file, and the park record naming `.bak`.
+    fs.renameSync(v.dbPath, `${v.dbPath}.bak`);
+    writeFileSync(`${v.dbPath}.bak-journal`, "");
+    writeParkMarker(v.dbPath, `${v.dbPath}.bak`);
+    const realRename = fs.renameSync;
+    const spy = spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      realRename(from, to);
+      // The sibling has just come back: another writer takes the lock
+      // before the main file follows it.
+      if (String(from) === `${v.dbPath}.bak-journal` && successor === null) {
+        rmSync(`${v.dbPath}.lock`, { recursive: true });
+        successor = acquireWriterLeaseSync(v.dbPath);
+      }
+    });
+    try {
+      const store = await Store.open(config, { mode: "read" });
+      await store.close();
+    } catch {
+      // No live index is the expected outcome once the lock was lost.
+    } finally {
+      spy.mockRestore();
+    }
+    expect(successor).not.toBeNull();
+    // The stale recovery renames nothing more and keeps the record.
+    expect(existsSync(v.dbPath)).toBe(false);
+    expect(existsSync(`${v.dbPath}.bak`)).toBe(true);
+    expect(existsSync(parkMarkerPath(v.dbPath))).toBe(true);
+    (successor as WriterLease | null)?.release();
+    // The next holder finishes the restore by the record.
+    const restored = await Store.open(config, { mode: "read" });
+    await restored.close();
+    expect(existsSync(v.dbPath)).toBe(true);
+    expect(existsSync(parkMarkerPath(v.dbPath))).toBe(false);
+  } finally {
+    (successor as WriterLease | null)?.release();
+    v.cleanup();
+  }
+});
+
+test("a lock taken over while the swap parks the live index never publishes the new one", async () => {
+  const v = createTempVault("lease-swap-publish");
+  let successor: WriterLease | null = null;
+  try {
+    writeMd(v.vault, "note.md", "# Note\n\nbody text\n");
+    const config = makeConfig({ vault: v.vault, dbPath: v.dbPath });
+    await indexVault(config);
+    const liveIno = statSync(v.dbPath).ino;
+    let refused: unknown = null;
+    const realRename = fs.renameSync;
+    const spy = spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      realRename(from, to);
+      // The previous index has just been parked: another writer takes the
+      // lock before the new index is renamed in.
+      if (String(from) === v.dbPath && successor === null) {
+        rmSync(`${v.dbPath}.lock`, { recursive: true });
+        successor = acquireWriterLeaseSync(v.dbPath);
+      }
+    });
+    try {
+      await reindexVault(config);
+    } catch (err) {
+      refused = err;
+    } finally {
+      spy.mockRestore();
+    }
+    expect(successor).not.toBeNull();
+    expect((refused as SearchError | null)?.code).toBe("INDEX_LOCKED");
+    // The stale writer cannot overwrite its successor. The previous index
+    // remains parked until the next owner restores it.
+    expect(existsSync(v.dbPath)).toBe(false);
+    expect(statSync(`${v.dbPath}.bak`).ino).toBe(liveIno);
+    (successor as WriterLease | null)?.release();
+    const restored = await Store.open(config, { mode: "read" });
+    await restored.close();
+    expect(statSync(v.dbPath).ino).toBe(liveIno);
+  } finally {
+    (successor as WriterLease | null)?.release();
     v.cleanup();
   }
 });

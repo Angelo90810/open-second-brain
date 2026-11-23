@@ -12,11 +12,14 @@
  */
 
 import { lstatSync, readdirSync, readFileSync, type Dirent } from "node:fs";
-import { basename, join, relative, sep } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
+
+import { isStoreFamilyEntry } from "../search/store-family.ts";
+import { checksum, fileStamp, stampInode, type IncrementalReads } from "./incremental-reads.ts";
 
 import { isSyncConflictName, parseShardedName } from "../brain/ledger-shards.ts";
 import { DEGRADATION_CODE } from "../integrity/degradation.ts";
-import { parseFrontmatterWithNotices } from "../vault.ts";
+import { parseFrontmatterTextWithNotices, parseFrontmatterWithNotices } from "../vault.ts";
 import {
   entryOfPath,
   laneNameRefusal,
@@ -53,6 +56,17 @@ export interface ScanTally {
   unshardedFiles: number;
   readonly devices: Map<string, DeviceTally>;
   readonly problems: ScanProblem[];
+  /**
+   * What earlier passes read of each JSONL file (`incremental-reads.ts`):
+   * an unchanged file is skipped, an appended one read from where the
+   * last read ended. Absent: every file is read whole.
+   */
+  incremental?: IncrementalReads;
+  /**
+   * Called for every item the scan reaches, before it is parsed or handed
+   * to the visitor: the one place a pass counts the rows it visits.
+   */
+  onVisit?: (path: string, line: number | null) => void;
 }
 
 export function emptyTally(): ScanTally {
@@ -77,6 +91,9 @@ const JSON_EXT = ".json";
 const STRICT_UTF8 = new TextDecoder("utf-8", { fatal: true });
 const PAGE_EXT = ".md";
 
+/** How the scan names a folder it could not list (`dry-run.ts` counts them). */
+export const CANNOT_LIST_PREFIX = "cannot list:";
+
 /** The entries of a directory, or none when it does not exist. */
 function entries(dir: string, tally: ScanTally): Dirent[] {
   try {
@@ -86,14 +103,21 @@ function entries(dir: string, tally: ScanTally): Dirent[] {
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code !== "ENOENT" && code !== "ENOTDIR") {
-      tally.problems.push({ path: dir, line: null, reason: `cannot list: ${String(code)}` });
+      tally.problems.push({
+        path: dir,
+        line: null,
+        reason: `${CANNOT_LIST_PREFIX} ${String(code)}`,
+      });
     }
     return [];
   }
 }
 
 /** Size a regular file; a link or special file is reported and skipped. */
-function regularFile(path: string, tally: ScanTally): { size: number; mtimeMs: number } | null {
+function regularFile(
+  path: string,
+  tally: ScanTally,
+): { size: number; mtimeMs: number; stamp: string } | null {
   let stat;
   try {
     stat = lstatSync(path);
@@ -112,10 +136,12 @@ function regularFile(path: string, tally: ScanTally): { size: number; mtimeMs: n
   }
   tally.files += 1;
   tally.bytes += stat.size;
-  return { size: stat.size, mtimeMs: stat.mtimeMs };
+  return { size: stat.size, mtimeMs: stat.mtimeMs, stamp: fileStamp(stat) };
 }
 
 function visit(tally: ScanTally, path: string, line: number | null, fn: () => void): boolean {
+  // Every item the scan reaches, whatever becomes of it.
+  tally.onVisit?.(path, line);
   try {
     fn();
     tally.items += 1;
@@ -144,13 +170,29 @@ export function rawLines(bytes: Buffer): Buffer[] {
   return out;
 }
 
+/**
+ * The rows of one JSONL file. `itemPath` is the path the items carry (the
+ * file itself, or the original a conflict copy is a version of), and
+ * `mtimeMs` null leaves the device tallies alone (a copy's time is when
+ * the conflict happened, not when its device last wrote).
+ */
 function scanJsonlFile(
   path: string,
   shardId: string,
-  mtimeMs: number,
+  mtimeMs: number | null,
   tally: ScanTally,
   visitor: ItemVisitor,
+  itemPath: string = path,
+  stamp: string | null = null,
 ): void {
+  // An earlier pass read this file: unchanged, it is not opened at all.
+  const incremental = stamp === null ? undefined : tally.incremental;
+  const known = incremental?.lookup(path);
+  if (incremental !== undefined && known !== undefined && known.stamp === stamp) {
+    incremental.record(path, known);
+    tallyDevice(tally, shardId, mtimeMs, known.items);
+    return;
+  }
   let bytes: Buffer;
   try {
     bytes = readFileSync(path);
@@ -163,7 +205,21 @@ function scanJsonlFile(
   }
   let items = 0;
   const lines = rawLines(bytes);
-  for (const [index, line] of lines.entries()) {
+  // Appended to since the last read, the lines read before unchanged: only
+  // the new lines are parsed and judged.
+  let start = 0;
+  if (
+    known !== undefined &&
+    stamp !== null &&
+    stampInode(known.stamp) === stampInode(stamp) &&
+    bytes.length >= known.bytes &&
+    checksum(bytes.subarray(0, known.bytes)) === known.sha
+  ) {
+    start = known.lines;
+    items = known.items;
+  }
+  for (let index = start; index < lines.length; index++) {
+    const line = lines[index]!;
     let raw: string | null;
     try {
       raw = STRICT_UTF8.decode(line);
@@ -181,10 +237,31 @@ function scanJsonlFile(
           index === lines.length - 1 ? "an incomplete last line, not JSON" : "not JSON",
         );
       }
-      visitor({ shape: "line", path, line: index + 1, row, device: shardId });
+      visitor({ shape: "line", path: itemPath, line: index + 1, row, device: shardId });
     });
     if (ok) items += 1;
   }
+  if (incremental !== undefined && stamp !== null) {
+    // Complete lines only: a last line without its newline is read again.
+    const complete = bytes.lastIndexOf(0x0a) + 1;
+    incremental.record(path, {
+      stamp,
+      bytes: complete,
+      lines: lines.length - 1,
+      sha: checksum(bytes.subarray(0, complete)),
+      items,
+    });
+  }
+  tallyDevice(tally, shardId, mtimeMs, items);
+}
+
+function tallyDevice(
+  tally: ScanTally,
+  shardId: string,
+  mtimeMs: number | null,
+  items: number,
+): void {
+  if (mtimeMs === null) return;
   if (shardId === "") {
     tally.unshardedFiles += 1;
     return;
@@ -213,7 +290,7 @@ function scanJsonl(
       const path = join(dir, entry.name);
       const stat = regularFile(path, tally);
       if (stat === null) continue;
-      scanJsonlFile(path, parsed.shardId, stat.mtimeMs, tally, visitor);
+      scanJsonlFile(path, parsed.shardId, stat.mtimeMs, tally, visitor, path, stat.stamp);
     }
   }
 }
@@ -312,18 +389,31 @@ function topFolders(root: string): string[] {
   }
 }
 
-function entryItem(locator: Extract<Locator, { shape: "entries" }>, path: string): LegacyItem {
+function entryItem(
+  locator: Extract<Locator, { shape: "entries" }>,
+  path: string,
+  readPath: string = path,
+): LegacyItem {
   const place = entryPlace(locator, path);
   if (path.endsWith(PAGE_EXT)) {
-    const [frontmatter, body, notices] = parseFrontmatterWithNotices(path);
+    // Read once: the page's text is kept beside its parts, so the record
+    // can carry the file byte for byte (`raw`) when its fields and text do
+    // not reproduce it (a page with no frontmatter, a quoted value, CRLF).
+    let raw: string;
+    try {
+      raw = readFileSync(readPath, "utf8");
+    } catch {
+      throw new Error("unreadable page");
+    }
+    const [frontmatter, body, notices] = parseFrontmatterTextWithNotices(raw, { path: readPath });
     if (notices.some((n) => n.code === DEGRADATION_CODE.frontmatterUnreadable)) {
       throw new Error("unreadable page");
     }
-    return { shape: "entry", path, ...place, fields: frontmatter, text: body };
+    return { shape: "entry", path, ...place, fields: frontmatter, text: body, raw };
   }
   let text: string;
   try {
-    text = STRICT_UTF8.decode(readFileSync(path));
+    text = STRICT_UTF8.decode(readFileSync(readPath));
   } catch {
     throw new Error("not UTF-8 text");
   }
@@ -337,7 +427,14 @@ function entryItem(locator: Extract<Locator, { shape: "entries" }>, path: string
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
       return { shape: "entry", path, ...place, fields: { value }, text: "" };
     }
-    return { shape: "entry", path, ...place, fields: value as Record<string, unknown>, text: "" };
+    return {
+      shape: "entry",
+      path,
+      ...place,
+      fields: value as Record<string, unknown>,
+      text: "",
+      raw: text,
+    };
   }
   return { shape: "entry", path, ...place, fields: {}, text };
 }
@@ -392,6 +489,19 @@ function scanTreeMatching(locator: Extract<Locator, { shape: "tree" }>, tally: S
   }
 }
 
+/**
+ * Count a search index store file and the files its store layer keeps
+ * beside it (`search/store-family.ts`) as files and bytes: sized with
+ * `lstat` only, never read.
+ */
+function scanStoreFamily(path: string, tally: ScanTally): void {
+  const base = basename(path);
+  for (const entry of entries(dirname(path), tally)) {
+    if (entry.isDirectory() || !isStoreFamilyEntry(entry.name, base, false)) continue;
+    if (regularFile(join(dirname(path), entry.name), tally) !== null) tally.items += 1;
+  }
+}
+
 /** Scan one locator into `tally`, handing every readable item to `visitor`. */
 export function scanLocator(locator: Locator, tally: ScanTally, visitor: ItemVisitor): void {
   switch (locator.shape) {
@@ -406,8 +516,66 @@ export function scanLocator(locator: Locator, tally: ScanTally, visitor: ItemVis
     case "entries":
       return scanEntries(locator, tally, visitor);
     case "tree":
+      if (locator.family === true) return scanStoreFamily(locator.path, tally);
       return locator.grammar === undefined
         ? scanTree(locator.path, tally)
         : scanTreeMatching(locator, tally);
+  }
+}
+
+/**
+ * The rows of a sync tool's conflict copy at `copyPath` of the JSONL file
+ * `originalPath` that `locator` reads: each item carries the original's
+ * path and shard device, so it builds the record the original's row
+ * would. The device tallies are left alone. A copy whose original name
+ * does not fit the locator's grammar holds no rows.
+ */
+export function scanCopyLines(
+  locator: Locator,
+  copyPath: string,
+  originalPath: string,
+  tally: ScanTally,
+  visitor: ItemVisitor,
+): void {
+  if (locator.shape !== "jsonl") return;
+  const parsed = parseShardedName(basename(originalPath), locator.grammar);
+  if (parsed === null) return;
+  if (regularFile(copyPath, tally) === null) return;
+  scanJsonlFile(copyPath, parsed.shardId, null, tally, visitor, originalPath);
+}
+
+/**
+ * The one item a file of a one-item-per-file locator holds (a page, a
+ * JSON file, a lane entry, a whole text file), read from `readPath` and
+ * carrying `path`: the original's own item, or a conflict copy's version
+ * of it. Null for a locator whose files are not one item each; throws
+ * when the file cannot be read as its surface writes it.
+ */
+export function readFileItem(locator: Locator, path: string, readPath: string): LegacyItem | null {
+  const stat = lstatSync(readPath);
+  if (!stat.isFile()) throw new Error("a link or special file, not read");
+  switch (locator.shape) {
+    case "pages": {
+      const [frontmatter, body, notices] = parseFrontmatterWithNotices(readPath);
+      if (notices.some((n) => n.code === DEGRADATION_CODE.frontmatterUnreadable)) {
+        throw new Error("unreadable page");
+      }
+      return { shape: "page", path, frontmatter, body };
+    }
+    case "json-files": {
+      let value: unknown;
+      try {
+        value = JSON.parse(readFileSync(readPath, "utf8")) as unknown;
+      } catch {
+        throw new Error("not JSON");
+      }
+      return { shape: "json-file", path, value };
+    }
+    case "text":
+      return { shape: "text", path, text: readFileSync(readPath, "utf8") };
+    case "entries":
+      return entryItem(locator, path, readPath);
+    default:
+      return null;
   }
 }

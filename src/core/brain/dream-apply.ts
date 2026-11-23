@@ -23,23 +23,23 @@
  * knows where that point is.
  */
 
+import { sameDevIno } from "../fs-identity.ts";
 import { legacyVaultOf } from "./no-vault.ts";
 import type { Authority } from "../store/constants.ts";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync } from "node:fs";
 import { basename } from "node:path";
 
-import { appendDecisionChangeReceipt } from "./decisions/receipts.ts";
+import { openReceiptBatch } from "./decisions/receipts.ts";
 import { preferenceSlug, type PlanState } from "./dream-plan.ts";
 import { SafeguardAbortError, SafeguardTimeoutError, type Safeguard } from "./safeguard.ts";
 import type { RefreshResult } from "./dream-refresh.ts";
 import type { DreamGatedRetireEntry } from "./dream-types.ts";
 import { WORKRUN_PHASE, type WorkrunHandle } from "./dream-workrun.ts";
-import { collectEvidenceForSlug } from "./evidence.ts";
 import { runHealEnrichment } from "./heal-run.ts";
 import { CHAIN_DECAY_STALE_DAYS } from "./inject-governor.ts";
 import { appendLogEvent } from "./log.ts";
 import { archivedSignalPath, brainDirs, preferencePathOf, processedSignalPath } from "./paths.ts";
-import { loadPreference, moveToRetired } from "./preference.ts";
+import { loadPreference, moveToRetired, preferenceFromStoreEntry } from "./preference.ts";
 import { isRetiredEntry, preferencesStoreOnly, storePreferenceEntry } from "./preference-store.ts";
 import { writePreferenceTxn } from "./preference-txn.ts";
 import { isoSecond } from "./time.ts";
@@ -54,9 +54,20 @@ import {
 } from "./types.ts";
 import { renameWithRetry } from "../fs-atomic.ts";
 import { parseFrontmatter } from "../vault.ts";
-import { routeSignalState, signalsStoreOnly } from "./signal-state.ts";
-import { readStoreEntities } from "../store/read/store-entities.ts";
+import { routeSignalState, signalsStoreOnly, writeStoreSignalStates } from "./signal-state.ts";
+import {
+  configuredStore,
+  holdStoreEntities,
+  readStoreEntities,
+  type HeldEntities,
+  type StorePreference,
+} from "../store/read/store-entities.ts";
+import { readShard, shardReadGap } from "../store/reader.ts";
+import { listShards } from "../store/shard-list.ts";
+import type { StoreInspection } from "../store/store-open.ts";
+import { partitionDir } from "../store/store-paths.ts";
 import { REMOTE_DENY_VISIBILITY_TOKEN } from "../graph/visibility.ts";
+import type { WindowContext, WindowEvidence } from "./dream-replay/window.ts";
 
 /**
  * The authority of every dream write under brain store dual writes: dream
@@ -73,9 +84,9 @@ const DEFAULT_DREAM_AGENT = "dream";
 export interface DreamApplyInput {
   readonly vault: string | null;
   readonly cfg: BrainConfig;
-  readonly now: Date;
   readonly plan: PlanState;
   readonly refresh: RefreshResult;
+  readonly window: WindowContext<WindowEvidence>;
   /** Identity threaded into edit-history and decision receipts. */
   readonly agentName: string | undefined;
   /** `[[Brain/log/<date>]]`, stamped as `retired_by` on each move. */
@@ -118,7 +129,8 @@ export function plannedSignalArchiveIds(plan: PlanState): string[] {
 }
 
 export function applyDreamPlan(input: DreamApplyInput): DreamApplyResult {
-  const { vault, cfg, now, plan, refresh, wikilinkToRun, workrun } = input;
+  const { vault, cfg, plan, refresh, wikilinkToRun, workrun } = input;
+  const now = input.window.instant;
   const agent = input.agentName ?? DEFAULT_DREAM_AGENT;
 
   // This module renames signal files directly, so it owes the vault-identity
@@ -128,8 +140,13 @@ export function applyDreamPlan(input: DreamApplyInput): DreamApplyResult {
   // With no vault the store writes check the store identity (D14 item 13).
   if (vault !== null) assertVaultIdentityForWrite(vault);
 
-  writePreferences(input, agent);
-  writeConfidenceReceipts(vault, refresh, agent, now);
+  // Each rewrite's confidence receipt is written right after it, so a pass
+  // stopped at its deadline between two rewrites still leaves the receipt
+  // of every band change it wrote (the next pass sees the new band and
+  // plans no receipt for it); the rest are written after the loop.
+  const receipts = confidenceReceipts(vault, refresh, agent, now);
+  writePreferences(input, agent, receipts);
+  receipts.rest();
 
   // Synthesize is durable here and nowhere earlier: every new
   // unconfirmed preference, every refreshed preference and every
@@ -139,7 +156,15 @@ export function applyDreamPlan(input: DreamApplyInput): DreamApplyResult {
   workrun?.checkpoint(WORKRUN_PHASE.promoteComplete);
   workrun?.checkpoint(WORKRUN_PHASE.synthesizeComplete);
 
-  const gatedRetires = executeRetires(vault, cfg, now, plan, wikilinkToRun);
+  const gatedRetires = executeRetires(
+    vault,
+    cfg,
+    now,
+    plan,
+    wikilinkToRun,
+    input.window,
+    input.safeguard,
+  );
 
   // Every planned retire has been moved (or explicitly gated) by here.
   workrun?.checkpoint(WORKRUN_PHASE.retireComplete);
@@ -172,8 +197,13 @@ export function applyDreamPlan(input: DreamApplyInput): DreamApplyResult {
  * array is deliberate - dream's plan-time logic has already decided to
  * proceed; the txn just owns the bookkeeping.
  */
-function writePreferences(input: DreamApplyInput, agent: string): void {
-  const { vault, cfg, now, plan, refresh } = input;
+function writePreferences(
+  input: DreamApplyInput,
+  agent: string,
+  receipts: ConfidenceReceipts,
+): void {
+  const { vault, cfg, plan, refresh } = input;
+  const now = input.window.instant;
   const historyOpts = { agent, now: () => now };
 
   for (const np of plan.newUnconfirmed) {
@@ -254,11 +284,16 @@ function writePreferences(input: DreamApplyInput, agent: string): void {
   }
 
   for (const update of refresh.updated.values()) {
+    // Between rewrites: each is a whole write of one preference that the
+    // next pass plans again from what is on disk, so a pass past its
+    // deadline stops here with what it wrote kept, rather than after the
+    // last of hundreds of rewrites on a migrated store.
+    input.safeguard?.checkpoint();
     // Rebuild the evidence slice from the log on every pass so the
     // pref body stays in sync with the counters even when the
     // counters themselves stayed put (e.g. dropping the
     // v0.9.x placeholder body during a no-counter-change run).
-    const ev = collectEvidenceForSlug(vault, update.slug, {
+    const ev = input.window.evidence.lookup(update.slug, {
       sinceIso: update.created_at,
     });
     // The freshness trend was classified at PLAN time (planRefresh)
@@ -308,6 +343,7 @@ function writePreferences(input: DreamApplyInput, agent: string): void {
       { overwrite: true, authority: DREAM_AUTHORITY },
       historyOpts,
     );
+    receipts.of(update.slug);
   }
 }
 
@@ -320,20 +356,37 @@ function writePreferences(input: DreamApplyInput, agent: string): void {
  * byte-identical no-op guarantees. The receipt's idempotency key
  * (subject + before + after) makes a re-run a no-op. Fail-soft.
  */
-function writeConfidenceReceipts(
+interface ConfidenceReceipts {
+  /** Write the receipts of preference `slug`'s band changes, once. */
+  of(slug: string): void;
+  /** Write every receipt not yet written. */
+  rest(): void;
+}
+
+/**
+ * The pass's confidence receipts, written through one receipts batch: the
+ * ledger is read once for the whole pass, not once per drop. That widens
+ * the idempotency window from one receipt to the whole pass: another
+ * writer appending the same receipt (subject, before and after) while the
+ * pass runs is not seen, so the worst case is one duplicate ledger line,
+ * which every reader dedupes by its idempotency key.
+ */
+function confidenceReceipts(
   vault: string | null,
   refresh: RefreshResult,
   agent: string,
   now: Date,
-): void {
+): ConfidenceReceipts {
   // Decision-change receipts are a vault lane until the decisions lane has
   // a record kind (design D14 item 2); with no vault they are not written.
-  if (vault === null) return;
-  for (const d of refresh.bandDrops) {
+  const pending = vault === null ? [] : [...refresh.bandDrops];
+  let batch: ReturnType<typeof openReceiptBatch> | null = null;
+  const write = (d: RefreshResult["bandDrops"][number]): void => {
     const before = `confidence:${d.previous}${d.previous_value !== null ? `(${d.previous_value.toFixed(2)})` : ""}`;
     const after = `confidence:${d.next}(${d.next_value.toFixed(2)})`;
     try {
-      appendDecisionChangeReceipt(vault, {
+      batch ??= openReceiptBatch(vault!);
+      batch.append({
         subject: d.id,
         before,
         after,
@@ -347,7 +400,17 @@ function writeConfidenceReceipts(
       // Accountability mirror is best-effort; the refreshed preference
       // bytes remain authoritative.
     }
-  }
+  };
+  const take = (match: (d: RefreshResult["bandDrops"][number]) => boolean): void => {
+    for (let i = 0; i < pending.length;) {
+      if (match(pending[i]!)) write(pending.splice(i, 1)[0]!);
+      else i += 1;
+    }
+  };
+  return {
+    of: (slug) => take((d) => d.id === `pref-${slug}`),
+    rest: () => take(() => true),
+  };
 }
 
 /** Step 3: move each planned retire into `retired/`, honouring the evidence gate. */
@@ -357,17 +420,37 @@ function executeRetires(
   now: Date,
   plan: PlanState,
   wikilinkToRun: string,
+  window: WindowContext<WindowEvidence>,
+  safeguard?: Safeguard,
 ): DreamGatedRetireEntry[] {
   // v0.12.0 Brain Integrity Suite: declined retires accumulate here.
   // Always an array (even when no gate is configured) so the eventual
   // DreamRunSummary.gated_retires field is consistently shaped.
   const gatedRetires: DreamGatedRetireEntry[] = [];
   const gateThreshold = cfg.retire.confirmed_evidence_min_threshold;
+  // The store's fold is read once for the whole loop, not once per retire:
+  // a retire changes only its own preference, and that one is noted here,
+  // so the snapshot answers every later slug as a fresh read would. What
+  // it does not see is another machine's record that arrives while the
+  // loop runs, so before each retire the bytes appended to the `events`
+  // shards since the snapshot are checked for a record about that
+  // preference, and when one is there the fold is read afresh (below).
+  // The evidence gate keeps reading the snapshot: its counters decide
+  // only whether to skip, never what to write.
+  const held = heldPreferences(vault);
+  const retiredHere = new Set<string>();
 
   for (const r of plan.retires) {
+    // Between retires, like the rewrites above: a retire not reached is
+    // planned again by the next pass.
+    safeguard?.checkpoint();
     const fromPath = preferencePathOf(vault, r.slug);
     // The page on an unswitched machine, the store's fold once switched.
-    if (!preferenceHeld(vault, r.slug, fromPath)) continue;
+    if (
+      held === null ? !existsSync(fromPath) : !held.entries.has(r.slug) || retiredHere.has(r.slug)
+    ) {
+      continue;
+    }
     // v0.12.0 Brain Integrity Suite: destructive-from-confirmed gate.
     // When the operator has set retire.confirmed_evidence_min_threshold,
     // refuse to retire a confirmed (unpinned) pref whose accumulated
@@ -375,7 +458,13 @@ function executeRetires(
     // retires bypass.
     if (gateThreshold !== undefined && gateThreshold > 0) {
       try {
-        const existing = loadPreference(vault, r.slug);
+        // From the loop's snapshot when the store holds it: loading it
+        // again would rebuild the fold after the previous retire's append.
+        const entry = held?.entries.get(r.slug);
+        const existing =
+          entry !== undefined
+            ? preferenceFromStoreEntry(vault, r.slug, entry)
+            : loadPreference(vault, r.slug);
         if (existing !== null && shouldGateRetireFromConfirmed(existing, r.reason, gateThreshold)) {
           gatedRetires.push({
             pref_id: existing.id,
@@ -392,13 +481,37 @@ function executeRetires(
         // (moveToRetired will surface the error through stderr below).
       }
     }
+    // The entry the retire writes from: the snapshot's, unless a record
+    // about this preference arrived since the snapshot (another machine's
+    // removal or retire, a person's edit), or the check cannot tell; then
+    // the fold is read afresh, and a preference no longer active is left
+    // alone. A stale entry would otherwise propose, with the snapshot's
+    // fields, that a removed preference exists again.
+    let storeEntry = held?.entries.get(r.slug);
+    if (held !== null && storeEntry !== undefined) {
+      const touched =
+        held.mark === null ? null : preferenceTouchedSince(held.mark, `pref-${r.slug}`);
+      if (touched !== false) {
+        const fresh = storePreferenceEntry(r.slug);
+        if (fresh === undefined || isRetiredEntry(fresh)) continue;
+        storeEntry = fresh;
+      }
+    }
     try {
+      const createdAt = window.signals.preferences.find(
+        (entry) => entry.pref.id === `pref-${r.slug}`,
+      )?.pref.created_at;
+      const evidence = window.evidence.lookup(r.slug, { sinceIso: createdAt ?? "" });
       moveToRetired(vault, fromPath, r.reason, {
         now,
         authority: DREAM_AUTHORITY,
         retired_by: wikilinkToRun,
+        evidenceApplied: evidence.applied,
+        evidenceViolated: evidence.violated,
         ...(r.supersededBy ? { superseded_by: r.supersededBy } : {}),
+        ...(storeEntry !== undefined ? { storeEntry } : {}),
       });
+      retiredHere.add(r.slug);
       // Belief lifecycle suite (A4): record the accelerated retirement of
       // a low-recall superseded ancestor as a dedicated audit event.
       if (r.chainDecay) {
@@ -426,11 +539,101 @@ function executeRetires(
   return gatedRetires;
 }
 
-/** Whether the active preference `slug` exists: its page, or the store's fold once switched. */
-function preferenceHeld(vault: string | null, slug: string, pagePath: string): boolean {
-  if (!preferencesStoreOnly(vault)) return existsSync(pagePath);
-  const found = storePreferenceEntry(slug);
-  return found !== undefined && !isRetiredEntry(found);
+/**
+ * The slugs of the active preferences the store's fold holds, read once;
+ * `null` on an unswitched machine, where each page is asked on disk.
+ */
+function heldPreferences(vault: string | null): HeldPreferences | null {
+  if (!preferencesStoreOnly(vault)) return null;
+  // Marked before the read: a record that lands between the two is seen as
+  // appended since, so it is checked rather than missed.
+  const store = configuredStore();
+  const mark = store === null ? null : markEvents(store);
+  const entries = new Map<string, StorePreference>();
+  for (const [id, entry] of readStoreEntities()?.preferences ?? []) {
+    if (!id.startsWith("pref-") || !entry.state.exists || isRetiredEntry(entry)) continue;
+    entries.set(id.slice("pref-".length), entry);
+  }
+  return { entries, mark };
+}
+
+/** The loop's snapshot of the active preferences, and where the `events` shards ended when it was read. */
+interface HeldPreferences {
+  readonly entries: ReadonlyMap<string, StorePreference>;
+  readonly mark: EventsMark | null;
+}
+
+/** Each `events` shard as it was at a moment: its identity and the bytes it held. */
+interface EventsMark {
+  readonly shards: ReadonlyArray<{
+    readonly path: string;
+    readonly partitionRoot: string;
+    /** null: the shard did not exist then (read whole now). */
+    /** Device and inode as `bigint` (`fs-identity.ts`), and the size the mark saw. */
+    readonly stamp: { readonly ino: bigint; readonly dev: bigint; readonly size: bigint } | null;
+  }>;
+  readonly store: StoreInspection;
+}
+
+function markEvents(store: StoreInspection): EventsMark {
+  const shards: Array<EventsMark["shards"][number]> = [];
+  for (const partition of store.partitions) {
+    const partitionRoot = partitionDir(store.root, partition);
+    for (const shard of listShards(partitionRoot, { stream: "events" })) {
+      try {
+        const st = lstatSync(shard.path, { bigint: true });
+        shards.push({
+          path: shard.path,
+          partitionRoot,
+          stamp: { ino: st.ino, dev: st.dev, size: st.size },
+        });
+      } catch {
+        shards.push({ path: shard.path, partitionRoot, stamp: null });
+      }
+    }
+  }
+  return { shards, store };
+}
+
+/**
+ * Whether a record about preference `id` (a set, a removal, evidence) was
+ * appended to the `events` stream since `mark`: only the bytes after the
+ * mark are read, so the check costs what arrived, not the stream. `null`
+ * when it cannot tell (a shard replaced, shorter, unreadable, or one that
+ * appeared since): the caller then reads the fold afresh.
+ */
+function preferenceTouchedSince(mark: EventsMark, id: string): boolean | null {
+  const known = new Set(mark.shards.map((s) => s.path));
+  for (const partition of mark.store.partitions) {
+    const partitionRoot = partitionDir(mark.store.root, partition);
+    try {
+      for (const shard of listShards(partitionRoot, { stream: "events" })) {
+        if (!known.has(shard.path)) return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  for (const shard of mark.shards) {
+    if (shard.stamp === null) return null;
+    let read: ReturnType<typeof readShard>;
+    try {
+      const st = lstatSync(shard.path, { bigint: true });
+      if (!sameDevIno(st, shard.stamp) || st.size < shard.stamp.size) {
+        return null;
+      }
+      if (st.size === shard.stamp.size) continue;
+      read = readShard(shard.path, {
+        partitionRoot: shard.partitionRoot,
+        offset: Number(shard.stamp.size),
+      });
+    } catch {
+      return null;
+    }
+    if (shardReadGap(read) !== null) return null;
+    if (read.records.some((r) => r.record.body["preference"] === id)) return true;
+  }
+  return false;
 }
 
 /**
@@ -442,15 +645,26 @@ function preferenceHeld(vault: string | null, slug: string, pagePath: string): b
 function moveConsumedSignals(vault: string | null, plan: PlanState): string[] {
   const moved: string[] = [];
   const storeOnly = signalsStoreOnly(vault);
-  // Read once: recording one signal's move does not change whether another
-  // is live, and each append would otherwise invalidate the fold cache.
-  const live = storeOnly ? liveStoreSignals() : null;
+  // Held across the moves: recording one signal's move does not change
+  // whether another is live or private, and each append would otherwise
+  // rebuild the fold to judge the next one. Another writer's change reads
+  // the store again (`holdStoreEntities`).
+  const held = storeOnly ? holdStoreEntities() : null;
+  if (held !== null) {
+    return storeSignalMoves(
+      vault,
+      plan.signalsToMove.values(),
+      held,
+      "consumed",
+      "move signal",
+      "to processed/",
+    );
+  }
   for (const sig of plan.signalsToMove.values()) {
     // The legacy destination, resolved only by the legacy move.
     const dest = (): string =>
       processedSignalPath(legacyVaultOf(vault, "moveConsumedSignals"), sig.date, sig.slug);
     try {
-      if (live !== null && !live.has(sig.id)) continue;
       // Judged before the move, from the page the scan read.
       const meta = storeOnly ? undefined : readFrontmatterOf(sig.path);
       routeSignalState({
@@ -493,7 +707,17 @@ function archiveStaleSignals(vault: string | null, plan: PlanState): string[] {
   const archived: string[] = [];
   if (plan.signalsToArchive.size === 0) return archived;
   const storeOnly = signalsStoreOnly(vault);
-  const live = storeOnly ? liveStoreSignals() : null;
+  const held = storeOnly ? holdStoreEntities() : null;
+  if (held !== null) {
+    return storeSignalMoves(
+      vault,
+      plan.signalsToArchive.values(),
+      held,
+      "archived",
+      "archive signal",
+      "to inbox/archived/",
+    );
+  }
   // The legacy destination, resolved only off the store-only path.
   const archivedPath = (path: string): string =>
     archivedSignalPath(legacyVaultOf(vault, "archiveStaleSignals"), basename(path));
@@ -504,17 +728,13 @@ function archiveStaleSignals(vault: string | null, plan: PlanState): string[] {
   }
   for (const sig of plan.signalsToArchive.values()) {
     try {
-      if (live !== null) {
-        if (!live.has(sig.id)) continue;
-      } else {
-        const dest = archivedPath(sig.path);
-        if (existsSync(dest)) {
-          process.stderr.write(
-            `warning: archive signal ${sig.id}: ${basename(dest)} already exists in ` +
-              `inbox/archived/; left in the inbox\n`,
-          );
-          continue;
-        }
+      const dest = archivedPath(sig.path);
+      if (existsSync(dest)) {
+        process.stderr.write(
+          `warning: archive signal ${sig.id}: ${basename(dest)} already exists in ` +
+            `inbox/archived/; left in the inbox\n`,
+        );
+        continue;
       }
       routeSignalState({
         vault,
@@ -534,13 +754,46 @@ function archiveStaleSignals(vault: string | null, plan: PlanState): string[] {
   return archived;
 }
 
-/** The ids the store's signal fold holds in the inbox (store-only moves). */
-function liveStoreSignals(): ReadonlySet<string> {
-  const live = new Set<string>();
-  for (const [id, signal] of readStoreEntities()?.signals ?? []) {
-    if (signal.state === "active") live.add(id);
+/**
+ * The store-only moves of steps 4 and 4b: the live signals' records in
+ * batches (`writeStoreSignalStates`), one clock write and one synced
+ * write per shard per batch instead of two synced writes per signal. A
+ * signal no longer live (a pass that stopped part way already moved it)
+ * is skipped, so a rerun completes the moves without duplicates. A move
+ * that fails is reported, and the signal stays where it was.
+ */
+function storeSignalMoves(
+  vault: string | null,
+  signals: Iterable<{ readonly id: string }>,
+  held: HeldEntities,
+  state: "consumed" | "archived",
+  verb: string,
+  where: string,
+): string[] {
+  const moves: Array<{ id: string; state: "consumed" | "archived" }> = [];
+  for (const sig of signals) {
+    try {
+      if (isLiveStoreSignal(held, sig.id)) moves.push({ id: sig.id, state });
+    } catch (err) {
+      process.stderr.write(
+        `warning: ${verb} ${sig.id} ${where} failed: ${(err as Error).message}\n`,
+      );
+    }
   }
-  return live;
+  const result = writeStoreSignalStates({ vault, moves, authority: DREAM_AUTHORITY, held });
+  for (const { id, error } of result.failed) {
+    process.stderr.write(`warning: ${verb} ${id} ${where} failed: ${error.message}\n`);
+  }
+  return [...result.written];
+}
+
+/**
+ * Whether the store's signal fold holds `id` in the inbox (store-only
+ * moves). The held read misses only this pass's own moves, each of one
+ * other signal, so it still answers for `id`.
+ */
+function isLiveStoreSignal(held: HeldEntities, id: string): boolean {
+  return held.current()?.signals.get(id)?.state === "active";
 }
 
 /**

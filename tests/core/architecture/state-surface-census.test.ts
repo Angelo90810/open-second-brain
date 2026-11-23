@@ -53,7 +53,7 @@
  * name the store directory. Every file it finds must be in the population.
  */
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 
@@ -64,6 +64,10 @@ import {
   STATE_SURFACE_ID,
 } from "../../../src/core/state/surfaces.ts";
 import { lexSource } from "../../helpers/source-lexer.ts";
+import { SOURCE_SCAN_BUDGET_MS } from "../../helpers/source-scan-timeout.ts";
+
+// A test here reads the whole source tree; see tests/helpers/source-scan-timeout.ts.
+setDefaultTimeout(SOURCE_SCAN_BUDGET_MS);
 
 const REPO_ROOT = join(import.meta.dir, "..", "..", "..");
 
@@ -116,7 +120,9 @@ const STORE_DIR_IDENTIFIER = "DERIVED_STORE_DIR";
 // 34 -> 33: that module keeps the three files in the device-local folder
 // of all stores instead, never in a vault, and the three rows leave the
 // registry.
-const SWEPT_POPULATION_SIZE = 33;
+// 33 -> 34: the migration doctor check joins, excused: it lists what a
+// vault whose legacy tree left still holds of this machine's legacy folder.
+const SWEPT_POPULATION_SIZE = 34;
 
 /** Declared surfaces today. Pinned for the same reason. */
 // 50: the source-archives row (answer-trust Task C1) joins the population,

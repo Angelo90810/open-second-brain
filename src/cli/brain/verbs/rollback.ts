@@ -19,6 +19,7 @@ import {
 import { diffBrainTrees } from "../../../core/brain/snapshot-diff.ts";
 import { renderDiffJson, renderDiffMarkdown } from "../../../core/brain/snapshot-diff-render.ts";
 import { brainDirs } from "../../../core/brain/paths.ts";
+import { storeOnlyMode } from "../../../core/store/store-only.ts";
 import { appendLogEvent } from "../../../core/brain/log.ts";
 import { BRAIN_LOG_EVENT_KIND } from "../../../core/brain/types.ts";
 import { isoSecond } from "../../../core/brain/time.ts";
@@ -34,9 +35,12 @@ import {
 import {
   renderDerivedStoreCoverage,
   renderDerivedStoreRestore,
+  renderRollbackDryRunNotListed,
+  ROLLBACK_DRY_RUN_NOT_LISTED,
   renderSnapshotListingFailure,
   renderSnapshotListingSkips,
   renderSnapshotReason,
+  renderStoreOnlySnapshotRefusal,
 } from "../snapshot-render.ts";
 
 export async function cmdBrainRollback(argv: string[]): Promise<number> {
@@ -48,7 +52,7 @@ export async function cmdBrainRollback(argv: string[]): Promise<number> {
     "force-rollback": { type: "boolean" },
     json: { type: "boolean" },
   });
-  const { vault } = brainVerbContext(flags);
+  const { vault } = brainVerbContext(flags, { vault: "store" });
   const forceRollback = Boolean(flags["force-rollback"]);
 
   // The usage check precedes the listing so a missing argument is still a
@@ -56,6 +60,13 @@ export async function cmdBrainRollback(argv: string[]): Promise<number> {
   // read ONCE for both surfaces below.
   if (!flags["list"] && positional.length < 1)
     return fail("brain rollback requires a <run_id> argument (or --list to enumerate snapshots)");
+  // A restore (or its dry run) compares and replaces the vault's `Brain/`
+  // tree, which a switched machine does not keep its memory in. Only a
+  // switch refuses: a machine that never switched and merely lost its
+  // `Brain/` folder restores it from the archive, as before.
+  if (!flags["list"] && storeOnlyMode({ vault }).reason === "device-switched") {
+    return fail(renderStoreOnlySnapshotRefusal("brain rollback"));
+  }
 
   let listing: SnapshotListing;
   try {
@@ -148,10 +159,21 @@ export async function cmdBrainRollback(argv: string[]): Promise<number> {
     try {
       const liveBrain = brainDirs(vault).brain;
       const diff = diffBrainTrees(liveBrain, ext.brainRoot);
-      const out = flags["json"]
-        ? JSON.stringify(renderDiffJson(diff), null, 2) + "\n"
-        : renderDiffMarkdown(diff, { aLabel: "live", bLabel: runId });
-      process.stdout.write(out + (out.endsWith("\n") ? "" : "\n"));
+      // The list covers every file under `Brain/` a restore replaces; what
+      // it leaves out is named after it, with the derived store's coverage.
+      if (flags["json"]) {
+        const payload = {
+          ...renderDiffJson(diff),
+          derived_store: target.derived_store,
+          not_listed: ROLLBACK_DRY_RUN_NOT_LISTED,
+        };
+        process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
+        return 0;
+      }
+      const out = renderDiffMarkdown(diff, { aLabel: "live", bLabel: runId });
+      process.stdout.write(
+        `${out}${out.endsWith("\n") ? "" : "\n"}\n${renderRollbackDryRunNotListed(target.derived_store)}`,
+      );
       return 0;
     } finally {
       ext.cleanup();
@@ -175,7 +197,7 @@ export async function cmdBrainRollback(argv: string[]): Promise<number> {
     const ans = await readSingleLine();
     if (ans.toLowerCase() !== "y" && ans.toLowerCase() !== "yes") {
       ok("rollback cancelled");
-      return 0;
+      return 1;
     }
   }
 

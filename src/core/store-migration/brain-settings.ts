@@ -25,7 +25,8 @@
  * `_permissions.yaml` rides along (review finding F461): its text becomes
  * the operator-only `permissions.document` setting at `human` authority,
  * never over a value the store already holds, so the deny rules stay in
- * force once the legacy tree leaves the vault.
+ * force once the legacy tree leaves the vault. `_vault-map.yaml` (the role
+ * tokens) does the same into `vault_map.document`.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -37,6 +38,7 @@ import {
 } from "../brain/permissions/document.ts";
 
 import { brainConfigPath } from "../brain/paths.ts";
+import { VAULT_MAP_REL, VAULT_MAP_SETTING } from "../brain/portability/vault-map-document.ts";
 import { DEFAULT_BRAIN_CONFIG } from "../brain/policy/defaults.ts";
 import { brainConfigKey, brainKeyHome, brainSettingKey } from "../brain/policy/settings-keys.ts";
 import {
@@ -48,11 +50,20 @@ import { schemaRecordAttestation, STORE_SCHEMA_PACK_SOURCE } from "../brain/sche
 import { parseBrainYaml } from "../brain/yaml-parse.ts";
 import { canonicalJson } from "../integrity/digest.ts";
 import { appendRecord } from "../store/appender.ts";
-import { AUTHORITY_FIELD, LEDGER_ROW_KIND, SETTING_SET_KIND } from "../store/constants.ts";
+import {
+  AUTHORITY_FIELD,
+  LEDGER_ROW_KIND,
+  SETTING_ENTRY_KIND,
+  SETTING_SET_KIND,
+  SETTING_UNSET_KIND,
+  STORE_PARTITIONS,
+} from "../store/constants.ts";
+import type { StoreRecord } from "../store/envelope.ts";
 import { DUAL_WRITE_LEDGERS } from "../store/dual-write-records.ts";
 import { foldSettings } from "../store/fold-settings.ts";
 import type { StoreHandle } from "../store/store-open.ts";
-import { heldRecords } from "./journal.ts";
+import { readStreamRecords } from "../store/read/stream-read.ts";
+import { describeUnseen } from "./journal.ts";
 
 // The classification lives in a leaf module so the settings reader
 // (`brain/policy/settings-source.ts`) can import it without closing an
@@ -115,6 +126,11 @@ function entries(parsed: Record<string, unknown>): Array<[string, string | undef
   return out;
 }
 
+/** The store's settings cannot all be read: nothing was imported. */
+export class BrainSettingsUnreadableError extends Error {
+  override readonly name = "BrainSettingsUnreadableError";
+}
+
 /**
  * Import `_brain.yaml` of `vault` into `store`: shared keys become
  * `setting-set` records unless the store's settings fold already holds the
@@ -135,7 +151,32 @@ export function importBrainSettings(
     device: [] as Array<{ yaml: string; line: string }>,
     unknown: [] as string[],
   };
-  const fold = foldSettings(heldRecords(store));
+  // The settings stream alone, read right here: a setting another machine
+  // set or unset a moment ago is seen before a stale file value is
+  // appended over it.
+  const settings: StoreRecord[] = [];
+  const unreadable: string[] = [];
+  const pending: string[] = [];
+  for (const partition of STORE_PARTITIONS) {
+    if (!store.partitions.has(partition)) continue;
+    const read = readStreamRecords(store.root, partition, { stream: "settings" });
+    for (const rel of read.unreadable) unreadable.push(`${partition}/${rel}`);
+    for (const blob of read.pendingBlobs) pending.push(`${partition} settings blob ${blob}`);
+    for (const record of read.records) {
+      if (
+        record.kind === SETTING_SET_KIND ||
+        record.kind === SETTING_UNSET_KIND ||
+        record.kind === SETTING_ENTRY_KIND
+      ) {
+        settings.push(record);
+      }
+    }
+  }
+  // A setting this machine cannot read must never read as absent: the
+  // stale file value would be appended over it. Nothing is appended.
+  const named = describeUnseen({ unreadable: unreadable.toSorted(), partial: pending.toSorted() });
+  if (named !== null) throw new BrainSettingsUnreadableError(named);
+  const fold = foldSettings(settings);
   const schemaAttestations: string[] = [];
   // `_permissions.yaml` becomes the operator-only `permissions.document`
   // setting (review finding F461): its text exactly as the file holds it,
@@ -159,6 +200,27 @@ export function importBrainSettings(
         },
       });
       result.written.push(PERMISSIONS_DOCUMENT_SETTING);
+    }
+  }
+  // `_vault-map.yaml` becomes the operator-only `vault_map.document`
+  // setting the same way: the role tokens apply once the tree is gone.
+  const vaultMap = join(vault, VAULT_MAP_REL);
+  if (existsSync(vaultMap)) {
+    if (fold.settings.has(VAULT_MAP_SETTING)) {
+      result.unchanged.push(VAULT_MAP_SETTING);
+    } else {
+      appendRecord(store, {
+        partition: "shared",
+        stream: "settings",
+        kind: SETTING_SET_KIND,
+        agent,
+        body: {
+          [AUTHORITY_FIELD]: "human",
+          key: VAULT_MAP_SETTING,
+          value: readFileSync(vaultMap, "utf8"),
+        },
+      });
+      result.written.push(VAULT_MAP_SETTING);
     }
   }
   if (!existsSync(path)) return result;

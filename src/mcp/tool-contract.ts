@@ -141,6 +141,34 @@ export interface RequestIdentity {
   readonly via: "token" | "shared-key";
 }
 
+/**
+ * Why the vault a context serves cannot be reached, when it cannot: a
+ * switched machine whose vault folder is gone or cannot be examined
+ * (design D14). Absent when the vault is there to read, and absent on a
+ * server with no vault at all - there the vault was never configured, so
+ * there are no operator rules to have missed.
+ */
+export interface VaultUnreachable {
+  /** The vault that could not be reached. */
+  readonly vault: string;
+  /** The reason, in words: what the look at the vault failed with. */
+  readonly reason: string;
+}
+
+/**
+ * The vault this context serves is configured, and its folder is not
+ * there: an unmounted disk, a renamed folder. The brain is not a fresh
+ * installation - the machine names a vault it cannot reach - and every
+ * surface that would answer "there is nothing here yet" says so instead,
+ * before any advice to initialise a new brain.
+ */
+export interface VaultMissing {
+  /** The configured vault, whose folder is not there. */
+  readonly vault: string;
+  /** The notice, in words. */
+  readonly notice: string;
+}
+
 export interface ServerContext {
   /**
    * The vault this server serves. On a server with no vault (design D14)
@@ -156,6 +184,20 @@ export interface ServerContext {
    * answer.
    */
   readonly vaultOrNull?: string | null;
+  /**
+   * Why the vault this context serves cannot be reached, when it cannot
+   * (see {@link VaultUnreachable}). A surface that answers about the
+   * operator's rules says so - naming the reason - instead of reporting
+   * no rules, which reads as "the operator wrote none".
+   */
+  readonly vaultUnreachable?: VaultUnreachable;
+  /**
+   * The configured vault's folder is not there, on a machine that has not
+   * switched (see {@link VaultMissing}). The surfaces that report what
+   * they could not read lead with it, and every refusal names the missing
+   * folder before any advice to initialise a new brain.
+   */
+  readonly vaultMissing?: VaultMissing;
   readonly configPath: string | null;
   readonly repoRoot: string | null;
   readonly capabilityReport?: ToolCapabilityReport;

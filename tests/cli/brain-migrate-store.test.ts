@@ -88,7 +88,7 @@ describe("o2b brain migrate-store --dry-run", () => {
 
   test("exits 0 once every legacy entry has a destination", async () => {
     for (const rel of [
-      "Brain/log/2026-11-01.sync-conflict-20261101-120000-ABC.jsonl",
+      "Brain/log/stray.sync-conflict-20261101-120000-ABC.txt",
       "Brain/log/stray.txt",
       "Brain/procedures/index.bin",
     ]) {
@@ -165,7 +165,7 @@ describe("o2b brain migrate-store", () => {
 
   test("migrates the vault and records the switch", async () => {
     for (const rel of [
-      "Brain/log/2026-11-01.sync-conflict-20261101-120000-ABC.jsonl",
+      "Brain/log/stray.sync-conflict-20261101-120000-ABC.txt",
       "Brain/log/stray.txt",
       "Brain/procedures/index.bin",
     ]) {
@@ -193,7 +193,21 @@ describe("o2b brain migrate-store", () => {
     expect(again.stdout).toContain(
       "already switched to the brain store; imported late legacy writes",
     );
-    expect(again.stdout).toContain("devices still on the legacy layout: dev-b, dev-c");
+    // The cohort's one judgement (`cohort-status.ts`): dev-c's last trace
+    // (2026-09) is past the default 30 days, so it is retired by silence,
+    // not still on the legacy layout; dev-b (2026-11-02) is pending while
+    // inside the threshold.
+    expect(again.stdout).toMatch(
+      /devices still on the legacy layout: (dev-b \(last evidence 2026-11-02\)|none)\n/,
+    );
+    expect(again.stdout).toMatch(/retired by silence \(.*\): .*dev-c \(last evidence 2026-09-01\)/);
+    // The silence rule off, so the fixture's dated devices stay pending
+    // whatever the date (the rule has its own test).
+    const off = await runCli(
+      ["brain", "settings", "set", "migration.silent_device_days", "0", "--vault", fx.vault],
+      { env },
+    );
+    expect([off.returncode, off.stderr]).toEqual([0, ""]);
     const blocked = await migrate("--remove-legacy");
     expect(blocked.returncode).toBe(1);
     expect(blocked.stdout).toContain("dev-b, dev-c still write the legacy layout");

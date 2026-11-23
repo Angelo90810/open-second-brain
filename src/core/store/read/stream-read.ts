@@ -18,10 +18,27 @@
  * Nothing here writes: no store is created, no partition copy refreshed.
  */
 
+import { createHash, type Hash } from "node:crypto";
+import { type BigIntStats, closeSync, lstatSync, readSync } from "node:fs";
+
+import { sameDevIno } from "../../fs-identity.ts";
+import { statSettled } from "../../fs-stamp.ts";
+
 import { BLOB_REF_KEY, type StorePartition } from "../constants.ts";
 import type { StoreRecord } from "../envelope.ts";
-import { readShard, replacedShards, shardReadGap, type Compaction } from "../reader.ts";
+import {
+  replacedShards,
+  scanShard,
+  shardScanGap,
+  type Compaction,
+  type ReadRecord,
+  type ShardDiagnostic,
+  type ShardScan,
+} from "../reader.ts";
+import { appendedByThisProcess, type AppendStamp } from "../own-appends.ts";
+import { gcHintTick } from "../gc-hint.ts";
 import { trackSeenShards } from "../seen-shards.ts";
+import { openRegularFileForRead } from "../safe-fs.ts";
 import { listShards } from "../shard-list.ts";
 import { partitionDir, type StreamRef } from "../store-paths.ts";
 
@@ -52,6 +69,14 @@ export interface StreamRead {
    * record, instead of rescanning the shards.
    */
   readonly pendingBlobs: ReadonlyArray<string>;
+  /**
+   * How many kept records were left out because their body is a pending
+   * blob, by envelope kind (the kind is read from the line, not the
+   * body). A caller that must know whether a record of some kind is
+   * missing from `records` reads it from the same scan, so no later
+   * arrival of a blob can fall between the two answers.
+   */
+  readonly pendingKinds: ReadonlyMap<string, number>;
 }
 
 export interface StreamReadOptions {
@@ -59,6 +84,328 @@ export interface StreamReadOptions {
   readonly device?: string;
   /** Read only shards whose month (`YYYY-MM`) passes this test. */
   readonly month?: (month: string) => boolean;
+  /**
+   * What earlier reads of this stream in this process kept of each shard
+   * (keyed by the shard's partition-relative path), so only what was
+   * appended since is parsed and verified: see {@link ShardTails}. Read and
+   * updated in place; absent, every shard is read whole.
+   */
+  readonly tails?: ShardTails;
+  /**
+   * The records the caller needs, judged by envelope as each is read: the
+   * rest are never held (pending ones are still counted for the gap and
+   * named when kept). Absent, every record.
+   */
+  readonly keep?: (record: StoreRecord) => boolean;
+  /**
+   * A cooperative deadline (a hook's `Safeguard.checkpoint`), called before
+   * each shard and at each record boundary. What it throws stops the read
+   * and reaches the caller as it is, never taken for an unreadable shard;
+   * a shard it stopped keeps the tail it had.
+   */
+  readonly checkpoint?: () => void;
+}
+
+/** A checkpoint's throw on its way out of a shard scan. */
+class StreamReadInterrupted {
+  constructor(readonly cause: unknown) {}
+}
+
+/**
+ * What a read kept of one shard it read whole and clean (no diagnostic, no
+ * pending body, no held-back last line), to read only what was appended to
+ * it next time: the records its caller keeps (`StreamReadOptions.keep`),
+ * never the whole parsed shard.
+ */
+export interface ShardTail {
+  /** Device and inode as `bigint` (`fs-identity.ts`: NTFS ids exceed 2^53). */
+  readonly ino: bigint;
+  readonly dev: bigint;
+  /** Bytes read: every complete line, up to and including the last newline. */
+  readonly size: number;
+  readonly mtimeNs: bigint;
+  readonly ctimeNs: bigint;
+  /** sha256 state of those bytes, extended by the next read. */
+  readonly hash: Hash;
+  /**
+   * Wall-clock time (ms) captured before the `lstat` and the read that
+   * kept this tail. The equal-stamp shortcut trusts the stamp only when
+   * the shard's times were older than this by the racy window
+   * (`fs-stamp.ts`); otherwise the kept bytes are checksummed first.
+   */
+  readonly observedAtMs: number;
+  /** The records the read kept, in file order. */
+  readonly records: ReadonlyArray<ReadRecord>;
+  readonly compactions: ReadonlyArray<Compaction>;
+}
+
+/**
+ * The shards of one stream of one partition a caller has read before in
+ * this process (`StreamReadOptions.tails`). A shard is append-only, and a
+ * writer that appends to it changes its size and mtime, so a reader that
+ * re-reads a stream after every write (a pass that writes and reads the
+ * same fold many times) would otherwise parse and verify the whole stream
+ * once per write. With a tail kept:
+ *
+ *  - a shard whose inode, device, size, mtime and ctime are all unchanged
+ *    is not opened, when those times were older than the read that kept
+ *    the tail by the racy window (`fs-stamp.ts`): the kept read answers.
+ *    A stamp younger than that proves nothing (a same-size write inside
+ *    one clock tick, or a same-size replacement on a volume that reuses
+ *    file ids, keeps all five), so the kept bytes are checksummed, and the
+ *    kept read answers only when the sum still matches;
+ *  - a shard with the same inode that is no shorter is read from where the
+ *    kept read ended when the bytes before are known unchanged: appends of
+ *    this process alone took it from the kept stamp to the current one
+ *    (`own-appends.ts`), or the sha256 of those bytes still matches the
+ *    kept one (the prefix is hashed, not parsed);
+ *  - anything else (another inode, a shorter file, a changed prefix, no
+ *    usable inode) is read whole, and a read with a problem is not kept.
+ *
+ * Neither the inode nor the times are trusted alone. An inode of 0 keeps
+ * nothing; a file id reused after a replace (FAT and exFAT derive it from
+ * the directory entry, ReFS does not promise unique 64-bit ids) still
+ * meets the size and the checksum, and a newer copy a sync tool delivers
+ * has the kept bytes as its prefix. Times that do not move within a clock
+ * tick are trusted only once they had settled when the tail was kept;
+ * what remains is a write the format never makes (an in-place rewrite of
+ * the same size) that also lands in this process's own-append chain, or a
+ * volume whose clock runs more than the racy window behind this one
+ * (`FORMAT.md`, "Reading").
+ *
+ * A tail holds only the records its caller keeps, so the bound is what
+ * the caller's fold holds anyway, not a parsed copy of the stream.
+ */
+export type ShardTails = Map<string, ShardTail>;
+
+/** Chunk size the checksum reads in. */
+const PREFIX_CHUNK_BYTES = 1 << 20;
+
+/**
+ * `hash` extended with bytes `from` to `to` of the file at `path`, or
+ * null when the file holds fewer or is refused. Opened through the guarded
+ * opener (`safe-fs.ts`): a link or a FIFO swapped in under the name after
+ * the caller's lstat is refused, never followed or blocked on.
+ */
+function hashRange(
+  path: string,
+  partitionRoot: string,
+  hash: Hash,
+  from: number,
+  to: number,
+): Hash | null {
+  let fd: number | null;
+  try {
+    fd = openRegularFileForRead(path, partitionRoot);
+  } catch {
+    return null;
+  }
+  if (fd === null) return null;
+  try {
+    const chunk = Buffer.alloc(Math.min(PREFIX_CHUNK_BYTES, Math.max(to - from, 1)));
+    let position = from;
+    while (position < to) {
+      const n = readSync(fd, chunk, 0, Math.min(chunk.length, to - position), position);
+      if (n === 0) return null;
+      hash.update(chunk.subarray(0, n));
+      position += n;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash;
+}
+
+/**
+ * Whether a kept tail whose stamp the shard still shows may answer without
+ * reading the shard: at once when the stamp had settled as the tail was
+ * kept, otherwise only when the kept bytes still hash to the kept sum. A
+ * matching sum observed once the stamp has settled renews the tail with
+ * this observation, so the check is paid for at most the racy window.
+ */
+function keptStampHolds(
+  path: string,
+  partitionRoot: string,
+  kept: ShardTail,
+  tails: ShardTails,
+  rel: string,
+  observedAtMs: number,
+): boolean {
+  if (statSettled(kept, kept.observedAtMs)) return true;
+  const check = hashRange(path, partitionRoot, createHash("sha256"), 0, kept.size);
+  if (check === null || check.digest("hex") !== kept.hash.copy().digest("hex")) return false;
+  if (statSettled(kept, observedAtMs)) tails.set(rel, { ...kept, observedAtMs });
+  return true;
+}
+
+function sameStamp(a: BigIntStats, b: BigIntStats): boolean {
+  return (
+    sameDevIno(a, b) && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs
+  );
+}
+
+/** What an append saw of a shard (`own-appends.ts`), from `bigint` stats. */
+function appendStampOf(stat: BigIntStats): AppendStamp {
+  return { size: Number(stat.size), mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+}
+
+/** One shard as a stream read sees it: what it kept, and what decides its health. */
+interface ShardPass {
+  readonly records: ReadonlyArray<ReadRecord>;
+  readonly compactions: ReadonlyArray<Compaction>;
+  readonly diagnostics: ReadonlyArray<ShardDiagnostic>;
+  /** Pending records not quarantined, kept or not: they open a gap. */
+  readonly gapPending: number;
+  /** Pending records, quarantined or not: a read with one is never kept. */
+  readonly anyPending: number;
+  readonly nextOffset: number;
+  readonly pendingTailBytes: number;
+}
+
+/** Scan `path` from `offset`, keeping the records `keep` passes. */
+function scanKeeping(
+  path: string,
+  partitionRoot: string,
+  offset: number,
+  keep: ((record: StoreRecord) => boolean) | undefined,
+  checkpoint?: () => void,
+): ShardPass {
+  const records: ReadRecord[] = [];
+  let anyPending = 0;
+  const scan = scanShard(path, { partitionRoot, ...(offset > 0 ? { offset } : {}) }, (r) => {
+    if (checkpoint !== undefined) {
+      try {
+        checkpoint();
+      } catch (err) {
+        throw new StreamReadInterrupted(err);
+      }
+    }
+    // A record the caller does not keep is garbage at once (`gc-hint.ts`).
+    gcHintTick();
+    if (r.bodyState === "pending") anyPending += 1;
+    if (keep === undefined || keep(r.record)) records.push(r);
+  });
+  return {
+    records,
+    compactions: scan.compactions,
+    diagnostics: scan.diagnostics,
+    gapPending: scan.pending,
+    anyPending,
+    nextOffset: scan.nextOffset,
+    pendingTailBytes: scan.pendingTailBytes,
+  };
+}
+
+/** The gap a pass opens (`shardScanGap`), or null. */
+function gapOf(pass: ShardPass): string | null {
+  const scan: Pick<ShardScan, "diagnostics" | "pending"> = {
+    diagnostics: pass.diagnostics,
+    pending: pass.gapPending,
+  };
+  return shardScanGap(scan as ShardScan);
+}
+
+function isCleanPass(pass: ShardPass): boolean {
+  return pass.diagnostics.length === 0 && pass.pendingTailBytes === 0 && pass.anyPending === 0;
+}
+
+/** One shard read through the caller's kept tails (see {@link ShardTails}). */
+function readShardWithTails(
+  path: string,
+  rel: string,
+  partitionRoot: string,
+  tails: ShardTails,
+  keep: ((record: StoreRecord) => boolean) | undefined,
+  checkpoint?: () => void,
+): ShardPass {
+  const kept = tails.get(rel);
+  let base: ShardTail | null = null;
+  // The observation clock, captured before the lstat and the read below.
+  const observedAtMs = Date.now();
+  // lstat: a link swapped in under the name has an inode of its own. Taken
+  // before the read too, so a read is kept only when the file did not
+  // change from before the read to after its checksum.
+  const now = lstatSync(path, { bigint: true });
+  let hash: Hash | null = null;
+  if (kept !== undefined) {
+    const size = Number(now.size);
+    if (sameDevIno(now, kept) && size >= kept.size) {
+      if (
+        size === kept.size &&
+        now.mtimeNs === kept.mtimeNs &&
+        now.ctimeNs === kept.ctimeNs &&
+        keptStampHolds(path, partitionRoot, kept, tails, rel, observedAtMs)
+      ) {
+        return {
+          records: kept.records,
+          compactions: kept.compactions,
+          diagnostics: [],
+          gapPending: 0,
+          anyPending: 0,
+          nextOffset: kept.size,
+          pendingTailBytes: 0,
+        };
+      }
+      if (
+        appendedByThisProcess(
+          path,
+          { size: kept.size, mtimeNs: kept.mtimeNs, ctimeNs: kept.ctimeNs },
+          appendStampOf(now),
+        )
+      ) {
+        base = kept;
+      } else {
+        const check = hashRange(path, partitionRoot, createHash("sha256"), 0, kept.size);
+        if (check !== null && check.copy().digest("hex") === kept.hash.copy().digest("hex")) {
+          base = kept;
+        }
+      }
+    }
+  }
+  const fresh = scanKeeping(path, partitionRoot, base?.size ?? 0, keep, checkpoint);
+  tails.delete(rel);
+  const after = lstatSync(path, { bigint: true });
+  // The suffix is combined with the kept prefix only when it came from the
+  // file the prefix was checked against: a shard replaced under its name
+  // after the check and before the read would pair another file's lines
+  // with the kept records. Then the combination is dropped and the shard
+  // is read whole, as with no kept tail.
+  if (base !== null && !sameDevIno(after, now)) {
+    return scanKeeping(path, partitionRoot, 0, keep, checkpoint);
+  }
+  const pass: ShardPass =
+    base === null
+      ? fresh
+      : {
+          ...fresh,
+          records: [...base.records, ...fresh.records],
+          compactions: [...base.compactions, ...fresh.compactions],
+        };
+  if (!isCleanPass(pass)) return pass;
+  // Kept only when the file is the same from before the read to after the
+  // checksum (inode, device, size, mtime, ctime): a write or a same-size
+  // replacement landing anywhere in between leaves it unkept, and the
+  // next read reads it whole.
+  if (after.ino === 0n || Number(after.size) !== pass.nextOffset || !sameStamp(now, after)) {
+    return pass;
+  }
+  hash =
+    base === null
+      ? hashRange(path, partitionRoot, createHash("sha256"), 0, pass.nextOffset)
+      : hashRange(path, partitionRoot, base.hash.copy(), base.size, pass.nextOffset);
+  if (hash === null || !sameStamp(after, lstatSync(path, { bigint: true }))) return pass;
+  tails.set(rel, {
+    ino: after.ino,
+    dev: after.dev,
+    size: pass.nextOffset,
+    mtimeNs: after.mtimeNs,
+    ctimeNs: after.ctimeNs,
+    hash,
+    observedAtMs,
+    records: pass.records,
+    compactions: pass.compactions,
+  });
+  return pass;
 }
 
 /** Month of a shard file name, `<YYYY-MM>[.<suffix>].jsonl`. */
@@ -105,18 +452,33 @@ export function readStreamRecords(
       unreadable: [streamPrefix(ref)],
       skippedPending: false,
       pendingBlobs: [],
+      pendingKinds: new Map(),
     };
   }
   const compactions: Compaction[] = [];
   let skippedPending = false;
+  const pendingKinds = new Map<string, number>();
   const seenBlobs = new Set<string>();
   for (const shard of shards) {
     if (options.device !== undefined && shard.device !== options.device) continue;
     if (options.month !== undefined && !options.month(monthOf(shard.rel))) continue;
-    let read: ReturnType<typeof readShard>;
+    options.checkpoint?.();
+    let read: ShardPass;
     try {
-      read = readShard(shard.path, { partitionRoot });
-    } catch {
+      read =
+        options.tails === undefined
+          ? scanKeeping(shard.path, partitionRoot, 0, options.keep, options.checkpoint)
+          : readShardWithTails(
+              shard.path,
+              shard.rel,
+              partitionRoot,
+              options.tails,
+              options.keep,
+              options.checkpoint,
+            );
+    } catch (err) {
+      if (err instanceof StreamReadInterrupted) throw err.cause;
+      options.tails?.delete(shard.rel);
       unreadable.push(shard.rel);
       continue;
     }
@@ -124,7 +486,7 @@ export function readStreamRecords(
       unreadable.push(shard.rel);
       continue;
     }
-    if (shardReadGap(read) !== null) unreadable.push(shard.rel);
+    if (gapOf(read) !== null) unreadable.push(shard.rel);
     compactions.push(...read.compactions);
     for (const entry of read.records) {
       if (entry.bodyState !== "pending") {
@@ -134,12 +496,18 @@ export function readStreamRecords(
       // The body is still the blob reference (reader.ts): the sha names
       // the blob the caller stats for availability.
       skippedPending = true;
+      pendingKinds.set(entry.record.kind, (pendingKinds.get(entry.record.kind) ?? 0) + 1);
       const sha = blobRefSha(entry.record.body);
       if (!seenBlobs.has(sha)) {
         seenBlobs.add(sha);
         pendingBlobs.push(sha);
       }
     }
+  }
+  // A shard no longer listed (compacted away, removed) keeps nothing.
+  if (options.tails !== undefined && options.device === undefined && options.month === undefined) {
+    const listed = new Set(shards.map((shard) => shard.rel));
+    for (const rel of options.tails.keys()) if (!listed.has(rel)) options.tails.delete(rel);
   }
   const gone = trackSeenShards(
     partitionRoot,
@@ -156,5 +524,6 @@ export function readStreamRecords(
     unreadable: [...unreadable, ...gone],
     skippedPending,
     pendingBlobs,
+    pendingKinds,
   };
 }

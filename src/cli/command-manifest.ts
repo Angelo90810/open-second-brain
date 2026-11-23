@@ -50,6 +50,17 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
       flag("force", "boolean"),
       flag("interactive", "boolean"),
     ]),
+    command("setup", "Configure the brain, connect an agent host, and verify the connection", [
+      flag("target", "string"),
+      flag("vault", "string"),
+      flag("no-vault", "boolean"),
+      flag("agent-name", "string"),
+      flag("timezone", "string"),
+      flag("config", "string"),
+      flag("apply", "boolean"),
+      flag("yes", "boolean"),
+      flag("json", "boolean"),
+    ]),
     command("doctor", "Run health checks on vault, config, and plugins", [
       flag("vault", "string"),
       flag("config", "string"),
@@ -745,6 +756,24 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
         ),
         command("state", "Overwrite-only exact-state lane keyed by aspect: set, get, list, clear"),
         command(
+          "standing-rules",
+          "The operator's standing rules, vault-wide or scoped: show, set, clear",
+          [
+            flag("vault", "string"),
+            flag("project", "string"),
+            flag("harness", "string"),
+            flag("host", "string"),
+            flag("file", "string"),
+            flag("stdin", "boolean"),
+            flag("json", "boolean"),
+          ],
+          [
+            command("show", "Print the rules as stored"),
+            command("set", "Replace the rules with a file's text (--file or --stdin)"),
+            command("clear", "Remove the rules"),
+          ],
+        ),
+        command(
           "health-baseline",
           "Acknowledge-before watermark for health advisories: set, get, clear",
         ),
@@ -1230,6 +1259,16 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
             flag("apply", "boolean"),
           ],
         ),
+        command(
+          "set-aside",
+          "Move a parked index (bak or old) with its -wal, -shm and -journal files into <index folder>/set-aside/ (dry-run unless --apply; deletes nothing)",
+          [
+            flag("vault", "string"),
+            flag("config", "string"),
+            flag("db", "string"),
+            flag("apply", "boolean"),
+          ],
+        ),
         // Both `schema` subcommands parse `--json` (export also `--stdout`),
         // so the inherited stand-in covers the one and `stdout` is declared
         // here; `tests/cli/search-query-flag-manifest.test.ts` holds this
@@ -1390,6 +1429,49 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
           flag("config", "string"),
           flag("json", "boolean"),
         ]),
+      ],
+    ),
+    command(
+      "dream",
+      "Dream owner and dream work queue verbs: who runs live dream passes, and the work that waits for a model",
+      [],
+      [
+        command(
+          "owner",
+          "Show the dream owner, or take (--here), force (--force) or give up (--release) the role",
+          [
+            flag("here", "boolean"),
+            flag("agent", "string"),
+            flag("force", "boolean"),
+            flag("release", "boolean"),
+            flag("vault", "string"),
+            flag("config", "string"),
+            flag("json", "boolean"),
+          ],
+        ),
+        command(
+          "queue",
+          "List the dream work queue: counts by state, the oldest ready item, parked items",
+          [
+            flag("state", "string"),
+            flag("vault", "string"),
+            flag("config", "string"),
+            flag("json", "boolean"),
+          ],
+          [
+            command("retry", "Offer a parked dream work item again (the dream owner's device)", [
+              flag("vault", "string"),
+              flag("config", "string"),
+              flag("json", "boolean"),
+            ]),
+            command("cancel", "Cancel a dream work item (the dream owner's device)", [
+              flag("reason", "string"),
+              flag("vault", "string"),
+              flag("config", "string"),
+              flag("json", "boolean"),
+            ]),
+          ],
+        ),
       ],
     ),
     command(

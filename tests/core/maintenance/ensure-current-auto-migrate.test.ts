@@ -10,9 +10,10 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 
 import { bootstrapBrain } from "../../../src/core/brain/init.ts";
+import { runDoctor } from "../../../src/core/brain/doctor.ts";
 import { brainConfigPath } from "../../../src/core/brain/paths.ts";
 import { listMetrics } from "../../../src/core/brain/metrics.ts";
 import { writeSignal } from "../../../src/core/brain/signal.ts";
@@ -28,9 +29,17 @@ import { STORE_ROOT_ENV } from "../../../src/core/store/constants.ts";
 import {
   ensureVaultCurrent,
   AUTO_MIGRATION_SPAWN,
+  rebuildsIntoLegacyFolder,
 } from "../../../src/core/maintenance/ensure-current.ts";
+import { SELF_HEAL_SPAWN } from "../../../src/core/maintenance/self-heal-reindex.ts";
+import {
+  collectRuntimeNotices,
+  renderRuntimeNotices,
+} from "../../../src/core/brain/runtime-notices.ts";
+import { autoMigrationReport } from "../../../src/core/store-migration/auto-report.ts";
 import {
   autoMigrationLockPath,
+  autoMigrationWorkerLogPath,
   autoMigrationStatePath,
   claimAutoMigrationLock,
   readAutoMigrationFailure,
@@ -355,6 +364,163 @@ describe("two starts at once", () => {
   });
 });
 
+/**
+ * The `PATH` of this process without every directory that holds a Bun
+ * binary: what a start launched from an ssh session or a macOS GUI agent
+ * sees, where the runtime that runs it was named by its absolute path.
+ */
+function pathWithoutBun(): string {
+  const bunNames = process.platform === "win32" ? ["bun.exe", "bun.cmd", "bun"] : ["bun"];
+  return (process.env["PATH"] ?? "")
+    .split(delimiter)
+    .filter((dir) => dir !== "" && !bunNames.some((name) => existsSync(join(dir, name))))
+    .join(delimiter);
+}
+
+describe("a start whose PATH has no Bun", () => {
+  test("starts a worker that reaches its outcome", async () => {
+    const barrier = join(root, "barrier");
+    writeFileSync(barrier, "");
+    const start = Bun.spawn([process.execPath, "run", START_CHILD, vault, configPath, barrier], {
+      env: {
+        ...process.env,
+        PATH: pathWithoutBun(),
+        // The launcher adopts `~/.bun/bin` when Bun is not on PATH; a
+        // home without one is the machine this test stands for.
+        HOME: root,
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: 50_000,
+    });
+    await start.exited;
+    const decision = (await new Response(start.stdout as ReadableStream).text()).trim();
+    expect(decision).toBe(AUTO_MIGRATION_SPAWN.spawned);
+
+    // The worker's end releases the claim; a worker that never ran leaves
+    // the claim behind under a pid that is gone.
+    const deadline = Date.now() + 50_000;
+    while (Date.now() < deadline && existsSync(lockPath)) {
+      // eslint-disable-next-line no-await-in-loop
+      await Bun.sleep(100);
+    }
+    expect(existsSync(lockPath)).toBe(false);
+    expect(listMetrics(vault, { surface: AUTO_MIGRATION_SURFACE }).length).toBeGreaterThan(0);
+    // The worker log says what happened: the start, each step with its
+    // time, and the outcome, also when the run succeeded.
+    const log = readFileSync(autoMigrationWorkerLogPath(vault), "utf8");
+    expect(log).toMatch(
+      /^===== attempt \S+ started by process \d+ =====\n\d{4}-\d\d-\d\dT[\d:.]+Z the automatic store migration worker \(process \d+\) starts/,
+    );
+    for (const step of [
+      "checking what a migration would move",
+      "running the migration",
+      "the gate is closed",
+      "taking the backups",
+      "switching this machine to the brain store",
+      "outcome applied after",
+    ]) {
+      expect(log).toContain(step);
+    }
+  });
+});
+
+/** The pid of a process that has ended: spawned, reaped, gone. */
+async function deadPid(): Promise<number> {
+  const child = Bun.spawn([process.execPath, "-e", ""], {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  await child.exited;
+  return child.pid;
+}
+
+/** A claim a start handed to worker `pid`, which never confirmed it. */
+function handedClaim(pid: number, since: string): void {
+  mkdirSync(dirname(lockPath), { recursive: true });
+  writeFileSync(
+    lockPath,
+    JSON.stringify({ token: "a".repeat(32), pid, started: null, since, worker: "awaited" }),
+  );
+}
+
+describe("a worker that exited before it started", () => {
+  test("the next start records why and starts nothing until the cooldown", async () => {
+    const pid = await deadPid();
+    handedClaim(pid, "2026-11-19T08:00:00.000Z");
+    writeFileSync(autoMigrationWorkerLogPath(vault), "error: 'bun' is not on PATH.\n");
+
+    const r = await ensureVaultCurrent(vault, { background: true, configPath });
+
+    expect(r.migrationSpawn).toBe(AUTO_MIGRATION_SPAWN.workerLost);
+    const failure = readAutoMigrationFailure(vault);
+    expect(failure).not.toBeNull();
+    expect(failure!.error).toContain(`process ${pid}`);
+    expect(failure!.error).toContain("exited before it started");
+    expect(failure!.error).toContain("'bun' is not on PATH");
+    expect(failure!.error).toContain(".worker.log");
+    expect(failure!.consecutiveFailures).toBe(1);
+    expect(existsSync(lockPath)).toBe(false);
+
+    const again = await ensureVaultCurrent(vault, { background: true, configPath });
+    expect(again.migrationSpawn).toBe(AUTO_MIGRATION_SPAWN.skippedBackoff);
+    const report = autoMigrationReport({ vault, configPath });
+    expect(report.state).toBe("failed");
+    expect(report.message).toContain("exited before it started");
+    expect(report.manualCommand).toBe("o2b brain migrate-store");
+  });
+
+  test("status names it before any start recorded it", async () => {
+    handedClaim(await deadPid(), "2026-11-19T08:00:00.000Z");
+
+    const report = autoMigrationReport({ vault, configPath });
+
+    expect(report.state).toBe("failed");
+    expect(report.message).toContain("exited before it started");
+    expect(report.manualCommand).toBe("o2b brain migrate-store");
+    const notices = renderRuntimeNotices(collectRuntimeNotices(vault, { configPath }));
+    expect(notices).toContain("exited before it started");
+    expect(notices).toContain("o2b brain migrate-store");
+    rmSync(lockPath, { force: true });
+  });
+
+  test("with the automatic migration off, status still names it, and that no start retries it", async () => {
+    handedClaim(await deadPid(), "2026-11-19T08:00:00.000Z");
+    process.env["OPEN_SECOND_BRAIN_AUTO_STORE_MIGRATION"] = "false";
+
+    const report = autoMigrationReport({ vault, configPath });
+
+    expect(report.state).toBe("failed");
+    expect(report.message).toContain("exited before it started");
+    expect(report.nextStart).toContain("the automatic migration is off");
+    expect(report.nextStart).not.toContain("cooldown");
+    expect(report.manualCommand).toBe("o2b brain migrate-store");
+    rmSync(lockPath, { force: true });
+  });
+
+  test("a start that spawns a worker names a log for its error output", async () => {
+    const r = await ensureVaultCurrent(vault, { background: true, configPath });
+
+    expect(r.migrationSpawn).toBe(AUTO_MIGRATION_SPAWN.spawned);
+    expect(existsSync(autoMigrationWorkerLogPath(vault))).toBe(true);
+  });
+
+  test("a worker spawned after a killed one keeps the killed run's lines, under a separator", async () => {
+    const log = autoMigrationWorkerLogPath(vault);
+    mkdirSync(dirname(log), { recursive: true });
+    writeFileSync(log, "2026-11-20T07:25:40.000Z the killed run's last step\n");
+
+    const r = await ensureVaultCurrent(vault, { background: true, configPath });
+
+    expect(r.migrationSpawn).toBe(AUTO_MIGRATION_SPAWN.spawned);
+    const text = readFileSync(log, "utf8");
+    expect(text.startsWith("2026-11-20T07:25:40.000Z the killed run's last step\n")).toBe(true);
+    expect(text).toMatch(/\n===== attempt \S+ started by process \d+ =====\n/);
+  });
+});
+
 describe("the managed-file upgrade and the migration", () => {
   test("a start that spawns the migration worker leaves the upgrade to it", async () => {
     const r = await ensureVaultCurrent(vault, { background: true, configPath });
@@ -395,6 +561,93 @@ describe("the managed-file upgrade and the migration", () => {
 
     expect(run.outcome).toBe(AUTO_MIGRATION_OUTCOME.applied);
     expect(readFileSync(brainManualPath(vault), "utf8")).not.toBe("stale operator copy\n");
+  });
+
+  test("a claim another machine's sync brought here holds nothing: the migration runs", () => {
+    // The lock sits in the vault's own folder before the switch, which a
+    // file sync carries to every machine; its pid is alive here by chance.
+    mkdirSync(dirname(upgradeLockPath), { recursive: true });
+    writeFileSync(
+      upgradeLockPath,
+      JSON.stringify({
+        token: "d".repeat(32),
+        pid: process.pid,
+        host: "another-machine",
+        since: new Date().toISOString(),
+        worker: true,
+      }),
+    );
+
+    const run = runAutoStoreMigration(vault, { configPath });
+
+    expect(run.outcome).toBe(AUTO_MIGRATION_OUTCOME.applied);
+  });
+
+  test("an older release's bare claim does not hold the migration off", () => {
+    mkdirSync(dirname(upgradeLockPath), { recursive: true });
+    writeFileSync(upgradeLockPath, "e".repeat(32));
+    const lines: string[] = [];
+
+    const run = runAutoStoreMigration(vault, { configPath, progress: (l) => lines.push(l) });
+
+    expect(run.outcome).toBe(AUTO_MIGRATION_OUTCOME.applied);
+    // The upgrade is left for a later start, and the progress says why.
+    expect(lines.join("\n")).toContain("the managed-file upgrade is left for later");
+    rmSync(upgradeLockPath, { force: true });
+  });
+
+  test("a live upgrade of this machine: status names it as what the migration waits for", () => {
+    const token = claimSelfHealUpgradeLock(vault, new Date());
+    expect(token).not.toBeNull();
+    try {
+      const report = autoMigrationReport({ vault, configPath });
+
+      expect(report.state).toBe("pending");
+      expect(report.message).toContain("waits for this machine's managed-file upgrade to end");
+      expect(report.message).toContain(`process ${process.pid} of this machine`);
+      expect(report.nextStart).toContain("once that upgrade has ended");
+    } finally {
+      releaseSelfHealUpgradeLock(vault, token!);
+    }
+  });
+
+  test("a live upgrade of this machine: the doctor names it in the words of status", () => {
+    const token = claimSelfHealUpgradeLock(vault, new Date());
+    expect(token).not.toBeNull();
+    try {
+      const report = autoMigrationReport({ vault, configPath });
+      const uncertain = runDoctor(vault, { configPath }).uncertain ?? [];
+      const available = uncertain.find((u) => u.code === "migration-available");
+      const lock = uncertain.find(
+        (u) => u.code === "stale-lock" && u.path === selfHealUpgradeLockPath(vault),
+      );
+
+      // One text: the clause status shows is the one the doctor shows.
+      expect(report.waitsFor).not.toBeNull();
+      expect(available?.message).toContain(`The migration waits for ${report.waitsFor}.`);
+      expect(lock?.message).toContain(`process ${process.pid} of this machine holds`);
+      expect(lock?.message).toContain("waits for it to end");
+      expect(lock?.message).not.toContain("remove the file by hand");
+    } finally {
+      releaseSelfHealUpgradeLock(vault, token!);
+    }
+  });
+
+  test("only an index inside the vault is the legacy folder's", () => {
+    expect(rebuildsIntoLegacyFolder(vault, join(vault, ".open-second-brain", "brain.sqlite"))).toBe(
+      true,
+    );
+    // A switched machine's index in device-local state is rebuilt as before.
+    expect(rebuildsIntoLegacyFolder(vault, join(root, "state", "brain.sqlite"))).toBe(false);
+  });
+
+  test("a start that spawns the migration worker builds no search index into the vault", async () => {
+    const r = await ensureVaultCurrent(vault, { background: true, configPath });
+
+    expect(r.migrationSpawn).toBe(AUTO_MIGRATION_SPAWN.spawned);
+    // The switch moves the index to device-local state, where it is built
+    // anew; one built into the vault's legacy folder would stay behind.
+    expect(r.reindexSpawn).toBe(SELF_HEAL_SPAWN.skippedMigration);
   });
 
   test("a live upgrade worker holds the attempt off without a record", () => {

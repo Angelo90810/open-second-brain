@@ -7,11 +7,14 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   brainDirsOf,
   brainStandingRulesPath,
   BRAIN_ACTIVE_FILE,
   BRAIN_ROOT_REL,
+  BRAIN_SCOPED_RULES_DIR,
+  BRAIN_STANDING_RULES_FILE,
 } from "../../core/brain/paths.ts";
 import {
   readStandingRules,
@@ -26,6 +29,7 @@ import {
 } from "../../core/brain/policy.ts";
 import {
   readScopedRules,
+  SCOPED_RULES_HEADER,
   type ScopedRuleIdentity,
   type ScopedRules,
 } from "../../core/brain/scoped-rules.ts";
@@ -46,7 +50,14 @@ import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
 import { parseFrontmatter } from "../../core/vault.ts";
 import { readVaultInstructionFile } from "../../core/brain/vault-instruction-file.ts";
 import { readPinnedContext } from "../../core/brain/pinned.ts";
-import { contextReach, contextVault, type ServerContext } from "../tool-contract.ts";
+import { VaultUnexaminableError } from "../../core/vault-unexaminable.ts";
+import {
+  contextReach,
+  contextVault,
+  type ServerContext,
+  type VaultMissing,
+  type VaultUnreachable,
+} from "../tool-contract.ts";
 import { vaultPathField } from "../vault-path-field.ts";
 import { deliveryView } from "./reach-events.ts";
 import { readableAtContextReachOrUndefined } from "./reach-readable.ts";
@@ -96,10 +107,49 @@ export async function toolBrainContext(ctx: ServerContext): Promise<Record<strin
   // file to read (standing rules, scoped rules, the instruction file).
   const vault = contextVault(ctx);
   const dirs = brainDirsOf(vault);
-  // `Brain/active.md` on an unswitched machine; on a store-only one the
-  // device-local cache the digest is rendered into on demand (D14 item 7).
-  const activePath = compiledDigestPath(vault, "active");
-  const onDemand = digestsRenderedOnDemand(vault);
+  // The operator's rules first: whatever the memory layer below does,
+  // including a vault this process cannot tell is switched or not, the
+  // rules lead the answer or it says why they could not be read.
+  const standing =
+    ctx.vaultMissing !== undefined
+      ? missingVaultStandingBlock(ctx.vaultMissing)
+      : vault === null
+        ? ctx.vaultUnreachable === undefined
+          ? NO_STANDING_BLOCK
+          : unreachableStandingBlock(ctx.vaultUnreachable)
+        : readStandingBlock(vault);
+  const scoped = readScopedBlock(ctx);
+  let activePath: string;
+  let onDemand: boolean;
+  try {
+    // `Brain/active.md` on an unswitched machine; on a store-only one the
+    // device-local cache the digest is rendered into on demand (D14 item 7).
+    activePath = compiledDigestPath(vault, "active");
+    onDemand = digestsRenderedOnDemand(vault);
+  } catch (err) {
+    if (!(err instanceof VaultUnexaminableError)) throw err;
+    // Neither the legacy tree nor the store can be read as this vault's
+    // memory: say so in `error`, beside the rules, never "no memory". The
+    // paths are where the legacy layout keeps the files; the pinned
+    // context is not read, and `maintenance_overdue` is null (not read).
+    return {
+      vault_path: vaultPathField(ctx),
+      present: false,
+      active_path: join(dirs.brain, "active.md"),
+      content: prependBlock(standing.text, prependBlock(scoped?.text ?? "", "")),
+      counts: EMPTY_CONTEXT_COUNTS,
+      generated_at: null,
+      pinned: serializePinnedContext(ctx, {
+        path: join(dirs.brain, "pinned.md"),
+        present: false,
+        content: "",
+      }),
+      maintenance_overdue: null,
+      error: err.message,
+      ...standingRulesField(ctx, standing),
+      ...scopedRulesField(scoped),
+    };
+  }
   const pinned = readPinnedContext(vault);
   // The request's delivery binding, resolved ONCE and used for the active
   // body AND the pinned scratchpad beside it (delivery-trust, lane A): one
@@ -126,12 +176,11 @@ export async function toolBrainContext(ctx: ServerContext): Promise<Record<strin
   // path that said nothing at all about the rules - the last silent answer
   // on a surface where every other path either carries the block or states
   // why it could not be read.
-  const standing = vault === null ? NO_STANDING_BLOCK : readStandingBlock(vault);
-  // The scoped operator rules for the project, harness and host this
-  // server was launched for - local reach only, see `readScopedBlock`.
-  // Read beside the constitution, before the no-Brain return, for the
-  // same reason: the rules govern a session whatever the memory layer did.
-  const scoped = readScopedBlock(ctx);
+  // (`standing` above.) The scoped operator rules for the project,
+  // harness and host this server was launched for - local reach only, see
+  // `readScopedBlock` - are read beside the constitution, before the
+  // no-Brain return, for the same reason: the rules govern a session
+  // whatever the memory layer did.
 
   // A store-only machine keeps its memory in the store, `Brain/` or not.
   if (!onDemand && !existsSync(dirs.brain)) {
@@ -290,6 +339,62 @@ export interface StandingBlock {
 
 export const NO_STANDING_BLOCK: StandingBlock = Object.freeze({ text: "", rules: null });
 
+/**
+ * The standing-rules block for a vault that cannot be reached: the shape a
+ * failed read has (`renderStandingRulesFailure`) - the path, the reason and
+ * the statement that no rules are in force.
+ *
+ * The rules are NOT read from the store. The store holds the operator's
+ * memories (preferences, lessons, context packs); the operator's rules live
+ * in the vault, and a vault that cannot be reached is a vault whose rules
+ * are unknown - never "there are none".
+ *
+ * The path is vault-relative, and it is built textually rather than
+ * through `brainStandingRulesPath`: that helper resolves the path inside
+ * the vault, which is exactly what cannot be done with a vault that cannot
+ * be examined. The vault itself is named in the reason.
+ */
+function unreachableStandingBlock(unreachable: VaultUnreachable): StandingBlock {
+  const path = `${BRAIN_ROOT_REL}/${BRAIN_STANDING_RULES_FILE}`;
+  return Object.freeze({
+    text: renderStandingRulesFailure(path, new Error(unreachable.reason)),
+    rules: null,
+  });
+}
+
+/**
+ * The block for a vault whose folder is not there: the notice, in the
+ * `UNAVAILABLE:` shape the other unreadable case uses, so the leading
+ * slot of the content says what is wrong with the machine instead of
+ * reporting an empty brain.
+ *
+ * The operator's rules are in that folder, so they are unknown here -
+ * never "there are none". The notice carries that, and the remedy.
+ */
+function missingVaultStandingBlock(missing: VaultMissing): StandingBlock {
+  return Object.freeze({
+    text: `UNAVAILABLE: ${missing.notice} No standing rules are in force this session.`,
+    rules: null,
+  });
+}
+
+/**
+ * The scoped-rules block for a vault that cannot be reached: the scoped
+ * block's own shape - its header and an `UNAVAILABLE:` line - naming the
+ * reason the vault is out of reach.
+ */
+function unreachableScopedRules(unreachable: VaultUnreachable): ScopedRules {
+  return Object.freeze({
+    identity: Object.freeze({ project: null, harness: null, host: null }),
+    files: Object.freeze([]),
+    text: [
+      SCOPED_RULES_HEADER,
+      `UNAVAILABLE: ${BRAIN_ROOT_REL}/${BRAIN_SCOPED_RULES_DIR} could not be read ` +
+        `(${unreachable.reason}). No scoped operator rules are in force this session.`,
+    ].join("\n\n"),
+  });
+}
+
 export function readStandingBlock(vault: string): StandingBlock {
   const path = brainStandingRulesPath(vault);
   let cfg: BrainConfig | null = null;
@@ -354,8 +459,11 @@ export function prependBlock(block: string, content: string): string {
  */
 export function readScopedBlock(ctx: ServerContext): ScopedRules | null {
   if (contextReach(ctx) !== TRANSPORT_REACH.local) return null;
-  // Scoped rules are vault files; a server with no vault has none.
-  if (contextVault(ctx) === null) return null;
+  // Scoped rules are vault files; a server with no vault has none. A
+  // server whose vault cannot be reached says why it has none.
+  if (contextVault(ctx) === null) {
+    return ctx.vaultUnreachable === undefined ? null : unreachableScopedRules(ctx.vaultUnreachable);
+  }
   let host: { readonly host: string | null; readonly unreadable: boolean };
   try {
     host = resolveHostScope(ctx.configPath ?? undefined);

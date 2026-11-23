@@ -8,8 +8,9 @@
 import { Database } from "bun:sqlite";
 
 import { SearchError } from "../types.ts";
-import { CHUNK_HOLDS_TABLE } from "../schema.ts";
+import { CHUNK_HOLDS_TABLE, chunkFtsOverride } from "../schema.ts";
 import { pathPrefixRange } from "./path-prefix.ts";
+import { beginStep } from "./atomic.ts";
 import { nowIso, sqlPlaceholders } from "./sql.ts";
 import {
   matchCarriedVectors,
@@ -180,7 +181,7 @@ export function replaceDocumentChunks(
   const ids: number[] = [];
   let embeddingsReused = 0;
   const kept = new Set<number>();
-  db.exec("BEGIN");
+  const step = beginStep(db);
   try {
     const stored = db
       .query<StoredChunk, [number]>(
@@ -245,7 +246,8 @@ export function replaceDocumentChunks(
       chunks[0] !== undefined && chunks[0].content.startsWith("---")
         ? Math.min(1, chunks.length - 1)
         : 0;
-    const insert = db.prepare<
+    // Cached on the connection (`query`), not prepared per document.
+    const insert = db.query<
       { id: number },
       [
         number,
@@ -262,7 +264,7 @@ export function replaceDocumentChunks(
         string,
       ]
     >(
-      "INSERT INTO chunks(document_id, chunk_index, content, fts_content, content_hash, start_line, end_line, token_count, heading_path, created_at, updated_at, chunk_kind) " +
+      "INSERT INTO chunks(document_id, chunk_index, content, fts_override, content_hash, start_line, end_line, token_count, heading_path, created_at, updated_at, chunk_kind) " +
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     );
     const now = nowIso();
@@ -276,7 +278,9 @@ export function replaceDocumentChunks(
         documentId,
         c.chunkIndex,
         c.content,
-        c.ftsContent ?? c.content,
+        // Empty when the full-text form is the content itself (schema
+        // v18): the generated `fts_content` reads the content then.
+        chunkFtsOverride(c.content, c.ftsContent ?? c.content),
         c.contentHash,
         c.startLine,
         c.endLine,
@@ -291,9 +295,9 @@ export function replaceDocumentChunks(
     });
     restoreCarriedVectors(db, ids, carried);
     embeddingsReused = validKept.size + carried.length;
-    db.exec("COMMIT");
+    step.commit();
   } catch (e) {
-    db.exec("ROLLBACK");
+    step.rollback();
     throw e;
   }
   return { chunkIds: ids, embeddingsReused, keptChunkIds: kept };
@@ -321,14 +325,14 @@ export function deleteChunks(
   chunkIds: ReadonlyArray<number>,
 ): void {
   if (chunkIds.length === 0) return;
-  db.exec("BEGIN");
+  const step = beginStep(db);
   try {
     purgeVecRowsByChunkIds(db, vecLoaded, chunkIds);
     const placeholders = sqlPlaceholders(chunkIds);
     db.run(`DELETE FROM chunks WHERE id IN (${placeholders})`, chunkIds as number[]);
-    db.exec("COMMIT");
+    step.commit();
   } catch (e) {
-    db.exec("ROLLBACK");
+    step.rollback();
     throw e;
   }
 }

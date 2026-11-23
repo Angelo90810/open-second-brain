@@ -375,7 +375,8 @@ const DIRECT_WRITE_EXCLUSIONS: Readonly<Record<string, WriteExclusion>> = Object
       "the migration backup copies the snapshot archive and every backup-class surface OUT of the " +
       "vault into the device-local migration folder, writes its manifest and the unparseable-item " +
       "archive there, and removes the scratch folder of its test restore; it reads the vault and " +
-      "never writes into it.",
+      "never writes into it. The list of the sync conflict copies it keeps goes to the same " +
+      "folder through the shared atomic writer.",
   },
   "src/core/store-migration/local-state.ts": {
     categories: [C.archiveTransfer, C.machineArtifact],
@@ -659,15 +660,6 @@ const DIRECT_WRITE_EXCLUSIONS: Readonly<Record<string, WriteExclusion>> = Object
       "the signal twin of the preference retire: shared-writer write first, existence " +
       "re-confirmed, then the source unlinked.",
   },
-  "src/core/search/store/lifecycle.ts": {
-    categories: [C.lifecycleMove, C.retentionDelete],
-    calls: ["renameSync", "unlinkSync"],
-    reason:
-      "restores the parked `.old` (else the `.bak`) sqlite index over a missing database " +
-      "after a crashed reindex, re-checked under the lock, and deletes a `.old` a completed " +
-      "swap left beside the live index. A database file has no text-writer form.",
-  },
-
   // --- Retention, reset and cleanup deletes ------------------------------
   "src/core/brain/exact-state.ts": {
     categories: [C.retentionDelete],
@@ -894,6 +886,24 @@ const DIRECT_WRITE_EXCLUSIONS: Readonly<Record<string, WriteExclusion>> = Object
       "swaps a freshly built sqlite index into place under the index lock, keeping the " +
       "previous file as `.bak`. A database is not text and has no shared-writer form.",
   },
+  "src/core/search/store/lifecycle.ts": {
+    categories: [C.machineArtifact, C.retentionDelete],
+    calls: ["unlinkSync"],
+    reason:
+      "the park record a swap writes beside the search index before it moves the live " +
+      "database aside (`.parking`, through `atomicWriteFileSync`), and its removal once a " +
+      "live index is back in place. Machine state beside the index, never a note.",
+  },
+  "src/core/search/build-progress.ts": {
+    categories: [C.machineArtifact, C.lockPrimitive, C.retentionDelete],
+    calls: ["unlinkSync", "writeFileSync"],
+    reason:
+      "a running rebuild's progress file beside the index (written through " +
+      "`atomicWriteFileSync`), unlinked when the rebuild ends, and the claim a search " +
+      "reading the staging file takes: an exclusive create (`wx`) of a small file, " +
+      "unlinked after its one query, which the atomic writer would lose the exclusivity " +
+      "of. Machine state beside the index, never a note.",
+  },
   "src/core/search/link-ratchet.ts": {
     categories: [C.archiveTransfer],
     calls: ["cpSync", "rmSync"],
@@ -969,13 +979,42 @@ const DIRECT_WRITE_EXCLUSIONS: Readonly<Record<string, WriteExclusion>> = Object
       "final name by an exclusive hard link (`linkSync`, or a checked rename where the " +
       "filesystem has no links), so a killed compression never leaves a torn archive.",
   },
+  "src/core/brain/tar-extract.ts": {
+    categories: [C.archiveTransfer],
+    calls: ["chmodSync", "copyFileSync", "rmSync", "symlinkSync", "utimesSync", "writeSync"],
+    reason:
+      "extracts a snapshot's tar stream into the private temp directory the restore, the " +
+      "rollback and the snapshot diff made outside the vault (`mkdtemp`); a member name " +
+      "that would leave it is refused and links are created last. The restore copies the " +
+      "checked tree into `Brain/` itself; no vault page is written here.",
+  },
+  "src/core/brain/tar-writer.ts": {
+    categories: [C.archiveTransfer],
+    calls: ["writeSync"],
+    reason:
+      "writes the tar stream of a snapshot on Windows into a file the caller opened in " +
+      "a private temp directory outside the vault (`wx`), one block at a time; the " +
+      "compressor reads that file and `snapshot.ts` publishes the archive. No vault page " +
+      "is written and no Markdown parser reads the stream.",
+  },
+  "src/core/brain/dream-owner/owner.ts": {
+    categories: [C.machineArtifact],
+    calls: ["writeFileSync"],
+    reason:
+      "notes the dream owner claim this device has already caught up on once, as a small " +
+      "JSON file in the store's device-local state directory (the claim settle rule, mirrored " +
+      "from the view writer's claim-seen file); it is never synced, never in a vault, and no " +
+      "Markdown parser reads it. The role's records go through the store appender.",
+  },
   "src/core/maintenance/self-heal-upgrade-state.ts": {
     categories: [C.lockPrimitive, C.retentionDelete],
     calls: ["unlinkSync", "writeFileSync"],
     reason:
-      "the automatic-upgrade worker lock is an exclusive create (`wx`) of a token file in " +
-      "`.open-second-brain/`, released by unlinking it; routing it through the atomic " +
-      "writer would lose the exclusivity that makes it a lock. The failed-upgrade marker is " +
+      "the automatic-upgrade worker lock is an exclusive create (`wx`) of a claim record " +
+      "(token, process, machine) in `.open-second-brain/`, released by unlinking it; routing " +
+      "the create through the atomic writer would lose the exclusivity that makes it a lock " +
+      "(the worker's stamp of its own pid on a claim it holds goes through " +
+      "`atomicWriteFileSync`). The failed-upgrade marker is " +
       "written through `atomicWriteFileSync` and unlinked once nothing is pending, which is " +
       "this tool's own per-device state, never a note.",
   },
@@ -1400,8 +1439,14 @@ const DIRECT_ROWS = ROWS.filter((row) => row.directCalls.length > 0);
  * 81 -> 82: the search index writer lock is taken, refreshed and released by its own module instead of `proper-lockfile`, to check ownership.
  * 82 -> 83: `src/core/store-migration/auto-state.ts` claims and releases the automatic store migration worker lock (an exclusive create) and removes its state and notice files once moot.
  * 83 -> 82: that module keeps its files in the device-local folder of all stores, never in a vault, so it leaves the in-vault census.
+ * 82 -> 83: `src/core/search/build-progress.ts` removes a running rebuild's progress file beside the search index when the rebuild ends.
+ * 83 -> 84: `src/core/brain/tar-writer.ts` writes a Windows snapshot's tar stream into a temp file outside the vault.
+ * 84 -> 85: `src/core/brain/tar-extract.ts` extracts a snapshot's tar stream into a temp directory outside the vault.
+ * 85 -> 84: `src/core/search/store/lifecycle.ts` moves the index's database set through `src/core/sqlite-file-set.ts` (fs-atomic retries) instead of calling `fs` itself.
+ * 84 -> 85: `src/core/search/store/lifecycle.ts` removes the park record a swap writes beside the search index once a live index is back in place.
+ * 85 -> 86: `src/core/brain/dream-owner/owner.ts` notes the dream owner claim this device has caught up on, in device-local state.
  */
-const DIRECT_WRITE_ROWS = 82;
+const DIRECT_WRITE_ROWS = 86;
 
 /**
  * Measured modules reaching a write through a shared helper. An equality.
@@ -1658,8 +1703,16 @@ const DIRECT_WRITE_ROWS = 82;
  * state and its one-time notice with the shared atomic writer.
  * 116 -> 115: those files left the vault for the device-local folder of
  * all stores.
+ * 115 -> 116: the migration backup (`src/core/store-migration/backup.ts`)
+ * writes the list of the sync conflict copies it keeps
+ * (`backup/sync-conflict-copies.json`, device-local migration folder) with
+ * the shared atomic writer (change migration-sync-conflict-copies).
+ * 116 -> 117: `src/core/search/build-progress.ts` writes a running rebuild's
+ * progress file beside the search index with the shared atomic writer.
+ * 117 -> 118: `src/core/search/store/lifecycle.ts` writes the park record a
+ * swap leaves beside the search index with the shared atomic writer.
  */
-const SHARED_HELPER_ROWS = 115;
+const SHARED_HELPER_ROWS = 118;
 
 // ----- Origin-channel coverage boundary (Unit C) ----------------------------
 
@@ -1785,8 +1838,14 @@ const STAMPED_PATHS: ReadonlySet<string> = new Set(
  * 80 -> 81: the search index writer lock's own module (lock directory metadata only, no stamped bytes).
  * 81 -> 82: the automatic store migration worker lock and state removal (machine state, no note).
  * 82 -> 81: those files left the vault for the device-local folder of all stores.
+ * 81 -> 82: a running rebuild's progress file beside the search index (machine state, no note).
+ * 82 -> 83: the in-process tar writer of a Windows snapshot (a temp tar stream, no note).
+ * 83 -> 84: the in-process tar reader of every restore (a temp extraction folder, no note).
+ * 84 -> 83: the search index's crash restore moves its database set through `sqlite-file-set.ts` (fs-atomic retries, no direct `fs` call).
+ * 83 -> 84: the removal of the park record a swap writes beside the search index (machine state, no note).
+ * 84 -> 85: the dream owner's claim-seen file (device-local machine state, no note).
  */
-const UNSTAMPED_DIRECT_ROWS = 81;
+const UNSTAMPED_DIRECT_ROWS = 85;
 
 /**
  * Shared-helper write sites the stamp does not reach, measured the same
@@ -1930,8 +1989,14 @@ const UNSTAMPED_DIRECT_ROWS = 81;
  * its one-time notice, machine state and no note.
  * 112 -> 111: those files left the vault for the device-local folder of
  * all stores.
+ * 111 -> 112: the migration backup's list of the sync conflict copies it
+ * keeps, machine state in the device-local migration folder and no note.
+ * 112 -> 113: a running rebuild's progress file beside the search index,
+ * written through the shared atomic writer, machine state and no note.
+ * 113 -> 114: the park record a swap writes beside the search index,
+ * through the shared atomic writer, machine state and no note.
  */
-const UNSTAMPED_SHARED_ROWS = 111;
+const UNSTAMPED_SHARED_ROWS = 114;
 
 describe("in-vault write-site census", () => {
   test("every direct-fs write site carries a written exclusion", () => {

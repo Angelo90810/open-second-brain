@@ -62,6 +62,11 @@ import { listMetrics } from "../brain/metrics.ts";
 import { isoSecond } from "../brain/time.ts";
 import { BRAIN_LOG_EVENT_KIND } from "../brain/types.ts";
 import { runSelfHealUpgrade, SELF_HEAL_UPGRADE_OUTCOME } from "../maintenance/self-heal-upgrade.ts";
+import {
+  describeSelfHealUpgradeLock,
+  readSelfHealUpgradeLock,
+} from "../maintenance/self-heal-upgrade-state.ts";
+import { describeImportCounts } from "../migration-gate.ts";
 import { processDirsEnv } from "../platform-dirs.ts";
 import {
   MIGRATE_STORE_COMMAND,
@@ -70,7 +75,7 @@ import {
   type MigrationAvailability,
 } from "../store/migration-availability.ts";
 import { LOG_EVENT_KIND } from "../store/constants.ts";
-import { readPartition } from "../store/state-digest.ts";
+import { forEachPartitionRecord } from "../store/state-digest.ts";
 import { inspectStore } from "../store/store-open.ts";
 import {
   isPathInsideResolved,
@@ -341,6 +346,28 @@ function stoppedGateRun(g: GatheredGate): string | null {
   return stoppedGateOf(g) !== null && gate?.kind === "held" ? gate.runId : null;
 }
 
+/** How often a step that only counts on is reported again, in ms. */
+const PROGRESS_REPEAT_MS = 30_000;
+
+/**
+ * The migrator's progress as the worker's lines: every new step at once,
+ * the same step with new counts at most every {@link PROGRESS_REPEAT_MS}
+ * (the import reports after every batch).
+ */
+function migratorProgress(
+  line: (text: string) => void,
+): (step: string, counts?: { readonly journaled: number; readonly planned: number }) => void {
+  let last = "";
+  let at = 0;
+  return (step, counts) => {
+    const t = performance.now();
+    if (step === last && t - at < PROGRESS_REPEAT_MS) return;
+    last = step;
+    at = t;
+    line(counts === undefined ? step : `${step}, ${describeImportCounts(counts)}`);
+  };
+}
+
 /** Act on the decision taken under the claim. */
 function act(a: Attempt, g: GatheredGate, w: ClaimedWrites, token: string): AutoMigrationRun {
   const d = g.decision;
@@ -489,11 +516,15 @@ function withLock(
     // The worker stamps its own pid and start identity on the claim it was
     // handed, so the claim reads as live for exactly as long as this
     // process runs. A claim taken over meanwhile is no longer ours.
+    // The stamp is also the worker's confirmation that it started: a claim
+    // handed to a worker that never confirms it, and is gone, is recorded
+    // as a failure by the start that spawned it, or by the next start.
     token = handAutoMigrationLock(
       a.vault,
       a.opts.lockToken,
       process.pid,
       processStartIdentity(process.pid),
+      true,
     )
       ? a.opts.lockToken
       : null;
@@ -715,7 +746,38 @@ function attemptOnLegacy(
       a.progress("bringing the brain's managed files up to date");
       hooks?.atStep?.(AUTO_MIGRATION_STEP.upgrade);
       const upgrade = runSelfHealUpgrade(vault, { now: a.now, ...a.cfg });
-      if (upgrade.outcome === SELF_HEAL_UPGRADE_OUTCOME.running) return notOurTurn();
+      if (upgrade.outcome === SELF_HEAL_UPGRADE_OUTCOME.running) {
+        // Only a live upgrade of this machine holds the migration off: its
+        // lock sits in the vault's synced folder, and a claim another
+        // machine made, or one an older release wrote without its machine
+        // and process, says nothing of this one. The upgrade is then left
+        // for a later start. What covers each upgrade that may still run:
+        //  - one of this release asks the gate when its apply starts and
+        //    again when its snapshot starts (`assertVaultIdentityForWrite`
+        //    in `applyUpgrade` and `takeSnapshot`), not before each file
+        //    write; its claim is a record of this machine's live process
+        //    (`here`), so the migration waits for it and never overlaps it;
+        //  - one of an older release knows no gate and may rewrite
+        //    `Brain/_brain.yaml`, `Brain/_BRAIN.md` and a repaired
+        //    preference after the snapshot: the ordinary legacy writer after
+        //    the snapshot. The import passes run until one imports nothing,
+        //    the settings are read from `_brain.yaml` at the switch,
+        //    `_BRAIN.md` is a compiled page written again after it, and a
+        //    preference written after the last pass is a late legacy write
+        //    the transition import brings in after the switch.
+        const holder = readSelfHealUpgradeLock(vault, a.now);
+        if (holder.kind === "here") {
+          a.progress(
+            `the managed-file upgrade runs (${describeSelfHealUpgradeLock(holder)}); the ` +
+              "migration is left to the next start",
+          );
+          return notOurTurn();
+        }
+        a.progress(
+          `the managed-file upgrade is left for later (${describeSelfHealUpgradeLock(holder)}); ` +
+            "the migration goes on",
+        );
+      }
     }
     // The dry run reads the legacy tree alone and writes nothing.
     a.progress("checking what a migration would move");
@@ -822,6 +884,7 @@ function attemptOnLegacy(
       ...a.cfg,
       ...(hooks !== undefined ? { hooks } : {}),
       ...(a.opts.settleMs !== undefined ? { settleMs: a.opts.settleMs } : {}),
+      onProgress: migratorProgress(a.progress),
     });
     if (outcome.mode === "waiting") {
       return wait(a, w, {
@@ -1075,18 +1138,24 @@ function rowWritten(a: Attempt, runId: string): boolean {
 function logLineWritten(a: Attempt, runId: string): boolean {
   try {
     const root = resolveConfiguredStoreRoot(a.opts.configPath).root;
-    return readPartition(join(root, "shared")).some((shard) =>
-      shard.all.some((r) => {
-        if (r.kind !== LOG_EVENT_KIND) return false;
-        if (r.body["event_type"] !== BRAIN_LOG_EVENT_KIND.storeMigrationDone) return false;
-        const body = r.body["body"];
-        return (
-          typeof body === "object" &&
-          body !== null &&
-          (body as Record<string, unknown>)["run_id"] === runId
-        );
-      }),
+    // Record by record: the shared partition holds every migrated record.
+    let found = false;
+    forEachPartitionRecord(
+      join(root, "shared"),
+      {},
+      {
+        record: (_shard, r) => {
+          if (found || r.kind !== LOG_EVENT_KIND) return;
+          if (r.body["event_type"] !== BRAIN_LOG_EVENT_KIND.storeMigrationDone) return;
+          const body = r.body["body"];
+          found =
+            typeof body === "object" &&
+            body !== null &&
+            (body as Record<string, unknown>)["run_id"] === runId;
+        },
+      },
     );
+    return found;
   } catch {
     return false;
   }

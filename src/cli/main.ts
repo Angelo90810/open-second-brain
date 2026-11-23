@@ -12,6 +12,7 @@ import { mkdirSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { recordFreshInstallSwitch } from "../core/store/fresh-switch.ts";
+import { assertVaultIdentityForWrite } from "../core/brain/vault-identity.ts";
 
 import {
   ConfigReadError,
@@ -59,6 +60,7 @@ import { handleDecisionModelSubcommand } from "./decision-model.ts";
 import { handleStateSubcommand } from "./state.ts";
 import { handleStoreSubcommand } from "./store.ts";
 import { handleViewSubcommand } from "./view.ts";
+import { handleDreamSubcommand } from "./dream/owner.ts";
 import { handleTopicSubcommand } from "./topic.ts";
 import { installMcpSignalDrain, type McpSignalDrainHandle } from "./mcp-drain.ts";
 import { installMcpFaultGuard } from "./mcp-fault-guard.ts";
@@ -71,6 +73,7 @@ import {
   resolveSemanticConfigState,
   sortedReplacer,
 } from "./helpers.ts";
+import { VaultUnexaminableError } from "../core/vault-unexaminable.ts";
 import { nextCommandField } from "../core/brain/next-step.ts";
 import { emitNextStep, type AdvisoryStream } from "./advisory-rail.ts";
 import { renderHelp, renderUsage } from "./help-render.ts";
@@ -117,6 +120,10 @@ import {
 import { HARNESS_IDS, isHarnessId, type HarnessId } from "../core/brain/scoped-rules.ts";
 import { buildStoreStatusBlock } from "../core/store/store-status.ts";
 import { storeStatusLine } from "./store-path.ts";
+import {
+  assertDestinationOutsideGatedVault,
+  MigrationInProgressError,
+} from "../core/migration-gate.ts";
 
 // ── Subcommands ─────────────────────────────────────────────────────────────
 
@@ -189,6 +196,8 @@ async function cmdStatus(argv: string[]): Promise<number> {
       process.stdout.write(`semantic: off (${semantic.hint})\n`);
     }
     process.stdout.write(`${storeStatusLine(store)}\n`);
+    const topics = store["topics"] as { advice?: unknown } | null | undefined;
+    if (typeof topics?.advice === "string") process.stdout.write(`topics: ${topics.advice}\n`);
   }
   // no-dead-ends, task 7: the terminal-state census found this one. With
   // no configuration file there is nothing else this verb can report and
@@ -208,10 +217,15 @@ async function cmdStatus(argv: string[]): Promise<number> {
  * Create the brain store unless it exists, and print the outcome (and the
  * view writer line); `null` after printing the failure.
  */
-function ensureStoreAndReport(configPath: string): EnsureBrainStoreResult | null {
+function ensureStoreAndReport(
+  configPath: string,
+  vault: string | null,
+): EnsureBrainStoreResult | null {
   let store: EnsureBrainStoreResult;
   try {
-    store = ensureBrainStore({ configPath });
+    // A store created here is a new brain unless the vault holds a legacy
+    // tree: it claims the dream owner role for this device.
+    store = ensureBrainStore({ configPath, dreamOwnerFor: { vault } });
   } catch (exc) {
     process.stderr.write(
       `error: failed to create the brain store: ${(exc as Error).message ?? exc}\n`,
@@ -224,6 +238,7 @@ function ensureStoreAndReport(configPath: string): EnsureBrainStoreResult | null
       : `the brain store already exists: ${store.root}\n`,
   );
   if (store.viewWriter !== null) process.stdout.write(`${store.viewWriter.message}\n`);
+  if (store.dreamOwner !== null) process.stdout.write(`${store.dreamOwner.message}\n`);
   return store;
 }
 
@@ -232,7 +247,7 @@ function ensureStoreAndReport(configPath: string): EnsureBrainStoreResult | null
  * and bind the vault to it. Prints the outcome; false on a failure.
  */
 function initBrainStoreForVault(vault: string, configPath: string): boolean {
-  const store = ensureStoreAndReport(configPath);
+  const store = ensureStoreAndReport(configPath, vault);
   if (store === null) return false;
   try {
     const bound = bindVaultToStore(vault, {
@@ -250,18 +265,22 @@ function initBrainStoreForVault(vault: string, configPath: string): boolean {
 }
 
 /** `o2b init` with no `--vault` and none configured: machine values, then the store (see `cmdInit`). */
-function initWithoutVault(agentName: string | null, timezone: string | null): number {
-  let configPath = defaultConfigPath();
+function initWithoutVault(
+  agentName: string | null,
+  timezone: string | null,
+  requestedConfigPath = defaultConfigPath(),
+): number {
+  let configPath = requestedConfigPath;
   try {
-    if (agentName) configPath = setConfigValue("agent_name", agentName);
-    if (timezone) configPath = setConfigValue("timezone", timezone);
+    if (agentName) configPath = setConfigValue("agent_name", agentName, configPath);
+    if (timezone) configPath = setConfigValue("timezone", timezone, configPath);
   } catch (exc) {
     process.stderr.write(
       `error: failed to persist plugin config: ${(exc as Error).message ?? exc}\n`,
     );
     return 1;
   }
-  if (ensureStoreAndReport(configPath) === null) return 1;
+  if (ensureStoreAndReport(configPath, null) === null) return 1;
   recordFreshSwitchQuietly(null, configPath);
   // The onboarding checklist below names the optional vault step and its
   // command, so this line does not repeat it.
@@ -290,7 +309,7 @@ function recordFreshSwitchQuietly(vault: string | null, configPath: string): voi
   }
 }
 
-async function cmdInit(argv: string[]): Promise<number> {
+export async function cmdInit(argv: string[]): Promise<number> {
   // `--interactive` is its own mode — composed of `init` + `brain init` +
   // per-target `install`. The non-interactive path below requires --vault.
   if (argv.includes("--interactive")) {
@@ -301,8 +320,10 @@ async function cmdInit(argv: string[]): Promise<number> {
     name: { type: "string", default: "Second Brain" },
     "agent-name": { type: "string" },
     timezone: { type: "string" },
+    config: { type: "string" },
     force: { type: "boolean" },
   });
+  const requestedConfigPath = (flags["config"] as string | undefined) ?? defaultConfigPath();
   const agentName = (flags["agent-name"] as string | undefined) ?? null;
   const timezone = (flags["timezone"] as string | undefined) ?? null;
 
@@ -335,7 +356,7 @@ async function cmdInit(argv: string[]): Promise<number> {
   // must never be written back as the machine's vault.
   let configured: string | null;
   try {
-    configured = flagVault === undefined ? configuredVaultKey(defaultConfigPath()) : null;
+    configured = flagVault === undefined ? configuredVaultKey(requestedConfigPath) : null;
   } catch (exc) {
     process.stderr.write(
       `error: cannot read the machine config: ${(exc as Error).message ?? exc}\n`,
@@ -343,7 +364,7 @@ async function cmdInit(argv: string[]): Promise<number> {
     return 1;
   }
   const vault = flagVault ?? configured;
-  if (vault === null) return initWithoutVault(agentName, timezone);
+  if (vault === null) return initWithoutVault(agentName, timezone, requestedConfigPath);
 
   // v0.11.0: `o2b init` no longer writes content into the vault.
   // Content scaffolding belongs to `o2b brain init` (the Brain layer).
@@ -355,9 +376,9 @@ async function cmdInit(argv: string[]): Promise<number> {
   const resolvedVault = resolve(vault).replace(/\\/g, "/");
   let configPath: string;
   try {
-    configPath = setConfigValue("vault", resolvedVault);
-    if (agentName) setConfigValue("agent_name", agentName);
-    if (timezone) setConfigValue("timezone", timezone);
+    configPath = setConfigValue("vault", resolvedVault, requestedConfigPath);
+    if (agentName) setConfigValue("agent_name", agentName, configPath);
+    if (timezone) setConfigValue("timezone", timezone, configPath);
   } catch (exc) {
     process.stderr.write(
       `error: failed to persist plugin config: ${(exc as Error).message ?? exc}\n`,
@@ -800,6 +821,8 @@ async function cmdExportConfig(argv: string[]): Promise<number> {
     return 1;
   }
   const output = String(flags["output"]);
+  // A destination the caller names is no way past a migration gate.
+  assertDestinationOutsideGatedVault(output);
   try {
     mkdirSync(resolve(output, ".."), { recursive: true });
     writeFileSync(output, JSON.stringify(verdict.payload, sortedReplacer, 2) + "\n", "utf8");
@@ -941,6 +964,9 @@ async function cmdIndex(argv: string[]): Promise<number> {
   }
   const indexPath = resolve(vault, BRAIN_INDEX_REL);
   try {
+    // `Brain/_INDEX.md` is a vault write: the guard refuses it on a frozen
+    // vault, a wrong store and a vault a migration is moving.
+    assertVaultIdentityForWrite(vault);
     writeFrontmatter(indexPath, { title: "Index", type: "index" }, lines.join("\n"));
   } catch (exc) {
     process.stderr.write(`error: failed to write index: ${(exc as Error).message ?? exc}\n`);
@@ -1083,12 +1109,11 @@ async function cmdMcp(argv: string[]): Promise<number> {
   // must not resolve the token file against the working directory.
   const mapVault =
     normalizeFlagString(flags["vault"] as string | undefined) ?? resolveVault(config) ?? null;
-  const mintedTokens = hasAnyMcpToken({ vault: mapVault, configPath: config });
   if (
     transport === "http" &&
     !isLoopbackHost(host) &&
     (apiKey === undefined || apiKey === "") &&
-    !mintedTokens
+    !mintedTokenKnown({ vault: mapVault, configPath: config })
   ) {
     process.stderr.write(
       "o2b mcp: --api-key (or OPEN_SECOND_BRAIN_MCP_API_KEY) or at least one minted agent token " +
@@ -1167,7 +1192,7 @@ async function cmdMcp(argv: string[]): Promise<number> {
       // enforce against. With the key on but nothing minted yet the server
       // starts and only says so - an outage would be the wrong answer for
       // an operator one mint away from the posture they asked for.
-      if (resolveMcpTokensRequired(config) && !hasAnyMcpToken({ vault, configPath: config })) {
+      if (resolveMcpTokensRequired(config) && !mintedTokenKnown({ vault, configPath: config })) {
         process.stderr.write(
           "o2b mcp: mcp_tokens_required is on, but no agent token is minted for this server yet; " +
             "credential-less requests are not refused until one exists " +
@@ -1227,6 +1252,26 @@ async function cmdMcp(argv: string[]): Promise<number> {
   }
 }
 
+/**
+ * Whether the token map the transport reads holds a minted agent token, as
+ * far as this machine can tell at start.
+ *
+ * On a vault that cannot be examined (`VaultUnexaminableError`) the
+ * machine cannot tell which token map is the one in force, and that must
+ * not keep the server from starting: a host would see a dead server
+ * instead of a `vault_unreadable` answer per tool. It counts as no token
+ * here, so a non-loopback bind still needs the shared key, and every HTTP
+ * request reads the map again and is refused while it cannot be read.
+ */
+function mintedTokenKnown(context: { vault: string | null; configPath: string }): boolean {
+  try {
+    return hasAnyMcpToken(context);
+  } catch (err) {
+    if (err instanceof VaultUnexaminableError) return false;
+    throw err;
+  }
+}
+
 function parseCapabilityWindow(
   flags: Record<string, string | boolean | string[] | undefined>,
 ): RuntimeCapabilityWindow | undefined {
@@ -1249,7 +1294,7 @@ function parseCapabilityWindow(
   };
 }
 
-async function runMcpProbe(args: {
+export async function runMcpProbe(args: {
   vault: string | undefined;
   config: string;
   scope: ToolScope;
@@ -1515,6 +1560,8 @@ async function dispatchCommand(command: string, rest: string[]): Promise<number>
         return await cmdStatus(rest);
       case "init":
         return await cmdInit(rest);
+      case "setup":
+        return await (await import("./setup.ts")).cmdSetup(rest);
       case "doctor":
         return await cmdDoctor(rest);
       case "onboarding":
@@ -1563,6 +1610,8 @@ async function dispatchCommand(command: string, rest: string[]): Promise<number>
         return await handleStoreSubcommand(rest);
       case "view":
         return await handleViewSubcommand(rest);
+      case "dream":
+        return await handleDreamSubcommand(rest);
       case "topic":
         return await handleTopicSubcommand(rest);
       case "vault":
@@ -1585,8 +1634,19 @@ async function dispatchCommand(command: string, rest: string[]): Promise<number>
       process.stderr.write(exc.message + "\n");
       return 1;
     }
+    if (exc instanceof MigrationInProgressError) {
+      return reportMigrationRefusal(exc, command, rest);
+    }
     if (exc instanceof ConfigReadError) {
       return reportConfigReadError(exc, command, rest);
+    }
+    if (exc instanceof VaultUnexaminableError) {
+      // The machine cannot tell whether the vault holds a legacy tree (the
+      // vault cannot be examined), so the verb neither read nor wrote: one
+      // line naming the vault and the error, exit 1, as for a config the
+      // machine cannot read.
+      process.stderr.write(`error: ${exc.message}\n`);
+      return 1;
     }
     if (exc instanceof BrainConfigError) {
       // Joins `NoVaultConfiguredError` on exit 1 for the reason stated at
@@ -1605,6 +1665,40 @@ async function dispatchCommand(command: string, rest: string[]): Promise<number>
     }
     throw exc;
   }
+}
+
+/**
+ * A write a store migration's gate refused, wherever in a verb it was met
+ * (a caller-named destination inside the gated vault, any guarded write):
+ * exit 1 and one error line, as a machine that cannot answer now, and for a
+ * --json caller a parseable object naming the refusal. A command the
+ * {@link withJsonFallback} envelope wraps reports it in that envelope and
+ * never gets here.
+ */
+function reportMigrationRefusal(
+  exc: MigrationInProgressError,
+  command: string,
+  rest: string[],
+): number {
+  process.stderr.write(`error: ${exc.message}\n`);
+  // A refusal that reached this point escaped no envelope (the wrapper
+  // catches it), so a --json caller gets this one object whatever the verb.
+  if (wantsJsonFlag(rest)) {
+    process.stdout.write(
+      JSON.stringify(
+        {
+          ok: false,
+          code: "migration_in_progress",
+          error: exc.message,
+          retry: exc.retry,
+          next_command: exc.next_command,
+        },
+        sortedReplacer,
+        2,
+      ) + "\n",
+    );
+  }
+  return 1;
 }
 
 /**

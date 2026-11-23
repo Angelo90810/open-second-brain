@@ -61,6 +61,9 @@
  * `doctor/uncertainty-probes.ts`.
  */
 
+import { LOCK_SIBLING_SUFFIX } from "../fs-atomic.ts";
+import { tryCreateLockName } from "../fs-lock.ts";
+import { identityOfStats, sameDevIno } from "../fs-identity.ts";
 import {
   type BigIntStats,
   closeSync,
@@ -91,7 +94,16 @@ export interface LockHandle {
   release(): void;
 }
 
-const LOCK_SUFFIX = ".lock";
+const LOCK_SUFFIX = LOCK_SIBLING_SUFFIX;
+
+/**
+ * The body {@link acquireLockSync} stamps into the lock file it creates:
+ * `<pid>\n<uuid>\n<iso>\n` on POSIX, `null\n<iso>\n` on Windows (no
+ * token). Exported so a reader can recognise a lock this module made (a
+ * snapshot leaves it out) without guessing from the name.
+ */
+export const LOCK_STAMP_BODY_RE =
+  /^(?:\d+\n[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|null)\n\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\n$/;
 
 /**
  * The file a holder created: device and inode as exact bigints. `null` when
@@ -133,8 +145,7 @@ function ensureExitHook(): void {
 /** Identity of the file behind an open descriptor; `null` when it has none. */
 function identityOf(fd: number): LockIdentity {
   try {
-    const st = fstatSync(fd, { bigint: true });
-    return st.ino === 0n ? null : { dev: st.dev, ino: st.ino };
+    return identityOfStats(fstatSync(fd, { bigint: true }));
   } catch {
     return null;
   }
@@ -174,53 +185,9 @@ function ownsLockName(lockPath: string, identity: LockIdentity, token: string): 
   try {
     const st = lstatSync(lockPath, { bigint: true });
     if (identity === null) return true;
-    return st.dev === identity.dev && st.ino === identity.ino;
+    return sameDevIno(st, identity);
   } catch {
     return false;
-  }
-}
-
-/**
- * Whether a failed exclusive create is Windows reporting a lock that is
- * mid-release rather than a real permission problem.
- *
- * Windows does not remove a file the moment another process unlinks it: the
- * name stays in a "delete pending" state until the last handle closes, and
- * any attempt to create that name meanwhile fails with `EPERM` (or `EACCES`)
- * instead of `EEXIST`. Under a multi-process race - the exact case these
- * locks exist for - a writer that loses by a few microseconds to a releasing
- * holder then crashed with a raw `EPERM` instead of waiting its turn. On
- * win32 that code is contention and goes through the same retry path as
- * `EEXIST`; the original error rides along as `cause`, so a directory that
- * genuinely refuses writes still names its real reason once the wait budget
- * runs out. POSIX never reports a held lock this way, so there it stays an
- * error.
- *
- * A directory that refuses to create files at all (an ACL, Defender's
- * Controlled Folder Access) answers the same `EPERM`, and treating THAT as
- * contention froze the caller for the whole wait budget and then reported
- * "lock busy". The two differ in whether anything holds the name: a
- * delete-pending or held lock file is there to `lstat` (or refuses the
- * `lstat` too), a refused create leaves nothing (`ENOENT`). Only the first
- * is contention. `platform` and `occupied` are test seams.
- */
-export function isWindowsDeletePending(
-  e: NodeJS.ErrnoException,
-  lockPath: string,
-  platform: NodeJS.Platform = process.platform,
-  occupied: (path: string) => boolean = nameIsOccupied,
-): boolean {
-  if (platform !== "win32" || (e.code !== "EPERM" && e.code !== "EACCES")) return false;
-  return occupied(lockPath);
-}
-
-/** Whether something holds `path`: it can be `lstat`ed, or refuses it with anything but ENOENT. */
-function nameIsOccupied(path: string): boolean {
-  try {
-    lstatSync(path);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code !== "ENOENT";
   }
 }
 
@@ -239,31 +206,19 @@ export function acquireLockSync(target: string): LockHandle {
   const lockPath = target + LOCK_SUFFIX;
   mkdirSync(dirname(lockPath), { recursive: true });
 
-  let fd = -1;
-  for (let attempt = 0; fd < 0; attempt += 1) {
-    try {
-      fd = openSync(lockPath, "wx", 0o644);
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException;
-      if (e.code === "EEXIST" || isWindowsDeletePending(e, lockPath)) {
-        const collision: NodeJS.ErrnoException = new Error(`lock busy: ${lockPath}`, { cause: e });
-        collision.code = "ELOCKED";
-        collision.path = lockPath;
-        throw collision;
-      }
-      // A Windows EPERM with nothing at the name is either a directory that
-      // refuses creates or a holder whose file finished going away between
-      // the open and the lstat. One more try tells them apart.
-      if (
-        attempt === 0 &&
-        process.platform === "win32" &&
-        (e.code === "EPERM" || e.code === "EACCES")
-      ) {
-        continue;
-      }
-      throw err;
-    }
+  // EEXIST, or Windows refusing a name its holder is still releasing, is a
+  // held lock; a refused name that is already free is created again at
+  // once (`fs-lock.ts`), and a directory that refuses new files throws there.
+  const outcome = tryCreateLockName(lockPath, "file", () => openSync(lockPath, "wx", 0o644));
+  if ("held" in outcome) {
+    const collision: NodeJS.ErrnoException = new Error(`lock busy: ${lockPath}`, {
+      cause: outcome.held,
+    });
+    collision.code = "ELOCKED";
+    collision.path = lockPath;
+    throw collision;
   }
+  const fd = outcome.created;
 
   const identity = identityOf(fd);
 
@@ -332,7 +287,7 @@ export function acquireLockSync(target: string): LockHandle {
 
 /** Whether two stats describe the same file in the same state. */
 function sameLockFile(a: BigIntStats, b: BigIntStats): boolean {
-  return a.dev === b.dev && a.ino === b.ino && a.mtimeNs === b.mtimeNs;
+  return sameDevIno(a, b) && a.mtimeNs === b.mtimeNs;
 }
 
 /**

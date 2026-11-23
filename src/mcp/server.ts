@@ -13,7 +13,11 @@ import { emitMcpRouteLatency, type McpRouteStatus } from "../core/brain/mcp-rout
 import { createRouteScope } from "../core/route-scope.ts";
 import { assertKnownArguments } from "./argument-guard.ts";
 import { VaultFrozenError } from "../core/brain/freeze-marker.ts";
-import { MigrationInProgressError } from "../core/migration-gate.ts";
+import {
+  MigrationInProgressError,
+  type MigrationRefusalRecorder,
+  recordMigrationRefusals,
+} from "../core/migration-gate.ts";
 import {
   migrationInProgressRefusal,
   UNRESOLVED_AGENT,
@@ -21,6 +25,7 @@ import {
 } from "./frozen-refusal.ts";
 import { assertNoCallerSuppliedReach } from "./reach-refusal.ts";
 import { withPrivateWithheld } from "../core/store/caller-reach.ts";
+import { configuredVaultMissing, servedVault, type ServedVault } from "../core/store/store-only.ts";
 import { buildInstructions } from "./instructions.ts";
 import {
   INTERNAL_ERROR,
@@ -40,6 +45,7 @@ import {
   isToolErrorCode,
   defaultCodeForRpc,
   TOOL_ERROR_META_KEY,
+  TOOL_ERROR_CODE,
   toolErrorMeta,
   type ToolErrorCode,
   type ToolErrorDetail,
@@ -65,6 +71,7 @@ import {
   type ToolCapabilityReport,
   type ToolDefinition,
   type ToolScope,
+  type VaultMissing,
 } from "./tool-contract.ts";
 import { noVaultRoot } from "../core/platform-dirs.ts";
 import { assertOutputContract } from "./output-contract.ts";
@@ -195,6 +202,18 @@ function vaultRequired(tool: string | undefined): MCPError {
   });
 }
 
+/**
+ * The refusal a tool that needs the vault gives on a switched machine whose
+ * vault cannot be read or is gone: the `vault_required` shape, with the
+ * `vault_unreadable` code and the reason.
+ */
+function vaultUnreachable(tool: string | undefined, reason: Error): MCPError {
+  const subject = tool === undefined ? "this request" : `\`${tool}\``;
+  return new MCPError(INVALID_PARAMS, `${subject} needs the vault: ${reason.message}`, {
+    code: TOOL_ERROR_CODE.vaultUnreadable,
+  });
+}
+
 export class MCPServer {
   readonly vault: string | null;
   readonly configPath: string | null;
@@ -203,6 +222,7 @@ export class MCPServer {
   private readonly serverName: string;
   private readonly scope: ToolScope;
   private readonly artifactStore: ArtifactStore;
+  private noVaultArtifactStore: ArtifactStore | null = null;
   private readonly capabilityReport: ToolCapabilityReport;
   /**
    * Route-level latency metrics gate (config `mcp_route_metrics_enabled`),
@@ -257,6 +277,46 @@ export class MCPServer {
     }
   }
 
+  /** This server's vault after the reachability decision, looked at now (`servedVault`). */
+  private servedVault(): ServedVault {
+    return servedVault(this.vault, this.configPath !== null ? { configPath: this.configPath } : {});
+  }
+
+  /**
+   * The notice for a configured vault whose folder is not there, on a
+   * machine that has not switched (`configuredVaultMissing`), or `null`.
+   * Looked at per request, like the reachability decision: the same
+   * server answers normally once the folder is back.
+   */
+  private missingVault(): VaultMissing | null {
+    const missing = configuredVaultMissing(
+      this.vault,
+      this.configPath !== null ? { configPath: this.configPath } : {},
+    );
+    return missing === null ? null : { vault: missing.vault, notice: missing.notice };
+  }
+
+  /**
+   * Where a request parks a payload past its preview budget: the vault's
+   * store, or with the vault served as none (a switched machine whose
+   * vault cannot be reached) the device-local one a server with no vault
+   * uses, so a large result never reads the vault to park itself.
+   *
+   * Only a switched machine's vault is ever served as none, and its
+   * machine state is device-local whether or not the vault can be reached
+   * (`state/machine-state.ts`): both stores name the same folder there, so
+   * a handle issued on either side of a change in the vault's reach
+   * resolves for the whole run.
+   */
+  private artifactStoreFor(served: string | null): ArtifactStore {
+    if (served !== null || this.vault === null) return this.artifactStore;
+    this.noVaultArtifactStore ??= new ArtifactStore({
+      vault: noVaultRoot(),
+      runId: this.artifactStore.runId,
+    });
+    return this.noVaultArtifactStore;
+  }
+
   get context(): ServerContext {
     return this.contextFor();
   }
@@ -272,20 +332,38 @@ export class MCPServer {
    */
   private contextFor(identity?: RequestIdentity, toolName?: string): ServerContext {
     const configPath = this.configPath ?? undefined;
-    const served = this.vault;
+    // A switched machine whose vault folder cannot be read or is gone holds
+    // its brain in the store: the request is served as on a server with no
+    // vault, and a tool that needs the vault refuses with the reason
+    // (`vault_unreadable`). Looked at per request, so the same server
+    // answers normally once the vault is back.
+    const { vault: served, unreachable } = this.servedVault();
+    // A configured vault whose folder is not there, on a machine that has
+    // not switched: the brain is not a fresh installation, and every
+    // surface that would say "there is nothing here yet" says this
+    // instead.
+    const missing = this.missingVault();
     return {
       // With no vault, reading `vault` is the uniform refusal (design D14):
       // a vault-adapter tool refuses at its first use, every other tool
       // reads `vaultOrNull` or never asks.
       get vault(): string {
+        if (unreachable !== null) throw vaultUnreachable(toolName, unreachable.error);
         if (served === null) throw vaultRequired(toolName);
         return served;
       },
       vaultOrNull: served,
+      // The reason the vault is out of reach, for the surfaces that report
+      // what they could not read instead of refusing (the operator's rules
+      // in `brain_context`).
+      ...(unreachable !== null
+        ? { vaultUnreachable: { vault: unreachable.vault, reason: unreachable.reason } }
+        : {}),
+      ...(missing !== null ? { vaultMissing: missing } : {}),
       configPath: this.configPath,
       repoRoot: this.repoRoot,
       capabilityReport: this.capabilityReport,
-      artifactStore: this.artifactStore,
+      artifactStore: this.artifactStoreFor(served),
       reach: this.reach,
       ruleScope: this.ruleScope,
       // Present only when a transport minted one: the two nulls (no
@@ -397,23 +475,31 @@ export class MCPServer {
     // cannot see.
     assertNoCallerSuppliedReach(tool, args);
     assertKnownArguments(tool, args);
+    // A refusal of the migration gate is recorded wherever it is met, so a
+    // handler that wraps it in an error of its own still answers with the
+    // structured refusal (`mapFrozen`).
+    const gate: MigrationRefusalRecorder = { refused: null };
     if (!this.routeMetricsEnabled) {
       try {
-        return await tool.handler(this.contextFor(identity, tool.name), args, onProgress);
+        return await recordMigrationRefusals(gate, async () =>
+          tool.handler(this.contextFor(identity, tool.name), args, onProgress),
+        );
       } catch (exc) {
-        throw this.mapFrozen(tool, exc, identity);
+        throw this.mapFrozen(tool, exc, identity, gate.refused);
       }
     }
     const start = performance.now();
     let status: McpRouteStatus = "ok";
     const routeScope = createRouteScope();
     try {
-      return await routeScope.run(async () =>
-        tool.handler(this.contextFor(identity, tool.name), args, onProgress),
+      return await recordMigrationRefusals(gate, async () =>
+        routeScope.run(async () =>
+          tool.handler(this.contextFor(identity, tool.name), args, onProgress),
+        ),
       );
     } catch (exc) {
       status = "error";
-      throw this.mapFrozen(tool, exc, identity);
+      throw this.mapFrozen(tool, exc, identity, gate.refused);
     } finally {
       // The route metric is a vault continuity record: none without a vault.
       if (this.vault !== null) {
@@ -446,9 +532,18 @@ export class MCPServer {
    * cover the ones somebody remembered. Every other exception passes
    * through untouched.
    */
-  private mapFrozen(tool: ToolDefinition, exc: unknown, identity?: RequestIdentity): unknown {
-    // A store migration running on this machine refuses like a freeze.
+  private mapFrozen(
+    tool: ToolDefinition,
+    exc: unknown,
+    identity?: RequestIdentity,
+    gateRefusal: MigrationInProgressError | null = null,
+  ): unknown {
+    // A store migration running on this machine refuses like a freeze,
+    // also when the handler reported the refusal as an error of its own.
     if (exc instanceof MigrationInProgressError) return migrationInProgressRefusal(tool.name, exc);
+    if (gateRefusal !== null && !(exc instanceof VaultFrozenError)) {
+      return migrationInProgressRefusal(tool.name, gateRefusal);
+    }
     if (!(exc instanceof VaultFrozenError) || this.vault === null) return exc;
     // `agentName` is optional on the context - a transport may supply
     // none - so an absent identity is recorded as the named absence
@@ -654,17 +749,34 @@ export class MCPServer {
       const structured = this.forCaller(
         await this.invokeToolHandler(tool, args, onProgress, identity),
       );
-      return withProgressRefusal(buildMcpToolResult(tool, structured, this.artifactStore), refusal);
+      return withProgressRefusal(
+        buildMcpToolResult(
+          tool,
+          structured,
+          this.artifactStoreFor(this.servedVault().vault),
+          (text) => this.forCaller(text) as string,
+        ),
+        refusal,
+      );
     } catch (exc) {
+      // A machine whose configured vault folder is not there is not a
+      // fresh installation: every refusal it answers names the missing
+      // folder FIRST, so the advice to initialise a new brain (which the
+      // refusal keeps) is never the first thing the caller reads.
+      const missing = this.missingVault();
+      const prefix = missing === null ? "" : `${missing.notice} `;
       if (exc instanceof MCPError) {
-        if (refusal === undefined) throw exc;
-        throw new MCPError(exc.code, exc.message, { ...exc.data, [PROGRESS_META_KEY]: refusal });
+        const message = prefix.length === 0 ? exc.message : `${prefix}${exc.message}`;
+        if (refusal === undefined) throw new MCPError(exc.code, message, exc.data);
+        throw new MCPError(exc.code, message, { ...exc.data, [PROGRESS_META_KEY]: refusal });
       }
       // The tool-level twin of the INTERNAL_ERROR channel: the same raw
       // exception prose, so the same host-path redaction at remote reach.
       // A local caller already holds the filesystem, and these messages
       // carry operator remediation (a config path to chmod) verbatim.
-      const raw = (exc as Error).message ?? String(exc);
+      // The missing-vault notice names the configured vault, so it is
+      // redacted with the exception prose, never prefixed after it.
+      const raw = `${prefix}${(exc as Error).message ?? String(exc)}`;
       const message =
         this.reach === TRANSPORT_REACH.local
           ? raw
@@ -756,10 +868,12 @@ export function buildMcpToolResult(
   tool: ToolDefinition,
   structured: unknown,
   store: ArtifactStore,
+  /** The caller's path redaction, for text this builder adds after it ran. */
+  forCaller: (text: string) => string = (text) => text,
 ): Record<string, unknown> {
   assertOutputContract(tool.name, tool.outputSchema, structured);
   const serialized = JSON.stringify(structured, sortedReplacer, 2);
-  const outcome = applyPreviewBudget(serialized, tool.previewBudget, store);
+  const outcome = applyPreviewBudget(serialized, tool.previewBudget, store, forCaller);
   return {
     content: [{ type: "text", text: outcome.text }],
     structuredContent: structured,

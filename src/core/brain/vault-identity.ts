@@ -85,6 +85,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { atomicWriteFileSync } from "../fs-atomic.ts";
+import { stampOfStats, stampVouches, type FileStamp } from "../fs-stamp.ts";
 import { ensureInsideVault } from "../path-safety.ts";
 import {
   DEGRADATION_CODE,
@@ -213,21 +214,23 @@ export class VaultIdentityMismatchError extends Error {
 const PINNED_IDENTITIES = new Map<string, string>();
 
 /**
- * Inode identity of the marker file the last assertion parsed, per
- * resolved root.
+ * Stamp of the marker file the last assertion parsed, per resolved root.
  *
  * The guard sits on EVERY write, including append-heavy telemetry loops
- * that record tens of thousands of rows in one run, so the per-call cost
- * has to be one syscall rather than an open-read-parse. `writeVaultIdentity`
- * goes through `atomicWriteFileSync` - a temp file plus a rename - so a
- * replaced marker always arrives with a new inode. Matching on
- * (inode, size, mtime) therefore proves the bytes are the ones already
- * parsed; anything else falls through to a full re-read.
+ * that record tens of thousands of rows in one run, so the steady-state
+ * cost has to be one syscall rather than an open-read-parse. The stamp
+ * alone is not proof: `writeVaultIdentity` replaces the marker through a
+ * temp file and a rename (a new inode), but a hand edit, a sync tool or a
+ * FAT volume that reuses ids can rewrite it in place at the same size
+ * inside one tick of the volume's clock, and then inode, size and both
+ * times all match. `stampVouches` (`fs-stamp.ts`) therefore trusts a
+ * stamp only once the marker's times are older than the read by the racy
+ * window; until then, and whenever any field differs, the marker is read
+ * again. A missed identity change here would let a write land in a vault
+ * that is no longer the one this process pinned.
  */
 interface MarkerStamp {
-  readonly ino: number;
-  readonly size: number;
-  readonly mtimeMs: number;
+  readonly stamp: FileStamp;
   readonly vaultId: string;
 }
 const MARKER_STAMPS = new Map<string, MarkerStamp>();
@@ -272,9 +275,13 @@ function currentVaultId(root: string): string | null {
   // The `catch` stays. The option suppresses ENOENT only, and every
   // other stat failure (EACCES, ELOOP) must still collapse to "absent"
   // exactly as before, rather than propagate out of a write guard.
+  // Taken before the stat, so it is no later than the read of the bytes.
+  const readAtMs = Date.now();
   let stat;
   try {
-    stat = statSync(path, { throwIfNoEntry: false });
+    // bigint: the inode compared below is exact on Windows too (NTFS ids
+    // exceed 2^53; `fs-identity.ts`).
+    stat = statSync(path, { bigint: true, throwIfNoEntry: false });
   } catch {
     stat = undefined;
   }
@@ -283,12 +290,7 @@ function currentVaultId(root: string): string | null {
     return null;
   }
   const cached = MARKER_STAMPS.get(root);
-  if (
-    cached !== undefined &&
-    cached.ino === stat.ino &&
-    cached.size === stat.size &&
-    cached.mtimeMs === stat.mtimeMs
-  ) {
+  if (cached !== undefined && stampVouches(cached.stamp, stat)) {
     return cached.vaultId;
   }
   const identity = readVaultIdentity(root);
@@ -296,12 +298,7 @@ function currentVaultId(root: string): string | null {
     MARKER_STAMPS.delete(root);
     return null;
   }
-  MARKER_STAMPS.set(root, {
-    ino: stat.ino,
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-    vaultId: identity.vault_id,
-  });
+  MARKER_STAMPS.set(root, { stamp: stampOfStats(stat, readAtMs), vaultId: identity.vault_id });
   return identity.vault_id;
 }
 
@@ -370,7 +367,9 @@ export function vaultMarkerAbsentNotice(vault: string): DegradationNotice | null
  * answer a question nobody asked.
  *
  * This guard is the freeze's seam because it is the only position every
- * content writer already passes. Hooking the note-write seam instead
+ * content writer already passes. It is the migration gate's seam for the
+ * same reason, on both lanes and ahead of the freeze: the gate holds the
+ * audit lane too. Hooking the note-write seam instead
  * would have left the dream pass, hygiene, page-dedup and the
  * write-session engine writing preferences, signals and state straight
  * through a freeze.
@@ -381,11 +380,16 @@ export function assertVaultIdentityForWrite(
   lane: WriteLane = WRITE_LANE.content,
 ): void {
   const root = resolve(vault);
-  if (lane === WRITE_LANE.content) {
-    assertVaultNotFrozen(root);
-    // A brain store migration running on this machine (design D11 step 2).
-    assertNoMigrationInProgress(root);
-  }
+  // A brain store migration of this vault holding this machine's gate
+  // (design D11 step 2) refuses EVERY write, on both lanes. The audit lane
+  // exists so a freeze does not silence its own record; a migration has no
+  // such need, and a log line, a freeze marker or an attestation written
+  // into the legacy tree while it is being moved is a write the migration
+  // may never carry over (a record after its last pass, or into a surface
+  // it copied once). The run's own snapshot passes through
+  // `asMigrationGateHolder`, nothing else does.
+  assertNoMigrationInProgress(root);
+  if (lane === WRITE_LANE.content) assertVaultNotFrozen(root);
   const vaultId = currentVaultId(root);
   if (vaultId === null) {
     if (sink !== undefined) {

@@ -22,13 +22,15 @@
  *     verifying the contents, then replacing every top-level entry
  *     under `Brain/` *except* `.snapshots/`.
  *
- *   - Tooling: we shell out to system `tar` (GNU tar on Linux, bsdtar
- *     on macOS and in `System32\tar.exe` on Windows 10+) and use `zstd`
- *     when it is on PATH. Without `zstd` the archive is gzip-compressed
- *     in-process through `node:zlib`, so no `gzip` binary is needed -
- *     native Windows has none. A missing `tar` throws
- *     {@link BrainSnapshotToolingMissingError} with an actionable
- *     message.
+ *   - Tooling: a snapshot is written by the system `tar` (GNU tar on
+ *     Linux, bsdtar on macOS) and, on Windows, in process
+ *     (`tar-writer.ts`); every archive is read back in process
+ *     (`tar-extract.ts`), so a restore needs no `tar` at all. `zstd` is
+ *     used when it is on PATH. Without `zstd` the archive is
+ *     gzip-compressed in-process through `node:zlib`, so no `gzip` binary
+ *     is needed - native Windows has none. A create without `tar` on
+ *     PATH throws {@link BrainSnapshotToolingMissingError} with an
+ *     actionable message.
  *
  * No external dependencies. Everything is `node:child_process` +
  * `node:fs` + `node:zlib`, so the cost is one subprocess per archive
@@ -112,10 +114,22 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { FileAlreadyExistsError, renameWithRetry, unlinkWithRetry } from "../fs-atomic.ts";
+import { productTransientKind } from "./snapshot-transient.ts";
+import { writeTarArchive } from "./tar-writer.ts";
+import { extractTarArchive } from "./tar-extract.ts";
+import { readTarMemberNames, type TarMemberName, type TarRead } from "./tar-names.ts";
 import { classifyRecoverability, type RecoverabilityVerdict } from "./gates/recoverability.ts";
-import { sha256Hex } from "../integrity/digest.ts";
+import { sha256HexOfFile } from "../integrity/digest.ts";
 import { resolveConfiguredIndexPath } from "../search/paths.ts";
-import { runIntegrityCheck } from "../search/store/lifecycle.ts";
+import { compareKey, foldsCase, isStoreFamilyEntry } from "../search/store-family.ts";
+
+export { isStoreFamilyEntry };
+import {
+  clearParkMarker,
+  restoreParkedIndexUnderLock,
+  runIntegrityCheck,
+  writeParkMarker,
+} from "../search/store/lifecycle.ts";
 import {
   acquireWriterLeaseSync,
   acquireWriterLockSync,
@@ -152,6 +166,13 @@ import { BRAIN_LOG_EVENT_KIND, type BrainSnapshotReason } from "./types.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 import type { WriteLane } from "./freeze-marker.ts";
 import { closeDatabase } from "../sqlite-close.ts";
+import {
+  parkSqliteFileSet,
+  sqliteJournalsPresent,
+  SQLITE_SIBLING_SUFFIXES,
+  SqliteFileSetMoveError,
+  unparkSqliteFileSet,
+} from "../sqlite-file-set.ts";
 import { machineStateRoot } from "../state/machine-state.ts";
 
 // ----- Errors ---------------------------------------------------------------
@@ -756,8 +777,9 @@ export function tarPathArg(path: string, platform: NodeJS.Platform = process.pla
  * Names are raw bytes (`Buffer`), not strings: a POSIX file name need not be
  * UTF-8, and a latin1 `caf\xe9.md` decoded to a string comes back as
  * `caf\uFFFD.md` - a name that does not exist, which GNU tar then refuses
- * to archive. Bytes round-trip exactly (on Windows they are the UTF-8 of
- * the UTF-16 name, which is what tar reads the list as).
+ * to archive. On Windows they are the UTF-8 of the UTF-16 name, which the
+ * in-process writer opens as a path (`tar.exe` would read them in the ANSI
+ * code page).
  *
  * The walk is exhaustive or it fails. tar is told not to recurse, so a
  * directory this walk could not read would be archived EMPTY, and bsdtar
@@ -766,11 +788,35 @@ export function tarPathArg(path: string, platform: NodeJS.Platform = process.pla
  * not in the tree any more and is left out; any other error is thrown as a
  * {@link BrainSnapshotError} naming the path.
  */
-export function sortedMembers(vault: string, rel: Buffer, runId: string): Buffer[] {
+export function sortedMembers(
+  vault: string,
+  rel: Buffer,
+  runId: string,
+  emptyLocks?: Set<string>,
+): Buffer[] {
   const abs = Buffer.concat([Buffer.from(vault), SLASH, rel]);
   let entries: Buffer[];
   try {
-    if (!lstatSync(abs).isDirectory()) return [rel];
+    const stat = lstatSync(abs);
+    // A transient of the product itself (`snapshot-transient.ts`: a form no
+    // content has) is never archived, a lock directory included, which is
+    // judged before it is entered.
+    const name = memberName(rel);
+    const dir = Buffer.concat([Buffer.from(vault), SLASH, rel.subarray(0, rel.lastIndexOf(SLASH))]);
+    const beside = (original: string): boolean =>
+      existsSync(Buffer.concat([dir, SLASH, Buffer.from(original)]));
+    // Any answer but content leaves it out, `vanished` included: an entry
+    // gone between this `lstat` and the classifier's read is not in the tree.
+    if (productTransientKind(abs, name, stat, beside) !== null) return [];
+    if (!stat.isDirectory()) {
+      // An empty `<target>.lock` the rule above does not know: archived, and
+      // remembered, because a lock helper's file looks like this between its
+      // create and its stamp (`snapshotVanishedTolerable`).
+      if (emptyLocks !== undefined && stat.isFile() && stat.size === 0 && name.endsWith(".lock")) {
+        emptyLocks.add(rel.toString("hex"));
+      }
+      return [rel];
+    }
     entries = readdirSync(abs, { encoding: "buffer" });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
@@ -782,13 +828,51 @@ export function sortedMembers(vault: string, rel: Buffer, runId: string): Buffer
   }
   const out = [rel];
   for (const name of entries.toSorted(Buffer.compare)) {
-    out.push(...sortedMembers(vault, Buffer.concat([rel, SLASH, name]), runId));
+    out.push(...sortedMembers(vault, Buffer.concat([rel, SLASH, name]), runId, emptyLocks));
   }
   return out;
 }
 
 const SLASH = Buffer.from("/");
 const NUL = Buffer.from([0]);
+
+/** The last `/`-separated segment of a member, as a name. */
+function memberName(rel: Buffer): string {
+  return rel.subarray(rel.lastIndexOf(SLASH) + 1).toString("utf8");
+}
+
+/**
+ * Whether the listed members that vanished let a snapshot whose tar failed
+ * list the tree again and retry. Only a member that was, when listed, an
+ * EMPTY `<target>.lock` file qualifies: the form a lock of
+ * `sync-lockfile.ts` has between its exclusive create and its stamp (once
+ * stamped the listing leaves it out), and one that held no byte, so the
+ * new listing loses nothing. Any other vanished member, an unknown
+ * `.lock` with content or a `.tmp` file included, is a vanished content
+ * file and fails the snapshot.
+ */
+function snapshotVanishedTolerable(
+  vanished: ReadonlyArray<Buffer>,
+  emptyLocks: ReadonlySet<string>,
+): boolean {
+  return vanished.length > 0 && vanished.every((m) => emptyLocks.has(m.toString("hex")));
+}
+
+/** How many times a snapshot lists and archives the tree when only transient files vanished. */
+const SNAPSHOT_VANISHED_ATTEMPTS = 3;
+
+/** The members of `members` no longer on disk (`lstat` finds nothing). */
+function vanishedMembers(vault: string, members: ReadonlyArray<Buffer>): Buffer[] {
+  return members.filter((m) => {
+    try {
+      lstatSync(Buffer.concat([Buffer.from(vault), SLASH, m]));
+      return false;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      return code === "ENOENT" || code === "ENOTDIR";
+    }
+  });
+}
 
 /**
  * Make `Brain/.snapshots/` exist, or say what is there instead.
@@ -903,22 +987,23 @@ export function createSnapshot(
   // rather than of a cleanup path that could be forgotten.
   const derivedStore = coverDerivedStore(vault, logVault, runId, tools, opts);
 
-  // List top-level entries of Brain/ that we want to capture. Sort the
-  // result so the resulting archive's contents are deterministic
-  // across filesystems (readdirSync's order is FS-dependent).
-  let topEntries: Buffer[];
-  try {
-    topEntries = readdirSync(dirs.brain, { encoding: "buffer" }).filter(
-      (e) => !isSnapshotExcludedEntry(bufferEntryName(e)),
-    );
-  } catch (err) {
-    discardStoreArchive(derivedStore, vault, runId);
-    throw new BrainSnapshotError(
-      `failed to list Brain/: ${(err as Error).message ?? String(err)}`,
-      runId,
-    );
-  }
-  topEntries.sort(Buffer.compare);
+  // The top-level entries of Brain/ to capture, listed again at every
+  // attempt below (a temp file renamed onto its final name between two
+  // attempts is found under that name). Sorted so the archive's contents
+  // are deterministic across filesystems (readdirSync's order is
+  // FS-dependent).
+  const listTop = (): Buffer[] => {
+    try {
+      return readdirSync(dirs.brain, { encoding: "buffer" })
+        .filter((e) => !isSnapshotExcludedEntry(bufferEntryName(e)))
+        .toSorted(Buffer.compare);
+    } catch (err) {
+      throw new BrainSnapshotError(
+        `failed to list Brain/: ${(err as Error).message ?? String(err)}`,
+        runId,
+      );
+    }
+  };
 
   // Paths inside the archive start at `Brain/` — matching the rollback
   // contract that the archive is "the Brain/ tree". Every member is
@@ -928,33 +1013,49 @@ export function createSnapshot(
   // order, NTFS, APFS). The member ORDER is therefore deterministic; the
   // bytes are not (tar headers still carry mtime, owner and mode).
   // The list travels NUL-separated through a file (`--null -T`), which
-  // GNU tar and bsdtar (macOS, Windows `tar.exe`) both accept and which
-  // survives any character a filename can hold.
+  // GNU tar and macOS bsdtar accept and which survives any character a
+  // filename can hold. Windows `tar.exe` reads that list in the ANSI code
+  // page, so there the stream is written in process instead
+  // (`writeArchiveInProcess`).
   const listDir = mkdtempSync(join(tmpdir(), `o2b-snapshot-list-${runId}-`));
   const listPath = join(listDir, "members");
 
   try {
-    const members = topEntries.flatMap((e) =>
-      sortedMembers(vault, Buffer.concat([Buffer.from(`${BRAIN_ROOT_REL}/`), e]), runId),
-    );
-    writeFileSync(listPath, Buffer.concat(members.flatMap((m) => [m, NUL])));
-    const tarArgs = [
-      "-c",
-      "-f",
-      "-",
-      "-C",
-      tarPathArg(vault),
-      "--no-recursion",
-      "--null",
-      "-T",
-      tarPathArg(listPath),
-    ];
-    // tar writes into a staging file beside the member list rather than
-    // into a captured pipe, and the compressor reads that file: neither
-    // the tar stream nor the compressed archive ever sits in this
-    // process's memory, so the size of `Brain/` sets no ceiling here.
     const tarPath = join(listDir, "brain.tar");
-    runArchiveProducer("tar", tarArgs, tarPath, runId);
+    // A listed member another process removes before tar reads it fails
+    // tar: GNU tar and macOS bsdtar say "<path>: Cannot stat: No such file
+    // or directory", Windows tar.exe (bsdtar) has been seen saying
+    // ": Couldn't visit directory" with no name. Each reads the same NUL
+    // list, so the check below re-reads the disk rather than the tool's
+    // words: when every member that vanished was an empty lock file
+    // (`snapshotVanishedTolerable`), the tree is listed again and archived
+    // again; anything else that vanished fails the snapshot.
+    for (let attempt = 1; ; attempt++) {
+      const emptyLocks = new Set<string>();
+      const members = listTop().flatMap((e) =>
+        sortedMembers(
+          vault,
+          Buffer.concat([Buffer.from(`${BRAIN_ROOT_REL}/`), e]),
+          runId,
+          emptyLocks,
+        ),
+      );
+      rmSync(tarPath, { force: true });
+      try {
+        if (process.platform === "win32") {
+          writeArchiveInProcess(vault, members, tarPath, runId);
+        } else {
+          writeFileSync(listPath, Buffer.concat(members.flatMap((m) => [m, NUL])));
+          runTar(vault, listPath, tarPath, runId);
+        }
+        break;
+      } catch (err) {
+        const vanished = vanishedMembers(vault, members);
+        const retry =
+          attempt < SNAPSHOT_VANISHED_ATTEMPTS && snapshotVanishedTolerable(vanished, emptyLocks);
+        if (!retry) throw err;
+      }
+    }
     compressInto({ kind: "file", path: tarPath }, outPath, tools, runId);
     if (!existsSync(outPath)) {
       throw new BrainSnapshotError(
@@ -972,7 +1073,71 @@ export function createSnapshot(
   } finally {
     rmSync(listDir, { recursive: true, force: true });
   }
+  return finishSnapshot(vault, logVault, runId, dirs, derivedStore, opts, outPath);
+}
 
+/**
+ * The tar stream of a snapshot on Windows, written in process
+ * (`tar-writer.ts`). `tar.exe` there (bsdtar in `System32`) reads the
+ * names of a `-T` list, and its `-C` directory, in the ANSI code page,
+ * so a member named in Cyrillic, CJK or with an accent (a decision or topic
+ * slug in any script) decoded to a name that does not exist, often an
+ * empty one ("tar: : Couldn't visit directory"), and every snapshot of
+ * such a tree failed. The writer takes the names as Node paths (UTF-16)
+ * and stores them as UTF-8 pax records, which both tars extract under the
+ * right name. A member that vanished fails like a tar run that missed it,
+ * so the caller's vanished-member check decides the same way.
+ */
+function writeArchiveInProcess(
+  vault: string,
+  members: ReadonlyArray<Buffer>,
+  tarPath: string,
+  runId: string,
+): void {
+  try {
+    keepLeasesFreshInProcess(() => writeTarArchive(vault, members, tarPath));
+  } catch (err) {
+    throw new BrainSnapshotError(
+      `archive write failed: ${(err as Error).message ?? String(err)}`,
+      runId,
+      { cause: err },
+    );
+  }
+}
+
+/** The tar run of a snapshot: the NUL-separated member list `listPath`, no recursion, into `tarPath`. */
+function runTar(vault: string, listPath: string, tarPath: string, runId: string): void {
+  const tarArgs = [
+    "-c",
+    "-f",
+    "-",
+    "-C",
+    tarPathArg(vault),
+    "--no-recursion",
+    "--null",
+    "-T",
+    tarPathArg(listPath),
+  ];
+  // tar writes into a staging file beside the member list rather than
+  // into a captured pipe, and the compressor reads that file: neither
+  // the tar stream nor the compressed archive ever sits in this
+  // process's memory, so the size of `Brain/` sets no ceiling here.
+  runArchiveProducer("tar", tarArgs, tarPath, runId, {
+    ...process.env,
+    COPYFILE_DISABLE: "1",
+  });
+}
+
+/** The sidecar manifest and the log line of a snapshot whose archive is on disk. */
+function finishSnapshot(
+  vault: string,
+  logVault: string,
+  runId: string,
+  dirs: ReturnType<typeof brainDirsForWrite>,
+  derivedStore: CreateSnapshotResult["derived_store"],
+  opts: CreateSnapshotOptions,
+  outPath: string,
+): CreateSnapshotResult {
   // Sidecar manifest. Failure is non-fatal: the archive is the
   // load-bearing artifact, and a snapshot without a manifest just
   // degrades rollback's drift detection to a silent-overwrite path
@@ -1222,7 +1387,7 @@ function coverDerivedStore(
     included: true,
     source_path: sourcePath,
     archive_name: basename(archivePath),
-    archive_sha256: sha256Hex(readFileSync(archivePath)),
+    archive_sha256: sha256HexOfFile(archivePath),
     archive_size: archiveSize,
     live_size: liveSize,
     exclusion_reason: null,
@@ -1271,8 +1436,12 @@ function assertStoreIsSound(sourcePath: string, runId: string): void {
   try {
     const verdict = runIntegrityCheck(db);
     if (!verdict.ok) {
+      // A scan that could not complete vouches for nothing either: the
+      // store is not archived, but it is not called damaged.
       throw new BrainSnapshotStoreError(
-        `${sourcePath} failed a structural integrity check: ${verdict.fault}`,
+        verdict.inconclusive === true
+          ? `${sourcePath} could not be checked for integrity: ${verdict.fault}`
+          : `${sourcePath} failed a structural integrity check: ${verdict.fault}`,
         runId,
         SNAPSHOT_STORE_EXCLUSION.integrity_fault,
       );
@@ -1665,6 +1834,47 @@ export function resolveSnapshotToolTimeoutMs(env: NodeJS.ProcessEnv = process.en
 }
 
 /**
+ * The ceiling on the INFLATED size of a snapshot archive, in bytes.
+ *
+ * The gzip branch of a restore inflates in process, because native Windows
+ * has no `gzip` binary, and the inflated bytes are held in memory: the
+ * tar stream of `Brain/` (or the archived derived store) comes back as one
+ * buffer. Without a ceiling an archive that inflates far past the tree it
+ * claims to hold takes the process down with it, so the restore refuses one
+ * by name instead.
+ *
+ * The default is half a gigabyte: twice the ceiling this tool's own
+ * defaults put on the largest artifact it archives (the derived store,
+ * `snapshots.derived_store_max_bytes`, 256 MiB by default) and far above
+ * the Markdown tree of any vault this tool was built for. A vault past it
+ * raises the bound - see {@link SNAPSHOT_MAX_INFLATED_BYTES_ENV}.
+ */
+export const MAX_INFLATED_ARCHIVE_BYTES = 512 * 1024 * 1024;
+
+/** Environment variable that overrides {@link MAX_INFLATED_ARCHIVE_BYTES}. */
+export const SNAPSHOT_MAX_INFLATED_BYTES_ENV = "OPEN_SECOND_BRAIN_SNAPSHOT_MAX_INFLATED_BYTES";
+
+/**
+ * The inflate ceiling in force: {@link SNAPSHOT_MAX_INFLATED_BYTES_ENV} when
+ * it is a whole number of bytes above zero, {@link MAX_INFLATED_ARCHIVE_BYTES}
+ * when it is unset or empty. Any other value is an error rather than a
+ * silent fallback, so a typo cannot quietly change the bound.
+ */
+export function resolveMaxInflatedBytes(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[SNAPSHOT_MAX_INFLATED_BYTES_ENV];
+  if (raw === undefined || raw.trim() === "") return MAX_INFLATED_ARCHIVE_BYTES;
+  const text = raw.trim();
+  const parsed = /^\d+$/.test(text) ? Number(text) : Number.NaN;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `${SNAPSHOT_MAX_INFLATED_BYTES_ENV}=${raw} is not a byte count; set it to a whole number of ` +
+        `bytes > 0 (the default is ${MAX_INFLATED_ARCHIVE_BYTES}), or unset it`,
+    );
+  }
+  return parsed;
+}
+
+/**
  * `spawnSync` with the snapshot tool timeout. A run that hits it is killed
  * (SIGKILL: a tool that ignored its input closing will not honour a polite
  * signal either) and reported as a {@link BrainSnapshotError} that names
@@ -1749,6 +1959,7 @@ function runArchiveProducer(
   args: ReadonlyArray<string>,
   outFile: string,
   runId: string,
+  env?: NodeJS.ProcessEnv,
 ): void {
   const fd = openSync(outFile, "wx");
   let r: SpawnSyncReturns<Buffer>;
@@ -1756,7 +1967,11 @@ function runArchiveProducer(
     r = spawnSnapshotTool(
       cmd,
       args,
-      { maxBuffer: SUBPROCESS_MAX_BUFFER_BYTES, stdio: ["ignore", fd, "pipe"] },
+      {
+        maxBuffer: SUBPROCESS_MAX_BUFFER_BYTES,
+        stdio: ["ignore", fd, "pipe"],
+        ...(env ? { env } : {}),
+      },
       runId,
     );
   } finally {
@@ -2103,16 +2318,8 @@ export function extractSnapshotToTemp(vault: string, runId: string): ExtractSnap
   vault = machineStateRoot(vault);
   validateRunId(runId);
   const archive = snapshotPath(vault, runId);
-  if (!existsSync(archive)) {
-    throw new BrainSnapshotError(`archive does not exist: ${archive}`, runId);
-  }
+  assertRegularFile(archive, runId, "archive");
   const tools = detectTooling();
-  if (!tools.tar) {
-    throw new BrainSnapshotToolingMissingError(
-      "tar",
-      "install GNU tar or BSD tar; both support the same -x command.",
-    );
-  }
 
   const tmp = mkdtempSync(join(tmpdir(), `o2b-brain-extract-${runId}-`));
   const cleanup = (): void => {
@@ -2135,76 +2342,168 @@ export function extractSnapshotToTemp(vault: string, runId: string): ExtractSnap
     }
 
     if (decompressor === "zstd") {
-      // Decompressed to a staging file OUTSIDE the extraction root, then
-      // handed to tar as its stdin descriptor: neither stream is captured
-      // in memory, so an archive whose tar stream is larger than any
-      // capture buffer restores as well as a small one. Captured through
-      // a 256 MB `maxBuffer` before, which such an archive overran.
+      // Decompressed to a staging file OUTSIDE the extraction root and read
+      // from it in place: neither stream is held in memory, so an archive
+      // whose tar stream is larger than any buffer restores as well as a
+      // small one.
       const staging = mkdtempSync(join(tmpdir(), `o2b-brain-extract-tar-${runId}-`));
       try {
         const tarball = join(staging, "brain.tar");
         runCompressor("zstd", ["-d", "-q", "-o", tarball, archive], runId);
-        const input = openSync(tarball, "r");
-        let tar: SpawnSyncReturns<Buffer>;
+        const fd = openSync(tarball, "r");
         try {
-          // `-f -` is explicit stdin: GNU tar defaults to stdin without
-          // it, but BSD tar and busybox tar do not, so passing the flag
-          // keeps the extraction portable across hosts.
-          tar = spawnSnapshotTool(
-            "tar",
-            ["-x", "-f", "-", "-C", tarPathArg(tmp)],
-            { stdio: [input, "inherit", "pipe"] },
+          extractTarStream(
+            (offset, length) => {
+              const buf = Buffer.alloc(length);
+              return buf.subarray(0, readSync(fd, buf, 0, length, offset));
+            },
+            tmp,
             runId,
           );
         } finally {
-          closeSync(input);
-        }
-        if (tar.error || tar.status !== 0) {
-          const stderr = Buffer.from(tar.stderr ?? "")
-            .toString("utf8")
-            .trim();
-          throw new BrainSnapshotError(
-            `tar extract failed: ${tar.error?.message ?? stderr}`,
-            runId,
-          );
+          closeSync(fd);
         }
       } finally {
         rmSync(staging, { recursive: true, force: true });
       }
     } else {
-      // gzip is inflated in-process and piped to `tar -f -`, like the zstd
-      // branch: no `gzip` binary needed (native Windows has none), and no
-      // reliance on `tar -z` spawning one.
-      let tarball: Buffer;
-      try {
-        tarball = gunzipSync(readFileSync(archive));
-      } catch (err) {
-        throw new BrainSnapshotError(
-          `gzip decompress failed: ${(err as Error).message ?? String(err)}`,
-          runId,
-        );
-      }
-      const tar = spawnSnapshotTool(
-        "tar",
-        ["-x", "-f", "-", "-C", tarPathArg(tmp)],
-        { input: tarball, stdio: ["pipe", "inherit", "pipe"] },
-        runId,
-      );
-      if (tar.error || tar.status !== 0) {
-        const stderr = (tar.stderr ?? Buffer.from("")).toString("utf8").trim();
-        throw new BrainSnapshotError(`tar extract failed: ${tar.error?.message ?? stderr}`, runId);
-      }
+      // gzip is inflated in-process, like the tar stream is read in
+      // process: no `gzip` binary needed (native Windows has none).
+      // The inflate is bounded: the bytes it produces are held in memory.
+      const tarball = inflateGzipArchive(archive, runId);
+      extractTarStream((offset, length) => tarball.subarray(offset, offset + length), tmp, runId);
     }
 
     const extractedBrain = join(tmp, BRAIN_ROOT_REL);
-    if (!existsSync(extractedBrain)) {
+    if (lstatSync(extractedBrain, { throwIfNoEntry: false }) === undefined) {
       throw new BrainSnapshotError(`archive does not contain a ${BRAIN_ROOT_REL}/ root`, runId);
     }
+    // The root itself is judged, not only what is inside it: an archive
+    // whose `Brain/` member is a link is refused here, before anything
+    // reads through it.
     refuseEscapingSymlinks(extractedBrain, runId);
     return Object.freeze({ tmpRoot: tmp, brainRoot: extractedBrain, cleanup });
   } catch (err) {
     cleanup();
     throw err;
+  }
+}
+
+/**
+ * Extract the tar stream `read` gives into the empty folder `dir`, in
+ * process (`tar-extract.ts`), after {@link refuseIndistinctMembers}. No
+ * system tar is run: Windows `tar.exe` turned every UTF-8 name into the
+ * ANSI code page and refused a name in Cyrillic, CJK or any script that
+ * code page lacks ("Archive entry has empty or unreadable filename"), so a
+ * snapshot of such a tree could be taken and never restored; macOS bsdtar
+ * renamed every NFC name to NFD. Every name now comes back as the archive
+ * stores it, on every platform. The thread blocks for the whole stream, so
+ * a writer lock the caller holds (the gated restore's) is kept fresh
+ * meanwhile, bounded like the tar run this replaces.
+ */
+function extractTarStream(read: TarRead, dir: string, runId: string): void {
+  refuseIndistinctMembers(read, dir, runId);
+  keepLeasesFreshInProcess(() => {
+    try {
+      extractTarArchive(read, dir);
+    } catch (err) {
+      throw new BrainSnapshotError(
+        `archive extract failed: ${(err as Error).message ?? String(err)}`,
+        runId,
+        { cause: err },
+      );
+    }
+  });
+}
+
+/**
+ * Run in-process archive work (writing or reading a tar stream), which
+ * blocks this thread and has no timeout of its own, with every writer lock
+ * this process holds kept fresh for as long as a tar run doing the same
+ * work could take ({@link resolveSnapshotToolTimeoutMs}, which an operator
+ * raises for a very large tree) plus one stale window.
+ */
+function keepLeasesFreshInProcess<T>(fn: () => T): T {
+  return keepWriterLeasesFresh(resolveSnapshotToolTimeoutMs() + resolveWriterLockStaleMs(), fn);
+}
+
+/**
+ * Refuse, before anything is written, an archive with two members that
+ * would land on one path of the extraction folder `dir`. APFS looks names
+ * up without regard to normalization, so an NFC name and its NFD twin
+ * ("café" typed on two machines) are one file there; APFS and NTFS look
+ * names up without regard to case, so `Note.md` and `note.md` are too.
+ * The second member would replace the first and a restore would lose the
+ * other record; refused instead, naming both.
+ * How this folder treats names is probed on the folder itself, so a
+ * case-sensitive volume or a Linux filesystem that keeps both forms apart
+ * restores both. Two directories that fold together merge, which loses
+ * nothing: the files inside them are checked by their full paths.
+ */
+function refuseIndistinctMembers(
+  read: (offset: number, length: number) => Buffer,
+  dir: string,
+  runId: string,
+): void {
+  let members: TarMemberName[];
+  try {
+    members = readTarMemberNames(read);
+  } catch (err) {
+    throw new BrainSnapshotError(
+      `the archive cannot be read: ${(err as Error).message ?? String(err)}`,
+      runId,
+      { cause: err },
+    );
+  }
+  const folding = nameFolding(dir);
+  if (!folding.normalization && !folding.caseFold) return;
+  const keyOf = (name: string): string => {
+    const trimmed = exactTarPath(name);
+    const normalized = folding.normalization ? trimmed.normalize("NFD") : trimmed;
+    return folding.caseFold ? normalized.toLowerCase() : normalized;
+  };
+  const seen = new Map<string, TarMemberName>();
+  for (const member of members) {
+    const key = keyOf(member.name);
+    const other = seen.get(key);
+    if (other === undefined) {
+      seen.set(key, member);
+      continue;
+    }
+    const same = exactTarPath(other.name) === exactTarPath(member.name);
+    if (same || (other.directory && member.directory)) continue;
+    throw new BrainSnapshotError(
+      `the archive holds two names this machine's filesystem cannot keep apart: ` +
+        `${JSON.stringify(other.name)} and ${JSON.stringify(member.name)}; a restore would keep ` +
+        "only one of them, so nothing was restored. Restore it on a filesystem that keeps both " +
+        "names apart, or rename one of the two files where the snapshot was taken and take a new snapshot.",
+      runId,
+    );
+  }
+}
+
+function exactTarPath(name: string): string {
+  return name
+    .split("/")
+    .filter((part) => part !== "" && part !== ".")
+    .join("/");
+}
+
+/**
+ * How the folder `dir` (empty, about to receive the extraction) treats
+ * names: whether two Unicode forms of one name are one file there (APFS),
+ * and whether two cases are (APFS, NTFS).
+ */
+function nameFolding(dir: string): { normalization: boolean; caseFold: boolean } {
+  const probe = join(dir, ".o2b-name-probe-\u00e9");
+  writeFileSync(probe, "");
+  try {
+    return {
+      normalization: existsSync(join(dir, ".o2b-name-probe-e\u0301")),
+      caseFold: existsSync(join(dir, ".O2B-NAME-PROBE-\u00e9")),
+    };
+  } finally {
+    rmSync(probe, { force: true });
   }
 }
 
@@ -2234,8 +2533,28 @@ export function extractSnapshotToTemp(vault: string, runId: string): ExtractSnap
  * root: the tmpdir this tree extracts into may itself sit behind a
  * platform symlink (macOS `/var`), and a compare against only one
  * spelling would refuse the tree's own honest links.
+ *
+ * The root is an entry of the tree like any other, and is judged first: it
+ * must be a real directory. A link in its place is refused here rather than
+ * followed, because every reader after this sweep - the staging copy into
+ * the live tree, the diff, the store-migration rollback - reads through
+ * the path it is given, and a root that is a link hands them whatever it
+ * points at.
  */
 function refuseEscapingSymlinks(root: string, runId: string): void {
+  const rootStat = lstatSync(root, { throwIfNoEntry: false });
+  if (rootStat === undefined) {
+    throw new BrainSnapshotError(`the extracted tree is not there: ${root}`, runId);
+  }
+  if (rootStat.isSymbolicLink()) {
+    throw new BrainSnapshotError(
+      `the extracted root is a symbolic link, not a directory: ${root}`,
+      runId,
+    );
+  }
+  if (!rootStat.isDirectory()) {
+    throw new BrainSnapshotError(`the extracted root is not a directory: ${root}`, runId);
+  }
   const realRoot = realpathSync(root);
   const lexicalRoot = resolve(root);
   const inside = (p: string): boolean =>
@@ -2282,6 +2601,83 @@ function refuseEscapingSymlinks(root: string, runId: string): void {
     }
   }
 }
+
+/**
+ * A file the restore reads must be a real file. `existsSync` follows a
+ * symbolic link, so an archive the vault holds as one would be read through
+ * it - and the vault is agent-writable, and in a peer-replicated vault
+ * writable by every peer. The link is refused by name instead.
+ */
+function assertRegularFile(path: string, runId: string, what: string): void {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (stat === undefined) {
+    throw new BrainSnapshotError(`${what} does not exist: ${path}`, runId);
+  }
+  if (stat.isSymbolicLink()) {
+    throw new BrainSnapshotError(`${what} is a symbolic link, not a file: ${path}`, runId);
+  }
+  if (!stat.isFile()) {
+    throw new BrainSnapshotError(`${what} is not a regular file: ${path}`, runId);
+  }
+}
+
+/**
+ * The inflated bytes of a gzip archive, refused when they pass the ceiling
+ * {@link MAX_INFLATED_ARCHIVE_BYTES} names.
+ *
+ * The gzip branch of a restore inflates in process, because native Windows
+ * has no `gzip` binary, and what it inflates is held in memory: the tar
+ * stream of `Brain/`, or the archived derived store. An archive that
+ * inflates far past the tree it claims to hold is refused by name, and the
+ * operator who really has such a vault raises the ceiling through
+ * {@link SNAPSHOT_MAX_INFLATED_BYTES_ENV}.
+ */
+function inflateGzipArchive(archive: string, runId: string): Buffer {
+  const limit = resolveMaxInflatedBytes();
+  const compressed = readCompressedArchive(archive, runId, limit);
+  try {
+    return gunzipSync(compressed, { maxOutputLength: limit });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") {
+      throw new BrainSnapshotError(
+        `the archive inflates to more than ${limit} bytes; refusing to restore it ` +
+          `(raise ${SNAPSHOT_MAX_INFLATED_BYTES_ENV} for a larger vault)`,
+        runId,
+        { cause: err },
+      );
+    }
+    throw new BrainSnapshotError(
+      `gzip decompress failed: ${(err as Error).message ?? String(err)}`,
+      runId,
+    );
+  }
+}
+
+/**
+ * The compressed bytes of an archive, refused before they are read when the
+ * file is larger than the ceiling allows. Gzip output is never meaningfully
+ * smaller than the bytes it holds, so a file this large cannot inflate to
+ * less than the ceiling either - and reading it would cost the memory the
+ * ceiling exists to bound.
+ */
+function readCompressedArchive(archive: string, runId: string, limit: number): Buffer {
+  const size = statSync(archive).size;
+  if (size > limit + GZIP_OVERHEAD_SLACK_BYTES) {
+    throw new BrainSnapshotError(
+      `the archive is ${size} bytes, over the ${limit}-byte ceiling a restore allows ` +
+        `(raise ${SNAPSHOT_MAX_INFLATED_BYTES_ENV} for a larger vault)`,
+      runId,
+    );
+  }
+  return readFileSync(archive);
+}
+
+/**
+ * What gzip may add to the bytes it holds: a header, a trailer, and a few
+ * bytes per deflate block. A compressed archive of exactly the ceiling size
+ * is therefore still an archive of the ceiling size.
+ */
+const GZIP_OVERHEAD_SLACK_BYTES = 1024 * 1024;
 
 /**
  * Restore the archive identified by `runId` over `Brain/`, and the
@@ -2425,10 +2821,15 @@ export function restoreSnapshot(
     // holding it is a refusal like any other, and it must arrive while
     // nothing has been replaced yet.
     const lock = store === null ? null : acquireStoreLockForRestore(store.target, runId);
+    // A rebuild that died between the renames of its swap left the index
+    // parked with no live file: it is put back before anything reads the
+    // live store, so the recovery point archives it and the swap below
+    // parks it, instead of treating it as an earlier `.bak` to replace.
     let evidence: RecoveryPointEvidence | null = null;
     let committed = false;
     let primary: { readonly err: unknown } | null = null;
     try {
+      if (store !== null && lock !== null) restoreParkedIndexUnderLock(store.target, lock.lease);
       // The last moment at which the live state still exists. A throw
       // here propagates and nothing has been replaced yet, which is the
       // same abort-before-the-operation rule the destructive gate applies.
@@ -2520,10 +2921,30 @@ export function restoreSnapshot(
       const swap = held.swap;
       if (swap === undefined)
         throw new BrainSnapshotError("restore: the Brain/ swap did not run", runId);
+      let outgoingStore: string | null = null;
       if (store !== null) {
+        const stagedStore = store;
         try {
-          commitDerivedStoreSwap(store);
+          const commit = (): string => {
+            if (lock !== null) assertStoreLeaseHeld(lock.lease, runId);
+            return commitDerivedStoreSwap(stagedStore, () => {
+              if (lock !== null) assertStoreLeaseHeld(lock.lease, runId);
+            });
+          };
+          outgoingStore =
+            lock === null
+              ? commit()
+              : keepWriterLeasesFresh(WRITER_LEASE_BLOCKING_BUDGET_MS, commit);
         } catch (err) {
+          // Two failures here can come after the restored store was renamed
+          // in: removing the park record (a file this swap just wrote) and
+          // the lease check `keepWriterLeasesFresh` makes when `commit`
+          // returns (a takeover needs the lock gone stale while the worker
+          // refreshed it). Neither is reachable without outside tampering or
+          // a suspended process, and either stays on the safe side: the
+          // restore reports failure, the pre-restore store stays at its
+          // parked name, nothing is deleted, and a recovery point taken for
+          // this restore holds a copy of it.
           throw swap.fail(`the derived store swap failed (${errorText(err)})`, err, {
             storeIntact: !(err instanceof StoreSwapTornError),
           });
@@ -2531,6 +2952,25 @@ export function restoreSnapshot(
       }
       committed = true;
       swap.finish();
+      if (store !== null && evidence !== null && outgoingStore !== null) {
+        const committedStore = store;
+        const committedEvidence = evidence;
+        const committedOutgoing = outgoingStore;
+        const cleanup = (): void => {
+          if (lock !== null) assertStoreLeaseHeld(lock.lease, runId);
+          discardCoveredOutgoingStore(
+            vault,
+            committedEvidence,
+            committedStore.target,
+            committedOutgoing,
+            () => {
+              if (lock !== null) assertStoreLeaseHeld(lock.lease, runId);
+            },
+          );
+        };
+        if (lock === null) cleanup();
+        else keepWriterLeasesFresh(WRITER_LEASE_BLOCKING_BUDGET_MS, cleanup);
+      }
     } catch (err) {
       primary = { err };
       throw err;
@@ -2871,6 +3311,10 @@ function assertDerivedStoreRestorable(vault: string, runId: string): void {
       runId,
     );
   }
+  // The archive is read as a file, so it has to be one: `existsSync`
+  // follows a link, and a vault that holds the archive as one would
+  // otherwise have the restore read through it.
+  assertRegularFile(archive, runId, "the derived-store archive");
 }
 
 /**
@@ -2890,19 +3334,6 @@ export type StorePlacement =
   | { readonly kind: "top"; readonly base: string }
   | { readonly kind: "nested"; readonly top: string }
   | { readonly kind: "brain" };
-
-/**
- * True where the filesystem compares names without case by default
- * (APFS, HFS+, NTFS), so `Index.sqlite` and `index.sqlite` are one file.
- */
-function foldsCase(platform: NodeJS.Platform): boolean {
-  return platform === "darwin" || platform === "win32";
-}
-
-/** `name` as the platform compares it. */
-function compareKey(name: string, platform: NodeJS.Platform): string {
-  return foldsCase(platform) ? name.toLowerCase() : name;
-}
 
 /**
  * A path with every existing ancestor resolved through symlinks. Where the
@@ -2988,58 +3419,6 @@ export function storePlacement(
   // whatever it holds, so a store inside one does not meet the swap.
   if (isSnapshotExcludedEntry(parts[0]!)) return { kind: "outside" };
   return parts.length === 1 ? { kind: "top", base: parts[0]! } : { kind: "nested", top: parts[0]! };
-}
-
-/** SQLite's journal siblings of a database file: WAL mode and DELETE mode. */
-const STORE_JOURNAL_SUFFIXES: ReadonlyArray<string> = Object.freeze(["-wal", "-shm", "-journal"]);
-
-/**
- * The database files the store layer keeps beside the store, as suffixes
- * of its name: the store itself, the reindex staging file (`.new`), the
- * parked previous index (`.bak`, also the restore's outgoing store, and
- * `.old`).
- */
-const STORE_DATABASE_SUFFIXES: ReadonlyArray<string> = Object.freeze(["", ".new", ".bak", ".old"]);
-
-/** The writer lock `proper-lockfile` takes on the store: a directory. */
-const STORE_LOCK_SUFFIX = ".lock";
-
-/** The restore's staged store: `<store>.restore-<pid>-<8 hex>`. */
-const STAGED_STORE_PATTERN = /^\.restore-\d+-[0-9a-f]{8}$/u;
-
-/**
- * True for a top-level `Brain/` entry that belongs to the store named
- * `base` when the store sits directly under `Brain/`. A closed list, so a
- * note or directory that merely starts with the store's name is restored
- * like any other entry:
- *
- *   - the store and each database file the store layer derives from it
- *     (`.new`, `.bak`, `.old`), each with its journals (`-wal`, `-shm`,
- *     `-journal`);
- *   - the restore's staged store (`.restore-<pid>-<hex>`) with its
- *     journals;
- *   - the writer lock directory (`.lock`), the only directory in the
- *     family.
- *
- * Names compare without case where the platform folds it. A suffix the
- * store layer adds later must be listed here; until it is, the Brain swap
- * treats that file as Brain content.
- */
-export function isStoreFamilyEntry(
-  name: string,
-  base: string,
-  isDirectory: boolean,
-  platform: NodeJS.Platform = process.platform,
-): boolean {
-  const key = compareKey(name, platform);
-  const stem = compareKey(base, platform);
-  if (!key.startsWith(stem)) return false;
-  const suffix = key.slice(stem.length);
-  if (isDirectory) return suffix === STORE_LOCK_SUFFIX;
-  // At most one journal suffix comes off: `-wal-shm` is not a journal.
-  const journal = STORE_JOURNAL_SUFFIXES.find((j) => suffix.endsWith(j));
-  const file = journal === undefined ? suffix : suffix.slice(0, -journal.length);
-  return STORE_DATABASE_SUFFIXES.includes(file) || STAGED_STORE_PATTERN.test(file);
 }
 
 /**
@@ -3151,24 +3530,20 @@ function stageDerivedStore(
   }
 
   const archive = snapshotStorePath(vault, runId);
-  if (!existsSync(archive)) {
-    // Unreachable through `restoreSnapshot`, which refuses this in its
-    // pre-flight. Kept because a store swap must never begin against an
-    // archive that is not there.
+  // An absent archive is unreachable through `restoreSnapshot`, which
+  // refuses it in its pre-flight; kept because a store swap must never
+  // begin against an archive that is not there.
+  // The archive must be a real file before anything reads it, the digest
+  // check below included.
+  if (lstatSync(archive, { throwIfNoEntry: false }) !== undefined) {
+    assertRegularFile(archive, runId, "the derived-store archive");
+  }
+  const archiveProblem = derivedStoreArchiveProblem(vault, runId, record);
+  if (archiveProblem !== null) {
     throw new BrainSnapshotError(
-      `manifest records a derived-store archive but ${archive} is absent`,
+      `${archiveProblem}; refusing before the Brain tree is touched`,
       runId,
     );
-  }
-  if (record.archive_sha256 !== null) {
-    const actual = sha256Hex(readFileSync(archive));
-    if (actual !== record.archive_sha256) {
-      throw new BrainSnapshotError(
-        `the derived-store archive ${archive} does not match the digest its manifest recorded ` +
-          `(${record.archive_sha256}, found ${actual}); refusing before the Brain tree is touched`,
-        runId,
-      );
-    }
   }
   mkdirSync(dirname(target), { recursive: true });
   // A name of this process's own: two restores staging at once must not
@@ -3318,6 +3693,75 @@ function assertRecoveryPointCoversTarget(
 }
 
 /**
+ * Remove the outgoing store a committed restore parked at `.bak` when the
+ * recovery point holds a copy of it: the manifest records the store as
+ * included, from this very path, and the archive is on disk and matches
+ * its recorded digest (`derivedStoreArchiveProblem`). The `.bak`
+ * is then a second copy of an index that can be the size of the vault's
+ * whole brain store, and the recovery point is the one that restores it
+ * together with the `Brain/` tree it belongs to. Without such a recovery
+ * point the `.bak` is the only copy, and it stays. Best effort: the
+ * restore has committed, and a file that cannot be removed now (a reader
+ * holding it on Windows) is removed by the next rebuild of the index.
+ */
+function discardCoveredOutgoingStore(
+  vault: string,
+  evidence: RecoveryPointEvidence,
+  target: string,
+  outgoing: string,
+  assertOwnership: () => void,
+): void {
+  const record = readManifestSidecar(vault, evidence.runId)?.derived_store ?? null;
+  if (record === null || !record.included || record.source_path !== target) return;
+  if (!existsSync(evidence.path)) return;
+  // The copy is the derived-store archive, checked as a restore of the
+  // recovery point would check it; one that is missing or does not match
+  // its digest is no copy, and the outgoing store stays.
+  if (derivedStoreArchiveProblem(vault, evidence.runId, record) !== null) return;
+  for (const suffix of [...SQLITE_SIBLING_SUFFIXES, ""]) {
+    try {
+      assertOwnership();
+      rmSync(outgoing + suffix, { force: true });
+    } catch {
+      // Left for the next rebuild, which removes a `.bak` it does not need.
+      // A sibling left here without its main file is never adopted: every
+      // swap removes the siblings at a free parked name before it parks
+      // there, and refuses when it cannot.
+    }
+  }
+}
+
+/**
+ * Why the derived-store archive of `runId` cannot stand for the store its
+ * manifest record names, or null when it can: the archive is on disk and,
+ * when the record carries a digest, matches it. The one check both a
+ * restore (before it swaps the archive in) and a committed restore (before
+ * it removes the outgoing store the archive copies) rely on.
+ */
+function derivedStoreArchiveProblem(
+  vault: string,
+  runId: string,
+  record: { readonly archive_sha256: string | null },
+): string | null {
+  const archive = snapshotStorePath(vault, runId);
+  if (!existsSync(archive)) {
+    return `manifest records a derived-store archive but ${archive} is absent`;
+  }
+  if (record.archive_sha256 === null) return null;
+  let actual: string;
+  try {
+    actual = sha256HexOfFile(archive);
+  } catch (err) {
+    return `the derived-store archive ${archive} could not be read (${errorText(err)})`;
+  }
+  if (actual === record.archive_sha256) return null;
+  return (
+    `the derived-store archive ${archive} does not match the digest its manifest recorded ` +
+    `(${record.archive_sha256}, found ${actual})`
+  );
+}
+
+/**
  * Release the writer lock {@link acquireStoreLockForRestore} took.
  *
  * A failed release must not hide what happened before it. When the
@@ -3386,165 +3830,153 @@ class StoreSwapTornError extends Error {
  * Rename the staged store over the live one. The caller holds the writer
  * lock.
  *
- * The same swap discipline `reindexVault` uses: the outgoing file is kept
- * as `.bak`, then a single atomic rename puts the replacement in place.
- * If that second rename fails, the `.bak` is renamed back, so the live
- * store is untouched; a {@link StoreSwapTornError} means even that failed.
- *
- * A rollback journal (`-journal`, DELETE journal mode, which the store
- * uses on remote filesystems and SQLite leaves hot after a crash) belongs
- * to the database it was written for and travels with it: it is moved to
- * `.bak-journal` right after the outgoing store moves to `.bak`, and back
- * before the store on every undo. Left at the live path, SQLite would
- * replay the old database's journal over the replacement on its next
- * open, which is the database/journal mismatch it documents as a cause of
- * corruption. A journal with no live store beside it moves the same way.
- * A journal that cannot be moved undoes the swap like any other failed
- * step, so the replacement never lands beside it.
- *
- * The WAL siblings of the OUTGOING file are removed after the swap. The
- * decompressed archive came from `VACUUM INTO` and is a complete
- * database on its own; an orphan `-wal` from the file it replaced would
- * make the next open fail with SQLITE_IOERR_SHORT_READ, which is the
- * exact failure `consolidateWal` exists to prevent on the reindex path.
- * A removal that still fails after the Windows retry budget (a reader
- * holding the file) is not a warning: the swap is undone, the new store
- * back at its staging name and the `.bak` back at the live path, and the
- * error is thrown so the caller undoes the Brain/ renames too.
+ * The swap discipline every rename of one SQLite database over another
+ * follows (`sqlite-file-set.ts`, shared with `reindexVault`): the live
+ * store moves aside to `.bak` as a set - main file, then its `-wal`,
+ * `-shm` and `-journal` - and the replacement is renamed in only over a
+ * live path that has no sibling left. A sibling belongs to the database
+ * whose name it carries: an outgoing `-wal` with committed frames, or a
+ * hot rollback journal (DELETE journal mode, which the store uses on
+ * remote filesystems), left at the live path would be replayed or rolled
+ * back over the replacement on its next open, which corrupts it. Moved
+ * with the store instead, the `.bak` keeps its own last commits. A
+ * sibling with no live store beside it moves the same way. Any step that
+ * fails undoes the swap, so the live store is untouched and the caller
+ * undoes the Brain/ renames too; a {@link StoreSwapTornError} means even
+ * the undo failed.
  */
-function commitDerivedStoreSwap(store: StagedDerivedStore): void {
+function commitDerivedStoreSwap(store: StagedDerivedStore, assertOwnership: () => void): string {
   const { target, incoming } = store;
-  const outgoing = `${target}${RESTORE_BACKUP_SUFFIX}`;
-  const journal = `${target}${ROLLBACK_JOURNAL_SUFFIX}`;
-  const outgoingJournal = `${outgoing}${ROLLBACK_JOURNAL_SUFFIX}`;
-  const moved: MovedOutgoing = { target, outgoing, store: false, journal: false };
-  try {
-    // A `.bak` and its journal from an earlier swap are replaced together:
-    // the earlier journal must not end up beside the store moved aside now.
-    rmSync(outgoing, { force: true });
-    rmSync(outgoingJournal, { force: true });
-    if (existsSync(target)) {
-      try {
-        renameWithRetry(target, outgoing);
-      } catch (err) {
-        throw new Error(
-          `could not move the live store ${target} aside to ${outgoing}: ${errorText(err)}; ` +
-            "the live store was not touched",
-          { cause: err },
-        );
-      }
-      moved.store = true;
-    }
-    if (existsSync(journal)) {
-      try {
-        renameWithRetry(journal, outgoingJournal);
-      } catch (err) {
-        throw new Error(
-          `could not move the rollback journal ${journal} aside to ${outgoingJournal}: ` +
-            `${errorText(err)}; the restored store must not open beside it`,
-          { cause: err },
-        );
-      }
-      moved.journal = true;
-    }
-    renameWithRetry(incoming, target);
-  } catch (err) {
-    putBackOutgoingStore(moved, errorText(err), err);
-    throw err;
+  const outgoing = outgoingStorePath(target);
+  // A free parked name holds no main file; journals of nothing found there
+  // would be adopted by the store moved aside now, so they go first. An
+  // earlier parked index is never replaced: it may be the only copy of
+  // stored embeddings a rebuild could not recompute.
+  for (const path of SQLITE_SIBLING_SUFFIXES.map((s) => outgoing + s)) {
+    assertOwnership();
+    rmSync(path, { force: true });
   }
+  const hadStore = existsSync(target);
+  // The same durable park record the reindex swap writes: a stop between
+  // the renames below is reunited by it, not by parked-name order.
+  assertOwnership();
+  writeParkMarker(target, outgoing);
   try {
-    removeWalSiblings(target);
+    parkSqliteFileSet(target, outgoing, undefined, assertOwnership);
   } catch (err) {
-    const what =
-      `could not remove ${errorText(err)} beside the restored store, and an orphan ` +
-      "write-ahead log would corrupt the next open";
-    try {
-      renameWithRetry(target, incoming);
-    } catch (backErr) {
+    const stranded = err instanceof SqliteFileSetMoveError ? err.stranded : [];
+    if (stranded.length === 0) clearParkMarker(target);
+    if (stranded.length > 0) {
+      // The undo of the park failed too: the live store is not whole.
       throw new StoreSwapTornError(
-        `${what}; the restored store could not be moved back off ${target} either ` +
-          `(${errorText(backErr)})` +
-          (moved.store ? `, and the pre-restore store is at ${outgoing}` : "") +
-          (moved.journal ? `, its rollback journal at ${outgoingJournal}` : ""),
+        `${parkFailureMessage(err, target, outgoing)}; moving it back failed too, and ` +
+          `${stranded.join(", ")} stays at ${stranded.length === 1 ? "that path" : "those paths"}` +
+          (stranded.includes(outgoing)
+            ? `: the pre-restore store stays at ${outgoing}, where the next store open restores it`
+            : ""),
         { cause: err },
       );
     }
-    putBackOutgoingStore(moved, what, err);
-    throw new Error(
-      `${what}; the store swap was undone` +
-        (moved.store
-          ? ", the pre-restore store is back in place"
-          : ", and no store was live before it"),
-      { cause: err },
-    );
+    throw new Error(parkFailureMessage(err, target, outgoing), { cause: err });
   }
-}
-
-/** What {@link commitDerivedStoreSwap} has moved aside so far. */
-interface MovedOutgoing {
-  readonly target: string;
-  readonly outgoing: string;
-  /** The live store is at `.bak`. */
-  store: boolean;
-  /** The live store's rollback journal is at `.bak-journal`. */
-  journal: boolean;
+  try {
+    const stray = sqliteJournalsPresent(target);
+    if (stray.length > 0) {
+      throw new Error(
+        `${stray.join(", ")} appeared beside the live store after it was moved aside; ` +
+          "the restored store must not open beside it",
+      );
+    }
+    assertOwnership();
+    renameWithRetry(incoming, target);
+  } catch (err) {
+    putBackOutgoingStore(target, outgoing, hadStore, errorText(err), err, assertOwnership);
+    clearParkMarker(target);
+    throw err;
+  }
+  clearParkMarker(target);
+  return outgoing;
 }
 
 /**
- * Put what a failed swap step moved aside back at the live path, or throw
- * a {@link StoreSwapTornError} naming where it was left.
- *
- * The journal goes back first. A crash between the two renames then
- * leaves the journal at the live path with no store and the store at
- * `.bak`, which the crash-recovery preamble of every `Store.open` puts
- * back beside it; the other order would leave the old store live without
- * the journal it needs to roll back.
+ * Where the restore parks the live store: `.bak`, or `.old` when an
+ * earlier parked index holds `.bak` (the rebuild's naming, which its crash
+ * restore reads newest first). Both taken refuses before anything moves.
  */
-function putBackOutgoingStore(moved: MovedOutgoing, what: string, cause: unknown): void {
-  const { target, outgoing } = moved;
-  if (moved.journal) {
-    const journal = `${target}${ROLLBACK_JOURNAL_SUFFIX}`;
-    const outgoingJournal = `${outgoing}${ROLLBACK_JOURNAL_SUFFIX}`;
-    try {
-      renameWithRetry(outgoingJournal, journal);
-    } catch (backErr) {
+function outgoingStorePath(target: string): string {
+  for (const suffix of [RESTORE_BACKUP_SUFFIX, ".old"]) {
+    if (!existsSync(target + suffix)) return target + suffix;
+  }
+  throw new Error(
+    `could not move the live store ${target} aside: earlier indexes are parked at both ` +
+      `${target}${RESTORE_BACKUP_SUFFIX} and ${target}.old; the live store was not touched`,
+  );
+}
+
+/**
+ * The message of a live store set that could not be moved aside: which
+ * file failed and why. The caller adds what an undo that failed too left
+ * moved ({@link SqliteFileSetMoveError.stranded}).
+ */
+function parkFailureMessage(err: unknown, target: string, outgoing: string): string {
+  const failed = err instanceof SqliteFileSetMoveError ? err.failedPath : target;
+  const cause = errorText(err instanceof Error && err.cause !== undefined ? err.cause : err);
+  if (failed === target) {
+    return (
+      `could not move the live store ${target} aside to ${outgoing}: ${cause}; ` +
+      "the live store was not touched"
+    );
+  }
+  const suffix = failed.slice(target.length);
+  const what =
+    suffix === ROLLBACK_JOURNAL_SUFFIX ? "the rollback journal" : "the write-ahead log file";
+  return (
+    `could not move ${what} ${failed} aside to ${outgoing}${suffix}: ${cause}; ` +
+    "the restored store must not open beside it"
+  );
+}
+
+/**
+ * Put the store set a failed swap step moved aside back at the live path
+ * (siblings first, main file last, so the live path never holds the store
+ * without its journal), or throw a {@link StoreSwapTornError} naming
+ * where it was left.
+ */
+function putBackOutgoingStore(
+  target: string,
+  outgoing: string,
+  hadStore: boolean,
+  what: string,
+  cause: unknown,
+  assertOwnership: () => void,
+): void {
+  try {
+    unparkSqliteFileSet(outgoing, target, undefined, assertOwnership);
+  } catch (backErr) {
+    const moveError = backErr instanceof SqliteFileSetMoveError ? backErr : null;
+    const failed = moveError?.failedPath ?? outgoing;
+    const stranded = moveError?.stranded ?? [];
+    const reason = errorText(
+      backErr instanceof Error && backErr.cause !== undefined ? backErr.cause : backErr,
+    );
+    if (failed === outgoing) {
       throw new StoreSwapTornError(
-        `${what}; the rollback journal of the pre-restore store could not be renamed back ` +
-          `(${errorText(backErr)}) and is at ${outgoingJournal}` +
-          (moved.store ? `; the pre-restore store is at ${outgoing}` : ""),
+        `${what}; the pre-restore store could not be renamed back either ` +
+          `(${reason}) and is at ${outgoing}, where the next store open restores it` +
+          (stranded.length > 0 ? `; stranded paths: ${stranded.join(", ")}` : ""),
         { cause },
       );
     }
-  }
-  if (!moved.store) return;
-  try {
-    renameWithRetry(outgoing, target);
-  } catch (backErr) {
+    const kind = failed.endsWith(ROLLBACK_JOURNAL_SUFFIX)
+      ? "the rollback journal"
+      : "the write-ahead log file";
     throw new StoreSwapTornError(
-      `${what}; the pre-restore store could not be renamed back either ` +
-        `(${errorText(backErr)}) and is at ${outgoing}, where the next store open restores it`,
+      `${what}; ${kind} of the pre-restore store could not be renamed back ` +
+        `(${reason}) and is at ${failed}` +
+        (hadStore ? `; the pre-restore store is at ${outgoing}` : "") +
+        (stranded.length > 0 ? `; stranded paths: ${stranded.join(", ")}` : ""),
       { cause },
     );
-  }
-}
-
-/**
- * Remove the WAL siblings the outgoing store left at `target`, throwing
- * the path that could not be removed.
- *
- * `-shm` goes first: it is only an index of the `-wal` and SQLite
- * rebuilds it, so when the `-wal` removal then fails, the swap can still
- * be undone in full - the pre-restore store returns beside its own log.
- */
-function removeWalSiblings(target: string): void {
-  for (const sidecar of ["-shm", "-wal"] as const) {
-    const path = `${target}${sidecar}`;
-    try {
-      unlinkWithRetry(path);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") continue;
-      throw new Error(`${path} (${errorText(err)})`, { cause: err });
-    }
   }
 }
 
@@ -3577,16 +4009,9 @@ function decompressArchiveTo(archive: string, outPath: string, runId: string): v
     return;
   }
   // gzip is inflated in-process (no `gzip` binary on native Windows);
-  // `wx` keeps the destination exclusive.
-  let bytes: Buffer;
-  try {
-    bytes = gunzipSync(readFileSync(archive));
-  } catch (err) {
-    throw new BrainSnapshotError(
-      `gzip decompress failed: ${(err as Error).message ?? String(err)}`,
-      runId,
-    );
-  }
+  // `wx` keeps the destination exclusive. The inflate is bounded: its
+  // bytes are held in memory.
+  const bytes = inflateGzipArchive(archive, runId);
   writeArchiveExclusive(outPath, bytes, runId);
 }
 

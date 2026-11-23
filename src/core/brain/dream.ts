@@ -77,28 +77,49 @@ import {
 } from "./dream-plan-cross-topic.ts";
 import { planRefresh, scanApplyEvidence } from "./dream-refresh.ts";
 import { writeDreamLog } from "./dream-report.ts";
+import {
+  assertDreamOwner,
+  recheckDreamOwner,
+  recheckUnboundDreamOwner,
+} from "./dream-owner/gate.ts";
+import { withDreamPassLock } from "./dream-owner/owner.ts";
+import {
+  dreamOwnerGateOptions,
+  withOwnerTag,
+  type DreamOwnerTag,
+} from "./dream-owner/pass-record.ts";
 import { scanBrain } from "./dream-scan.ts";
 import { planSignalArchive } from "./signal-archive.ts";
 import { buildChangedSummary, buildNoOpSummary } from "./dream-summary.ts";
 import type { DreamOptions, DreamRunSummary, DreamWarning } from "./dream-types.ts";
 import { openWorkrun, WORKRUN_PHASE, workrunPath, type WorkrunHandle } from "./dream-workrun.ts";
 import { buildIntentReview } from "./intent-review.ts";
+import { createWindowContext, readWindowEvidence } from "./dream-replay/window.ts";
 import { logShardWikilink } from "./log.ts";
 import {
   OPERATION,
   progressCounter,
+  PROGRESS_REASON,
   progressReasonForError,
   type ProgressCounter,
 } from "./progress.ts";
 import { regenerateLessonsQuiet } from "./lessons.ts";
 import { brainDirsForWrite, collisionCandidateName } from "./paths.ts";
 import { isStoreOnly } from "../store/store-only.ts";
+import { collectBetweenSteps } from "../runtime/collect-garbage.ts";
 import { repairLaneEntryIds } from "../store-migration/lane-id-repair.ts";
 import { loadBrainConfig } from "./policy.ts";
 import { buildReconcileOutcomes } from "./reconcile-outcomes.ts";
 import { buildRollupPlan, memoizedLinkCandidates } from "./dream-rollup.ts";
 import { collectWarnings, hasStateChange, withRetireSiblings } from "./dream-outcome.ts";
-import { applySalienceGate } from "./salience-gate.ts";
+import { gateSalience } from "./salience-gate.ts";
+import {
+  applyAtPassStart,
+  openQueuePass,
+  produceAtPassEnd,
+  withModelWork,
+  type DreamQueuePass,
+} from "./dream-queue/pass.ts";
 import { withDestructiveSnapshot } from "./snapshot-gate.ts";
 import { compactRunStamp, isoDate } from "./time.ts";
 import { BRAIN_SNAPSHOT_REASON } from "./types.ts";
@@ -142,6 +163,13 @@ const DREAM_STAGE = Object.freeze({
   apply: "apply",
   log: "log",
   finalize: "finalize",
+  /**
+   * The tail steps that belong to the brain store (`dream-tail.ts`):
+   * entered only where the store is in use and the pass is no dry run, so
+   * a pass on a machine without a store reports the five stages above.
+   */
+  topics: "topics",
+  view: "view",
 } as const);
 
 /** Code carried on the summary when the caller's progress sink failed. */
@@ -204,6 +232,42 @@ function scanAsAdmitted(
  * the whole distinction `SafeguardAbortError` exists to preserve.
  */
 export function dream(vault: string | null, opts: DreamOptions = {}): DreamRunSummary {
+  // The dream owner gate (dream-owner/gate.ts) comes first, before the
+  // tail wrappers and the lane-id repair write: a live pass on a device
+  // that is not the owner writes nothing. The owner's live pass holds the
+  // device-local pass lock for its whole length and checks the role again
+  // once it holds it. A look that finds the lock held leaves its release
+  // to the next look; `o2b dream owner --release` refuses after the wait.
+  const gate = assertDreamOwner(vault, dreamOwnerGateOptions(opts));
+  if (gate.status === "preview") return dreamPass(vault, opts, null, null);
+  if (gate.status === "unbound") {
+    if (gate.store === null) return dreamPass(vault, opts, null, null);
+    return withDreamPassLock(gate.store, () => {
+      recheckUnboundDreamOwner(gate.store!);
+      return dreamPass(vault, opts, null, null);
+    });
+  }
+  return withDreamPassLock(gate.store, () => {
+    // A release written between the gate and the lock moved the role:
+    // look again under the lock, before any write.
+    const owner = recheckDreamOwner(gate);
+    // The dream work queue lives only here: a live pass on the owner's
+    // device of a brain served from the store (dream-queue/pass.ts).
+    const queue = openQueuePass(vault, gate.store, owner, opts);
+    return withModelWork(
+      withOwnerTag(dreamPass(vault, opts, owner, queue), owner, opts.agentName),
+      queue,
+    );
+  });
+}
+
+/** The pass itself, once the owner gate let it through (see {@link dream}). */
+function dreamPass(
+  vault: string | null,
+  opts: DreamOptions,
+  owner: DreamOwnerTag | null,
+  queue: DreamQueuePass | null,
+): DreamRunSummary {
   // A caller's progress sink is an observer, and an observer must not be
   // able to destroy what it observes: a closed pipe or a renderer defect
   // cannot be allowed to abort a pass that is otherwise succeeding. Nor
@@ -213,17 +277,78 @@ export function dream(vault: string | null, opts: DreamOptions = {}): DreamRunSu
   const progress = progressCounter(OPERATION.dream, opts.onProgress, {
     onSinkError: (error) => progressFaults.push(errorMessage(error)),
   });
+  // A tail step stopped at the deadline ends the stream there, with its
+  // reason; a step after it still runs, unreported, as before.
+  let stopped = false;
   try {
-    // One read pass for the whole dream: the store-only log is read once
-    // and shared by every preference's evidence walk (log-days.ts).
-    return withLogReadPass(() =>
-      withViewPass(withTopicPass(dreamRun(vault, opts, progress, progressFaults), opts), opts),
+    // One read pass for the consolidation: the store-only log is read once
+    // and shared by every preference's evidence walk (log-days.ts). It
+    // ends before the topic and view steps, which read the store on their
+    // own and never the log days: holding the whole log through them only
+    // added it to their peak memory.
+    const summary = withViewPass(
+      afterStep(
+        withTopicPass(
+          afterStep(
+            withLogReadPass(() => dreamRun(vault, opts, progress, progressFaults, owner, queue)),
+          ),
+          opts,
+          {
+            start: () => progress.start(DREAM_STAGE.topics),
+            done: () => progress.advance(DREAM_STAGE.topics),
+            stopped: (error) => {
+              stopped = true;
+              progress.stop(progressReasonForError(error) ?? PROGRESS_REASON.failed);
+            },
+          },
+        ),
+      ),
+      opts,
+      {
+        start: () => {
+          if (!stopped) progress.start(DREAM_STAGE.view);
+        },
+        done: () => {
+          if (!stopped) progress.advance(DREAM_STAGE.view);
+        },
+        stopped: (error) => {
+          if (stopped) return;
+          stopped = true;
+          progress.stop(progressReasonForError(error) ?? PROGRESS_REASON.failed);
+        },
+      },
     );
+    // The stream ends after the tail steps, not after the consolidation:
+    // on a large store they are where most of the time goes, and a stream
+    // that reported "finished" before them read as a pass that hung.
+    if (!stopped) progress.finish();
+    return withLateProgressFault(summary, progressFaults);
   } catch (error) {
     const reason = progressReasonForError(error);
-    if (reason !== null) progress.stop(reason);
+    if (reason !== null && !stopped) progress.stop(reason);
     throw error;
   }
+}
+
+/** `value`, once the garbage of the step that made it is collected (`collect-garbage.ts`). */
+function afterStep<T>(value: T): T {
+  collectBetweenSteps();
+  return value;
+}
+
+/**
+ * `summary` with the progress-sink fault the consolidation could not see:
+ * the sink may first throw in a tail step, after the summary was built.
+ */
+function withLateProgressFault(
+  summary: DreamRunSummary,
+  faults: ReadonlyArray<string>,
+): DreamRunSummary {
+  if (faults.length === 0) return summary;
+  if (summary.warnings.some((w) => w.code === PROGRESS_SINK_FAULT_CODE)) return summary;
+  const warnings: DreamWarning[] = [];
+  noteProgressFaults(warnings, faults);
+  return { ...summary, warnings: [...summary.warnings, ...warnings] };
 }
 
 /** Ladder attempts for a no-vault run id, as many as a snapshot run gets. */
@@ -254,6 +379,8 @@ function dreamRun(
   opts: DreamOptions,
   progress: ProgressCounter,
   progressFaults: ReadonlyArray<string>,
+  owner: DreamOwnerTag | null,
+  queue: DreamQueuePass | null,
 ): DreamRunSummary {
   const now = opts.now ?? new Date();
   const dryRun = opts.dryRun === true;
@@ -277,22 +404,22 @@ function dreamRun(
       // The next pass tries again.
     }
   }
+  // Answers accepted since the last pass are applied first, on the
+  // owner's device only (dream-queue/pass.ts; never on a dry run).
+  if (queue !== null && !dryRun) applyAtPassStart(queue);
   // Per-run gate resolution (no-dead-ends, Unit E): the override wins for
   // this run, the configured value decides when it is absent. Resolved
   // once, here, so the heal branch below has a single source of truth and
   // nothing writes the decision back to `_brain.yaml`.
   const healEnrichEnabled = opts.gates?.heal_enrich ?? cfg.dream.heal_enrich_enabled === true;
   let runId = formatRunId(now);
-  // The retired_by stamp every retire in this pass carries. Built
-  // through the shared helper so it names the log shard the pass's own
-  // events land in - with a configured device id, the bare-date shape
-  // names a file this device never writes, and the doctor reads the
-  // provenance as a broken link.
-  const wikilinkToRun = logShardWikilink(isoDate(now));
-
   const callerAgent = opts.agentName?.trim() ?? "";
+  // A brain with a dream owner names the owner instead (`owner` below).
   const isNonPrimary =
-    cfg.primary_agent !== null && callerAgent.length > 0 && callerAgent !== cfg.primary_agent;
+    owner === null &&
+    cfg.primary_agent !== null &&
+    callerAgent.length > 0 &&
+    callerAgent !== cfg.primary_agent;
   const warnings = collectWarnings(isNonPrimary, callerAgent, cfg.primary_agent);
 
   // 0. Scan the whole Brain/ tree. Corrupted files (frontmatter
@@ -312,16 +439,20 @@ function dreamRun(
     opts.previewReadable === undefined
       ? fullScan
       : scanAsAdmitted(vault, fullScan, opts.previewReadable);
+  const context = createWindowContext(now, scan);
+  // The retired_by stamp names the audit shard for this window.
+  const wikilinkToRun = logShardWikilink(context.day);
   progress.advance(DREAM_STAGE.scan);
   const intentReview = buildIntentReview(vault, {
-    now,
+    now: context.instant,
+    signals: context.signals.signals,
     ...(opts.previewReadable !== undefined ? { readable: opts.previewReadable } : {}),
   });
   progress.start(DREAM_STAGE.plan, scan.preferences.length);
 
   // 1-2. Plan per-topic transitions: new unconfirmed preferences,
   //      same-sign noted-redundant moves, rebuttal accumulation.
-  const plan = planTopics(scan, cfg, now);
+  const plan = planTopics(context.signals, cfg, context.instant);
   // A folded topic key claimed by two preferences is an ambiguity the pass
   // refuses to settle by scan order, so it planned nothing for that key. The
   // warning is how it says so - on the no-op summary as well as the changed
@@ -332,20 +463,35 @@ function dreamRun(
   // and that have left the contradiction window can never count toward a
   // candidate again, so they leave the inbox for `inbox/archived/`.
   // Planned after the topic plan so a consumed signal is never archived.
-  warnings.push(...planSignalArchive(scan, cfg, now, plan));
+  warnings.push(
+    ...planSignalArchive(context.signals, cfg, context.instant, context.wallClock, plan),
+  );
 
   // 3. Plan refresh: applied / violated / last_evidence / confidence,
   //    and unconfirmed → confirmed promotion. We need the log of all
   //    apply-evidence entries up to `now` — we read every day file
   //    referenced by `last_evidence_at` plus today's file. Since the
   //    plan doesn't yet know dates, we scan the entire log/ directory.
-  const evidence = scanApplyEvidence(vault);
-  const refresh = planRefresh(vault, scan, evidence, cfg, now, plan);
+  // The two walks that grow with the history: a pass past its deadline
+  // stops inside them, before it has written anything.
+  const checkpoint = (): void => opts.safeguard?.checkpoint();
+  context.setEvidence(readWindowEvidence(vault, context.signals, checkpoint));
+  const evidence = scanApplyEvidence(context.evidence);
+  const refresh = planRefresh(
+    vault,
+    scan,
+    evidence,
+    cfg,
+    context.instant,
+    plan,
+    context.evidence,
+    checkpoint,
+  );
 
   // 4. Plan retires (expired-unconfirmed, stale-no-evidence). Pinned
   //    preferences get a `retain-pinned` log event instead of a real
   //    retire.
-  planAutoRetires(scan, cfg, now, plan, refresh);
+  planAutoRetires(context.signals, cfg, context.instant, plan, refresh);
 
   // 4b. Cross-topic rule promotion (t_642bc2b8). Planned after the
   //     refresh pass - the source pool reads post-refresh confirmation
@@ -363,11 +509,12 @@ function dreamRun(
     warnings.push({ code, message }),
   );
   const crossTopic = planCrossTopicRules({
-    scan,
+    scan: context.signals,
     refresh,
     config: crossTopicConfig,
     ledger: crossTopicConfig ? readCrossTopicLedger(vault) : null,
-    now,
+    now: context.instant,
+    day: context.day,
     plan,
   });
 
@@ -382,7 +529,7 @@ function dreamRun(
   // question. Computed in-memory before the `changed` gate so the
   // summary carries open_questions on both the no-op and changed paths;
   // the `reconcile` log events below are emitted only on a changed run.
-  const reconcile = buildReconcileOutcomes(scan, plan, cfg, now);
+  const reconcile = buildReconcileOutcomes(context.signals, plan, cfg, context.instant);
 
   // Deterministic salience gate over the ladder's fold set
   // (salience-lifecycle-enrichment, unit 1). The ladder counts facts and
@@ -390,7 +537,12 @@ function dreamRun(
   // change what the pass asks a model to fold. With
   // `dream.salience_threshold` unset the gate is open and reads nothing,
   // which is why an un-opted-in vault pays no I/O here.
-  const salienceGate = applySalienceGate({ vault, preferences: scan.preferences, cfg, now });
+  const { verdict: salienceGate, admitted_ids: admittedIds } = gateSalience({
+    vault,
+    preferences: context.signals.preferences,
+    cfg,
+    now: context.instant,
+  });
 
   // The wikilink targets a fired rung's envelope offers, built at most
   // ONCE per dream run and only if a rung fires. The manifest is a whole
@@ -410,10 +562,10 @@ function dreamRun(
 
   if (!hasStateChange(plan, refresh, scan.corrupted.length, rollupPlan)) {
     if (!dryRun) regenerateDigestPages(vault, now);
-    // A run that changed nothing still finished. Reporting it as an
-    // unterminated stream would make an idempotent rerun - the common
-    // case - indistinguishable from a pass that died in planning.
-    progress.finish();
+    // A run that changed nothing still finished (`dream` ends the stream
+    // after the tail steps). Reporting it as an unterminated stream would
+    // make an idempotent rerun - the common case - indistinguishable from
+    // a pass that died in planning.
     noteProgressFaults(warnings, progressFaults);
     return buildNoOpSummary({
       runId,
@@ -477,9 +629,9 @@ function dreamRun(
       const applied = applyDreamPlan({
         vault,
         cfg,
-        now,
         plan,
         refresh,
+        window: context,
         agentName: opts.agentName,
         wikilinkToRun,
         healEnrichEnabled,
@@ -546,21 +698,26 @@ function dreamRun(
   const gatedSlugs = gatedRetireSlugs(exec.gatedRetires);
 
   if (!dryRun) {
+    const rollupProductionComplete =
+      queue === null ||
+      produceAtPassEnd(queue, { plan: rollupPlan, admittedIds, day: isoDate(now) });
     writeDreamLog({
       vault,
-      now,
+      now: context.instant,
       runId,
-      scan,
+      scan: context.signals,
       plan,
       refresh,
       reconcile,
       rollupPlan,
+      rollupProductionComplete,
       crossTopicLedger: crossTopic.ledger,
       moved: exec.moved,
       archived: exec.archived,
       gatedSlugs,
       isNonPrimary,
       callerAgent,
+      ...(owner !== null ? { owner } : {}),
       workrun,
     });
 
@@ -588,7 +745,6 @@ function dreamRun(
   // spot. `workrun` is null on dry-run / pre-mutation paths.
   workrun?.finalize();
   progress.advance(DREAM_STAGE.finalize);
-  progress.finish();
   noteProgressFaults(warnings, progressFaults);
 
   const summary = buildChangedSummary({
@@ -602,7 +758,7 @@ function dreamRun(
           log_path:
             vault === null || isStoreOnly({ vault })
               ? NO_VAULT_LOG_PATH
-              : join(brainDirsForWrite(vault).log, `${isoDate(now)}.md`),
+              : join(brainDirsForWrite(vault).log, `${context.day}.md`),
         },
     scan,
     plan,

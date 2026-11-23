@@ -105,15 +105,73 @@ note, is left as written. `expose_host_paths: true` keeps every path raw.
 A server started with no vault configured keeps the memory contract on
 the brain store alone. `brain_feedback`, `brain_apply_evidence`,
 `brain_note`, `brain_pinned_context`, `brain_context`, `brain_search`,
-`brain_changes`, `brain_dream`, `brain_doctor`, `brain_settings` and
-`second_brain_status` answer from store records: a written record is named
+`brain_query`, `brain_changes`, `brain_dream`, `brain_doctor`,
+`brain_settings` and `second_brain_status` answer from store records: a written record is named
 `store:<id>` (a pinned register `store:<partition>/pinned`), the search
 index is keyed by the store id, the dream pass runs over the store's folds
 with no pre-run snapshot, and the doctor runs its store-side checks. A
 second machine sharing the store finds the same records once its own index
 catches up. A tool that works on notes, and the vault-file modes of these
 tools (a doctor repair, a single dream step, the staged dream lifecycle, a
-cross-vault search), refuse with `vault_required`.
+cross-vault search), refuse with `vault_required`. At remote reach the
+stored text these tools hand out (the digest, a pinned scratchpad) is
+fenced as usual; with no vault page to probe, only a memory page the
+store rebuilds can name its provenance, and every other body gets the
+fence for unknown provenance.
+
+A machine switched to the brain store whose configured vault folder
+cannot be examined (its permissions, an I/O error) or is gone (an
+unmounted disk) is served the same way, call by call: the tools above
+answer from the store, and a tool that needs the vault refuses with
+`vault_unreadable` instead of `vault_required`. The server looks at the
+vault on every call, so it answers normally once the folder is back. The
+operator's rules live in the vault, so `brain_context` reports them as
+unread on such a machine - an `UNAVAILABLE:` notice for the standing and
+the scoped rules, naming the reason - instead of reporting no rules,
+which reads as "the operator wrote none". The rules are not read from
+the store: the store holds the operator's memories, not their rules.
+A result past a tool's preview budget is parked where a server with no
+vault parks it (this machine's device-local state) and fetched back from
+there with `brain_artifact_get`, so a long search answer never reads the
+vault to park itself. The command line and the hooks take the same
+decision (`docs/brain-store.md`, "A vault the process cannot examine").
+
+A machine that has not switched is not served that way in every case, and
+its two cases are not the same answer, because the store-only predicate
+reads the `Brain/` folder, not the vault:
+
+- **The vault folder is gone.** No legacy tree is left behind, so the
+  machine is store-only (`no-legacy-tree`): the store-backed tools above
+  answer from the store, and a tool that needs the vault refuses with
+  `vault_unreadable` - the same answer a switched machine gives for the
+  same reason, because there is nothing in the folder to read. A note
+  write is such a tool. `brain_create_note`, `brain_update_note`,
+  `brain_append_note` and the note operations of `brain_write_batch`
+  refuse and write nothing, and the folder that is gone is never
+  recreated: a write never materialises a vault, so an unmounted disk
+  stays unmounted and visible instead of being replaced by an empty tree
+  that hides the real vault.
+  The machine is told what is wrong before it is told what to do. The
+  session context (`brain_context`) leads with an `UNAVAILABLE:` notice
+  naming the missing folder - it may be on a disk that is not mounted -
+  and keeps `present: false`; every refusal names the missing folder
+  before any advice to initialise a new brain, and the advice stays,
+  second; and `brain_doctor` reports the missing folder ahead of the
+  "brain root absent" entry, whose `o2b brain init` advice stays behind
+  the new `o2b status` exit. A machine with no vault configured is not
+  in this case, and keeps today's guidance word for word.
+- **The vault folder cannot be examined.** The machine cannot tell
+  whether it holds a legacy tree (`undetermined`), so the tools that ask
+  refuse with `vault_unreadable`, and nothing is read from or written to
+  the store or the vault.
+
+The read-only vault tools answer by their own checks, not by the write
+guard. `second_brain_status` is the diagnostic that reports a condition
+instead of refusing it: with the folder gone it answers with `vault_exists:
+false` and the store block, and where the look at the vault directory
+itself is what failed it answers with the reason in `vault_exists` and
+the degraded vault, brain and search blocks. Where the folder is there
+but its contents cannot be walked, it refuses like the other tools.
 
 ### Progress notifications
 
@@ -337,6 +395,7 @@ generic tokens:
 | `argument_forbidden` | `brain_scaffold_stub` was given an argument that belongs to its other action |
 | `quote_unverified` | `brain_distill_source` with `strict_quotes: true` refused the write because a quoted span in a claim did not verify against its source (see "Source distillation" below) |
 | `store_write_failed` | a write on a machine that writes the brain store only did not land; the payload (`_meta` on a tool result, `error.data` on a JSON-RPC error) also carries `reason` (`no-store`, `no-device`, `root-inside-vault`, `partition-unavailable`, `store-identity` or `store-error`) and `remedy`, one sentence naming the fix |
+| `vault_unreadable` | the machine cannot tell whether the vault holds a legacy `Brain/` tree, because the vault cannot be examined (its permissions, an I/O error), so the tool neither read nor wrote anything rather than answer from a guessed layout. The server starts on such a vault, answers `initialize` and `tools/list`, and each call reads the vault again, so it answers normally once the vault can be read. On a machine switched to the brain store the brain is in the store: while its vault folder cannot be examined or is gone, each call is served as on a server with no vault (see "Running with no vault"), and only a tool that needs the vault refuses, as a JSON-RPC error with this code in `error.data`, without writing anything or recreating the folder |
 
 plus every member of the vocabularies the core already defines, passed
 through unchanged:
@@ -376,6 +435,13 @@ through unchanged:
   context, exact state, host memory writes, the count guard
   (`count_guard`), and the shared `config_invalid` and
   `preference_not_found`;
+- the `brain_topic` refusals: `topic_invalid` (an action the tool
+  refuses, an assign of a record no topic can hold among them, and a
+  topic record that fails its shape check), `topic_unknown-topic` (a
+  write that names no topic the caller can see) and `topic_unreadable`
+  (the topic records could not be read in full, so the write was not
+  checked); a `brain_topic` write the brain store refuses answers
+  `store_write_failed`, as every other writer;
 - the `brain_expire` refusals, sent under their error class names:
   `ExpirationValueError` (the date is not one the server can compare),
   `ExpirationTargetNotFoundError` (no signal or preference has that id)
@@ -444,7 +510,8 @@ flags for a narrower per-process full server.
 | `brain_analytics`           | Brain analytics for any lens: `view: timeline \| attention_flows \| belief_evolution \| concept_synthesis \| dedup`. `view=attention_flows` seeds its default flow recipe when the vault lacks one; `view=dedup` summarises the persisted exact-hash ingest dedup records into a trend plus a per-source re-ingest ranking; every count is an exact sha-256 drop, never a semantic figure (the semantic detectors nominate merge candidates and never drop). | `view`                                         |
 | `brain_search`              | Vault search with optional structured query lanes, explicit focus hints, time ranges, evidence-pack diagnostics, a selectable recall `profile` (`fast \| balanced \| thorough`), an FTS `match_mode` (`all` \| `any`), a pushed `kind` filter (`page` \| `section`) plus SQL pushdown for the promoted `properties` keys (since v1.80.0), and since v1.82.0 an opt-in iterative recall loop (`iterative`, `iterative_token`, `iterative_payload`) whose surviving coverage gaps pause with a plan the caller answers. Write-classified: it persists activation access events by default and the opt-in reinforce, recall-telemetry and query-demand ledgers under `Brain/search/` - ranking state later searches read back. | `query`                                        |
 | `brain_changes`             | Change probe over the brain store (phase 1 trial, active only when a store is in use): returns the record ids added since an optional watermark (`since`; absent starts from the first record), grouped by partition, stream, scope and topic, plus the watermark to pass next (`truncated: true` when `limit` cut the page, `reset: true` when the watermark came from a replaced index, `warnings` when a catch-up failed), so an agent or hook can see what other agents saved without running a search. Read-only; local reach only. | none (`since`, `limit` optional) |
-| `brain_settings`            | Shared brain settings, the ones every machine agrees on, named `<block>.<field>` (`dream.candidate_threshold`, `decision_model.enabled`, `guardrails.derived_fact_synthesis`) or by a scalar key (`primary_agent`): `action: get \| list \| set \| unset`. `view.language` (`en`, `ru`, or a regional tag of one) names the language of the human view; it is a store record on every machine, switched or not. A `set` value is a scalar or a list of scalars and goes through the same validator the settings file goes through. Once the machine is switched to the brain store, a write is a `setting-set` or `setting-unset` record with agent authority; a value the operator set (`o2b brain settings set`, human authority) is refused with `human_value_in_force`, never written and outvoted, and while a shared settings shard cannot be read (or is gone since this machine read it) an agent's write is refused with `settings_unreadable`. Before the switch it edits the vault's settings file, where a value that differs from the shipped default counts as the operator's and is refused the same way. A setting that holds a safety or privacy boundary (every `integrity` gate, `notes.read_paths`, `vault.ignore_paths` and `vault.include_paths`, `write_binding.path_prefixes`, the `sessions` capture patterns, the promotion thresholds, the instruction-file ceiling and the trust and owner-scope toggles of `guardrails`, the decision-model opt-out `decision_model.enabled`, the permissions document `permissions.document`) is the operator's alone: an agent's write is refused with `operator_only_setting` in both modes, whether or not the operator set it. A setting of one machine (snapshots, storage, embeddings, decision-model endpoints) is refused with `device_setting` and the machine-config key to set instead. Works on a server with no vault. | `action` (`name` for get/set/unset, `value` for set) |
+| `brain_settings`            | Shared brain settings, the ones every machine agrees on, named `<block>.<field>` (`dream.candidate_threshold`, `decision_model.enabled`, `guardrails.derived_fact_synthesis`) or by a scalar key (`primary_agent`): `action: get \| list \| set \| unset`. `view.language` (`en`, `ru`, or a regional tag of one) names the language of the human view; it is a store record on every machine, switched or not. A `set` value is a scalar or a list of scalars and goes through the same validator the settings file goes through. Once the machine is switched to the brain store, a write is a `setting-set` or `setting-unset` record with agent authority; a value the operator set (`o2b brain settings set`, human authority) is refused with `human_value_in_force`, never written and outvoted, and while a shared settings shard cannot be read (or is gone since this machine read it) an agent's write is refused with `settings_unreadable`. Before the switch it edits the vault's settings file, where a value that differs from the shipped default counts as the operator's and is refused the same way. A setting that holds a safety or privacy boundary (every `integrity` gate, `notes.read_paths`, `vault.ignore_paths` and `vault.include_paths`, `write_binding.path_prefixes`, the `sessions` capture patterns, the promotion thresholds, the instruction-file ceiling and the trust and owner-scope toggles of `guardrails`, the decision-model opt-out `decision_model.enabled`, the permissions document `permissions.document`, the vault map `vault_map.document`) is the operator's alone: an agent's write is refused with `operator_only_setting` in both modes, whether or not the operator set it. A setting of one machine (snapshots, storage, embeddings, decision-model endpoints) is refused with `device_setting` and the machine-config key to set instead. Works on a server with no vault. | `action` (`name` for get/set/unset, `value` for set) |
+| `brain_dream_owner`         | The dream owner: the one device, and the agent on it, that runs live dream passes on this brain (the twin of `o2b dream owner`). `operation: status \| take \| release`. `status` (the default) names the owner's device and agent, whether this device is the owner, the revision, a pending transfer and what became of this device's own request; it is served at every reach and names devices and agents, never a host path, and at local reach the owner's device also hands a pending request over. `take` (local reach only) takes the role for `owner_agent`, default the calling agent: on a brain with no owner it adopts it, on the owner's device it changes the agent at once, and on another device it records a request the owner's device releases the next time it looks. `release` (local reach only) gives the role up with no successor. A move carries agent authority and goes through no settings write, so a transfer a person made earlier never blocks it. There is no forced transfer here: that is `o2b dream owner --here --force` on the command line. On a device that is not the owner, `brain_dream` refuses a live pass, a step that writes and the staged `stage`, `apply`, `discard` and `retriage` with `dream_not_owner` before it asks a model or writes anything; dry runs answer everywhere. | `operation`, `owner_agent` for take |
 | `brain_topic`               | Topics (see [topics.md](topics.md)): `action: list \| show \| review` reads (topic heads, one topic with its items and rendered page, proposed merges and quiet topics); `create`, `rename`, `status`, `goal`, `assign`, `unassign`, `merge`, `split`, `link`, `archive` and `undo` record what the user asked, with human authority; `record` adds the agent's own decision, open question, log entry, milestone, resolution or completion, with agent authority. A personal topic is private by default. Below local reach a private topic is absent from every answer, and a write that names one is refused as for an unknown id. Never write topic pages with a note tool. | `action` |
 | `brain_recall_feedback`     | Record explicit up/down recall feedback for one search result; feeds the deterministic learned-weight fold.                                     | `query`, `result_path`, `verdict`              |
 | `brain_recall_gate`         | Read-only classifier for whether an automatic recall attempt should run; returns `retrieve` plus a stable reason. When the caller passes `scores` AND `match_quality` (the `idf_weighted_coverage` a search outcome reports - the two stand or fall together, and an incomplete pair is refused), also attaches an adequacy verdict (`sufficient` \| `weak` \| `insufficient`), a recommended action (`proceed` \| `re_recall` \| `abstain`), and an optional `escalate` flag. The LEVEL is decided by `match_quality` alone; the scores decide only the usable-result count. Thresholds via `recall_adequacy_sufficient` / `recall_adequacy_weak` / `recall_adequacy_min_results`. Since v1.82.0 a measured call also returns the shared graded surfacing key (`key`, `tier`) beside the binary decision.                              | `prompt`                                       |
@@ -457,8 +524,8 @@ flags for a narrower per-process full server.
 | `brain_context_pack_outcome`| Agent-operable outcome loop over the context-pack quality ledger: `post` records one compact outcome row for a carried context-pack quality-sample id — first-pass/repair/retry counters plus three STRICTLY SEPARATE token signals (`exact_prompt_token_savings`, `modeled_inference_avoidance`, `observed_provider_tokens`) — and composes the token-impact ledger by posting a matching first-pass/repair/retry calibration outcome; `list`/`summary` read the rows keeping the signals separate. Writes gated on `context_pack_outcome_enabled` (default off); payload-safe (counters + opaque sample id only), a field the caller omits is never invented. An optional `agent_id` names the ACTING agent and is recorded on every row the post lands; it is a tool ARGUMENT rather than the server's own config identity, so a config the server cannot read can never fail a telemetry post, and omitting it records no actor rather than a guessed one. Reads ignore the gate. | `operation`                                    |
 | `brain_knowledge_gaps`      | Aggregate the persisted cross-query demand log into recurring queries the vault answers poorly, ranked by frequency × (1 − IDF-weighted coverage). Read-only; the log is written only by opt-in recall telemetry.                              | —                                              |
 | `brain_generation_reports`  | Inbound, opt-in LLM generation tracing: `record` posts a generation's usage for a handoff (gated, default off; stores prompt hash + token counts only); `list`/`summary` read records and join them to memory paths. Kernel never calls an LLM. | `action`                                       |
-| `brain_obligation`          | Recurring obligations under `Brain/obligations/` with a deterministic cadence-driven next-due date: `add`, `done` (advances next_due by one cadence interval), `list` (optionally overdue-only), `show`, `remove`. Cadences: daily/weekly/biweekly/monthly/quarterly/yearly/every-<N>-days. | `operation`                                    |
-| `brain_pledge`              | One-off pledges under `Brain/pledges/<slug>.md`: `add` (title, a `due` calendar date, the cited `source` page, and `evidence` quotes each verified to occur in that source at write time - an uncited pledge, a missing source page or an unverifiable quote refuses the write by name), `fulfill` (stamps the fulfillment date; a second stamp refuses), `list` (due-sorted open pledges with an overdue flag and whole days until due; `overdue` restricts to the overdue ones), `show`, `remove` (archives the page under `Brain/pledges/archive/` with a collision suffix). Counterparties ride the `promised_to` frontmatter key, a relation in the shared vocabulary, so the existing frontmatter-relations ingest projects the typed edges. Answers at the caller's reach: below local reach a withheld page answers `show` as absent, drops from `list`, and `fulfill`/`remove` refuse with the same `no pledge` error an absent slug gets; a withheld `remove` answer carries no archive path. | `operation`                                    |
+| `brain_obligation`          | Recurring obligations under `Brain/obligations/` with a deterministic cadence-driven next-due date: `add`, `done` (advances next_due by one cadence interval), `list` (optionally overdue-only), `show`, `remove`. Cadences: daily/weekly/biweekly/monthly/quarterly/yearly/every-<N>-days. The slug keeps letters of any script of the title. `show`, `done` and `remove` take the slug `list` gives or the title itself; a title reaches only the obligation that stores exactly that title (whitespace runs and Unicode form aside), at its slug or at the Latin-only slug an older release gave it, so two titles whose slugs key alike never act on each other's page; a value that is both a slug and a stored title reaches the obligation that stores it as its title, and `add` refuses a title whose slug is the exact title of an obligation under its old slug; the slug a title keys to, with no page at it, reaches the one obligation under an old slug (Latin-only or hashed) whose title keys to it, and two such obligations reach neither. Answers at the caller's reach: a withheld page is skipped before it is read while a title is resolved, so `show` answers it as absent and `done`/`remove` refuse it with the `no obligation` error an absent title gets, naming the title's own slug; `add` of a title whose only page is a withheld old-slug page writes a new page, as over an absent one, while a page at the title's own slug is refused whoever may read it. | `operation`                                    |
+| `brain_pledge`              | One-off pledges under `Brain/pledges/<slug>.md`: `add` (title, a `due` calendar date, the cited `source` page, and `evidence` quotes each verified to occur in that source at write time - an uncited pledge, a missing source page or an unverifiable quote refuses the write by name), `fulfill` (stamps the fulfillment date; a second stamp refuses), `list` (due-sorted open pledges with an overdue flag and whole days until due; `overdue` restricts to the overdue ones), `show`, `remove` (archives the page under `Brain/pledges/archive/` with a collision suffix). The slug keeps letters of any script of the title. `show`, `fulfill` and `remove` take the slug `list` gives or the title itself; a title reaches only the pledge that stores exactly that title (whitespace runs and Unicode form aside), so "Ship the parser to Ada" and "Ship the parser, to Ada", whose slugs key alike, each reach their own pledge. A value that is both a slug and a stored title reaches the pledge that stores it as its title; an identity-suffixed slug past the 64-character cap (`<base>-<hex>`) is read as itself; the slug a title keys to, with no page at it, reaches the one pledge under an old slug (Latin-only or hashed) whose title keys to it, and two such pledges reach neither. A pledge an older release stored under the Latin-only slug, its identity-suffixed form included, is found again by its title, and adding the same promise again is refused as existing; a title that is another pledge's listed slug is refused, and a title whose slug is the exact title of a pledge under its old slug takes its identity-suffixed slot. Counterparties ride the `promised_to` frontmatter key, a relation in the shared vocabulary, so the existing frontmatter-relations ingest projects the typed edges. Answers at the caller's reach: below local reach a withheld page answers `show` as absent, drops from `list`, and `fulfill`/`remove` refuse with the same `no pledge` error an absent slug gets, naming the same slug; a withheld page is skipped before it is read while a title is resolved, so the answer never depends on whether it exists; a withheld `remove` answer carries no archive path. | `operation`                                    |
 | `brain_intake_pledges`      | Extraction intake for one-off pledges: the agent posts typed extractions (`pledges`, each with a title, a due date, evidence quotes and optional text and counterparty names) citing one `source` page. The kernel validates EVERY item - source readable at the caller's reach, every quote contained in the source, valid dates - before writing anything, so a batch with one invalid item writes no page. Commit is idempotent: a repeat with the same payload reports its slug under `duplicates`; the same identity with a changed payload is a named mismatch refusal. Counterparty names are anchored server-side against canonical-scope entities and never taken from the caller; names that anchor nowhere are reported under `unanchored_counterparties` and stored nowhere, and re-posting the same payload after the entity registers adds the edge (`reanchored`). The batch is capped by name: at most 100 pledges per intake, at most 32 counterparty names per pledge, and no counterparty name longer than 200 characters - a batch over a cap refuses whole. The kernel never calls a model. | `source`, `pledges`                            |
 | `brain_agenda`              | Stateless agenda synthesis over caller-provided calendar events (the host fetches them; the Brain never calls a calendar API): overlap conflicts, free focus blocks (optionally clipped to a workday window), and events organised outside the operator's own email domain(s). No vault writes. | `events`                                       |
 | `brain_context_presets`     | Show, suggest, or diff read-only context budget presets (`tight-context`, `long-context`) without writing config.                              | `operation`                                    |
@@ -536,7 +603,9 @@ body-derived anchor, with document mtime only as the last rung);
 predecessors undemoted (history mode); and `evidence_pack: true` to return
 significant/matched/missing terms, abstention text, terminal-state downrank
 reasons, per-result `why_retrieved`, IDF-weighted coverage with rare-term
-classification, per-token `union_records` for uncovered terms, and a
+classification, per-token `union_records` for uncovered terms (a union
+record names only a page the caller's reach, visibility, owner and
+session/project scope admit, the same filters the results pass), and a
 `completeness` verdict whose `uncovered_but_present_in_corpus` list is the
 false-absence guard. It can also emit opt-in recall telemetry with
 `telemetry: true`. The whole query language is published as a versioned
@@ -688,11 +757,13 @@ recall DAG populated by CLI `import-session --recall` or the core API.
 `brain_session_summary` accepts `operation: "write"|"get"|"list"` (write takes
 `session_id` plus any of `request`, `decisions`, `learnings`, `next_steps`,
 `source_turn_ids`, `host`, `project_scope`). `project_scope` is the same
-project axis `brain_search` filters on, normalized to the same `[a-z0-9-]` slug:
+project axis `brain_search` filters on, normalized to the same key a record's
+project is stamped with (lowercase, letters, marks and digits of any script
+kept, other runs to one `-`; ASCII values key as the older `[a-z0-9-]` slug did):
 on `write` it files the digest under that project and folds it into the dedupe
 key, so the same content under two projects is two digests; on `list` it returns
 only that project's digests. Omitted, the digest and its dedupe key are
-byte-identical to the pre-project shape. A value with no alphanumeric is an
+byte-identical to the pre-project shape. A value with no letter or digit is an
 `INVALID_PARAMS` error naming the argument, never a silent drop to unscoped.
 This is unrelated to the `o2b brain project` verb, which links a code directory
 to its owning vault at the configuration level. `brain_idea_lineage` accepts `id` and optional
@@ -978,7 +1049,9 @@ server restart and keeps the PREVIOUS material authenticating for a
 ten-minute placement window (`ROTATION_GRACE_MS` in the token store) so the
 caller holding it does not fail while the new one is being placed; after the
 window the old material dies on its own, with no revoke. Revocation itself
-stays immediate. Both are read per request behind an mtime cache; the shared
+stays immediate. Both are read per request behind a cache keyed by the file's
+stat, which re-reads the file while that stat is younger than two seconds
+(an edit in place inside one tick of the volume's clock keeps it); the shared
 key keeps its launch-time capture. The gate
 `mcp_tokens_required` (device config key or
 `OPEN_SECOND_BRAIN_MCP_TOKENS_REQUIRED`, default `false`) makes the endpoint
@@ -1612,6 +1685,8 @@ The plugin manifest `.claude-plugin/plugin.json` declares **two** MCP-server ent
 
 Both servers reuse the same backing CLI (`o2b mcp --scope writer` vs the default `--scope full`), and since v1.70.0 both are registered with `--harness claude-code`. Handlers are byte-identical; the writer-mode instructions text explicitly tells the agent to prefer the writer copy over any duplicate the full server still exposes (both call the same code path).
 
+`brain_feedback` files the signal (`sig-<date>-<slug>`) and a `force_confirmed: true` rule (`pref-<slug>`) under a slug of the topic that keeps letters of any script, so "без восклицаний" is `без-восклицаний` (it was `unnamed-<hash>` before) and "Проект release" is `проект-release` (it was `release`). A topic whose rule an older release filed under the Latin-only slug keeps that slug when that rule carries the same topic (the dream pass's topic key: case, whitespace and quote forms aside): a force-confirmed re-record meets the existing rule and is refused as existing, never written as a second rule beside it, and a plain re-record reinforces it on the dream pass, which groups signals by topic. A rule the caller may not read is not consulted, so the slug is the one an absent rule gives. An ASCII topic keeps its slug and reads nothing to derive it. The `brain/topic/<slug>` tag follows the same rule, except where the readable slug fails the tag rule (a script whose words carry combining marks, such as Devanagari), which keeps the Latin-only form. Fact markers name their derived rule the same way.
+
 `brain_feedback`'s `scope` argument stays optional. When the vault declares `feedback.default_scope` in `Brain/_brain.yaml`, a call that omits `scope` records the signal under that default category; an explicit `scope` always wins, and with no default configured a scope-less call stays scope-less. The same effective scope is reused for a `force_confirmed: true` preference so the preference and its signal share one scope. The configured value is validated against the same constraints as any signal `scope` (non-empty after trim, single-line, at most 128 characters).
 
 ## Write-time page lint (since v1.46.0)
@@ -1701,7 +1776,19 @@ log line is machine-composed rather than authored.
 ## Source distillation
 
 `brain_distill_source` writes one idempotent distillation page per source
-from atomic claims the calling agent supplies. Open Second Brain runs no
+from atomic claims the calling agent supplies. The page is
+`Brain/distillations/dist-<slug>-<hash>.md`: the hash names the source, and
+the slug keeps letters of any script of the source path; a page an older
+release wrote under the Latin-only slug with the same hash is rewritten in
+place, never doubled. An ASCII source path keeps the stem it always had,
+a Windows device name such as `CON` included (the stem is prefixed and
+suffixed, so it is never a bare device name). The caller's reach is
+asked of the page selected, under either slug, before it is read or
+written: a page the caller may not read is neither read, rewritten nor
+doubled beside, and the answer is the one an absent page gets (the new
+slug's path, `created: true`, nothing written). `brain_ingest_source`
+names its summary page `Brain/sources/src-<slug>-<hash>.md` by the same
+rule and answers a withheld summary the same way. Open Second Brain runs no
 model here: it validates the claims, checks every quotation inside them
 against the source, and writes the page. The page cites each claim as
 `[[source#^block]]` when the claim names a block.
@@ -2171,7 +2258,10 @@ format characters), when it contains NUL, or when it exceeds the cap.
   it as `Brain/decisions/design-<date>-<topic>.md`, beside the panel
   outputs. Zero and two-plus recommendations are both refused and the
   refusal states the count found; a note for the same topic on the same day
-  is refused rather than overwriting the first.
+  is refused rather than overwriting the first, including one an older
+  release wrote under the Latin-only slug (a different topic that once
+  shared that slug does not hold the name). A panel of the same topic and
+  day under the old slug likewise holds its target.
 - Since v1.52.0 the three needs-llm-step lanes whose artifact is a wikilinked note -
   `brain_diarize`, `brain_design_note`, and the dream pass's rollup rungs -
   additively carry `link_candidates` on their envelope: the note basenames a
@@ -2264,13 +2354,34 @@ format characters), when it contains NUL, or when it exceeds the cap.
   `transport-reach` are one argument rather than three. `disclosure` is
   deliberately not reserved - it is the unrelated result-depth mode on the
   recall surfaces.
-- A write attempted while `o2b brain migrate-store` migrates this vault on
-  this machine (the device-local migration gate is held) is refused the
-  same way: `-32602`, the refusal token `migration_in_progress`, and
-  structured `data`: `code`, `tool`, `run_id`, `since` and
-  `next_command: "o2b brain migrate-store --resume"` (for a migration that
-  was interrupted). Other machines are not gated; nothing is appended to
-  the Brain log for this refusal.
+- A write attempted while a store migration of this vault, its rollback or
+  the removal of its legacy tree holds this machine's migration gate is
+  refused the same way, by every tool (a Brain log note included, and also
+  when the tool reported the refusal as an error of its own): `-32602`, the
+  refusal token `migration_in_progress`, and structured `data`: `code`,
+  `tool`, `run_kind` (`migration`, `rollback` or `removal`), `run_id`,
+  `since`, `holder` (`running`; `unknown` when its process is alive but
+  whether it is the run's own process cannot be told, the message then
+  naming `o2b brain migrate-store --force-release-gate`; or `stopped` when
+  the run's process is gone or its pid now belongs to another process),
+  `gate_fault` (`damaged` or `unreadable` when the gate file is no
+  readable gate, the message naming the file and what clears it, else
+  null), `progress` (how far the run is, the step status shows, recorded
+  from the moment the run holds the gate; null only for a run of an older
+  release), `retry` (`later`: call
+  again once the run has finished; `recover`: the run stopped and nothing
+  lifts the gate until it is continued by the next start or by
+  `next_command`) and `next_command` (for a stopped run
+  `o2b brain migrate-store --resume`, `--rollback` or `--remove-legacy`;
+  `--force-release-gate` for a damaged gate; null while the holder's
+  process is alive, `running` or `unknown`, where the remedy is to wait,
+  and for an unreadable gate). A readable gate gates only the vault it
+  names: other vaults and other machines are not gated. A gate file that
+  is damaged or cannot be read names no vault, so it refuses writes to
+  every vault on this machine until it is cleared (`gate_fault` says
+  which, the message names the file and the remedy); nothing is appended to the Brain log for this refusal. A
+  result over its preview budget comes back cut with `artifact_id: null`
+  while the gate is held, since the artifact store lives in the vault.
 - Since v1.55.0 a write attempted while the vault is FROZEN
   (`o2b brain freeze`, marker `Brain/.state/frozen.json`) is refused with
   `-32602`, the refusal token `vault_frozen`, and structured `data`:
@@ -2789,7 +2900,10 @@ format characters), when it contains NUL, or when it exceeds the cap.
   missing preference, `brain_derive_fact` as a missing premise,
   `brain_decision` `show`, `outcome` and `rate` with `no decision:
   <slug>` (and `list`, `compare`, `history`, `recall` and `similar`
-  leave it out), `brain_labels` `assign` and `remove` with `note does
+  leave it out; a title resolves past a withheld page without reading
+  it, so the refusal names the title's own slug, and `record` or
+  `resolve` of a title whose only page is a withheld old-slug page
+  writes a new page, as over an absent one), `brain_labels` `assign` and `remove` with `note does
   not exist`, `brain_scaffold_stub` as an unknown source (and `list`
   leaves it out), and `brain_lifecycle` `tip` reads it as an unknown id.
   The `brain_feedback` conflict and routing hints score only
@@ -2938,3 +3052,13 @@ format characters), when it contains NUL, or when it exceeds the cap.
   `o2b brain validate --paths <page>... | --dirty [--strict]` - the same
   write-receipt lint the write path enforces, with the doctor's exit
   contract (errors 1, `--strict` warnings 2, clean 0) as the product.
+- On a vault switched to the brain store, `brain_lifecycle` `tombstone`,
+  `supersede`, `temporal-replace` and `correct` change the record in the
+  store, never a legacy page (whether the legacy tree is still on disk or
+  not), and take the record's legacy path, its bare id or `store:<id>` (the
+  form `brain_feedback` answers on such a machine). A tombstoned record
+  leaves every read surface at once, and `brain_search` also leaves out
+  the log events that name it. A target the store does not hold is refused
+  with `note does not exist`, and a change a write of higher authority
+  outranks (a human decision beside an agent's tombstone) is refused as
+  not applied.

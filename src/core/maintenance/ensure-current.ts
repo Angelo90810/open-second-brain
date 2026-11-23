@@ -16,14 +16,23 @@
  * holds. State checks are cheap reads and also handle interrupted
  * migrations and downgrades correctly.
  */
-import { existsSync } from "node:fs";
+import { maintainDreamOwner } from "../brain/dream-owner/gate.ts";
+import { isPathInsideResolved } from "../store/store-paths.ts";
+import { existsSync, mkdirSync } from "node:fs";
+import { beginWorkerLogAttempt, workerLogAttemptHeader } from "../store-migration/worker-log.ts";
+import { dirname } from "node:path";
+import {
+  MigrationInProgressError,
+  migrationGateRefuses,
+  withGateJudge,
+} from "../migration-gate.ts";
 import { Database } from "bun:sqlite";
 
 import { defaultConfigPath } from "../config.ts";
-import { o2bCommand } from "./o2b-command.ts";
+import { o2bCommand, spawnSelfDetached } from "./o2b-command.ts";
 import { brainConfigPath } from "../brain/paths.ts";
 import { resolveSearchConfig } from "../search/index.ts";
-import { healIndex, inspectIndex } from "../search/self-heal.ts";
+import { healIndex, owesRepairBeyondUpgrade, planIndexRepair } from "../search/self-heal.ts";
 import { LAST_INDEXED_AT_STATE_KEY } from "../search/store/state.ts";
 import { maybeFreshenIndex, type FreshenDecision } from "../search/freshen.ts";
 import { isWriterLockHeld } from "../search/store/writer-lock.ts";
@@ -51,9 +60,16 @@ import {
   AUTO_MIGRATION_SELF_CLAIM,
   autoMigrationClaimUndecided,
   AUTO_MIGRATION_LOCK_JUDGE,
+  autoMigrationWorkerLogPath,
   claimAutoMigrationLock,
+  claimMutexBudgetMs,
   handAutoMigrationLock,
+  type LostAutoMigrationWorker,
+  recordAutoMigrationSpawnFailure,
+  recordLostAutoMigrationWorker,
   releaseAutoMigrationLock,
+  settleExitedAutoMigrationWorker,
+  underOwnAutoMigrationClaim,
 } from "../store-migration/auto-state.ts";
 import type { GateNone } from "../store-migration/gate-decision.ts";
 import { gatherGate } from "../store-migration/gate-state.ts";
@@ -84,6 +100,11 @@ export const SELF_HEAL_UPGRADE_SPAWN = Object.freeze({
   skippedBackoff: "skipped_backoff",
   /** Another worker holds this vault's lock; nothing was started. */
   skippedRunning: "skipped_running",
+  /**
+   * A migration of this vault holds the gate (running or stopped): nothing
+   * was claimed or started, since the lock lives in the state it moves.
+   */
+  skippedMigrationGate: "skipped_migration_gate",
 } as const);
 
 export type SelfHealUpgradeSpawnDecision =
@@ -102,6 +123,12 @@ export const AUTO_MIGRATION_SPAWN = Object.freeze({
   skippedBackoff: "skipped_backoff",
   /** Another worker holds this vault's lock; nothing was started. */
   skippedRunning: "skipped_running",
+  /**
+   * The worker an earlier start spawned exited before it confirmed its
+   * claim (it could not run): this start recorded that as a failed
+   * attempt, which starts its cooldown, and started nothing.
+   */
+  workerLost: "worker_lost",
   /**
    * A live migration of ANOTHER vault holds this machine's gate: no
    * migration of this vault starts while it runs, and nothing of this
@@ -248,30 +275,32 @@ function startSelfHealUpgrade(
   // The claim creates the lock's directory; a vault removed since the
   // caller's check is left alone and nothing is started.
   if (!existsSync(brainConfigPath(vault))) return null;
+  if (migrationGateRefuses(vault)) return SELF_HEAL_UPGRADE_SPAWN.skippedMigrationGate;
   if (selfHealUpgradeBackoffActive(readSelfHealUpgradeFailure(vault), now)) {
     return SELF_HEAL_UPGRADE_SPAWN.skippedBackoff;
   }
-  const token = claimSelfHealUpgradeLock(vault, now);
+  let token: string | null;
+  try {
+    // Claimed for the worker spawned below, which stamps its own pid.
+    token = claimSelfHealUpgradeLock(vault, now, { handed: true });
+  } catch (e) {
+    // The gate closed after the check above: nothing claimed, nothing started.
+    if (e instanceof MigrationInProgressError) return SELF_HEAL_UPGRADE_SPAWN.skippedMigrationGate;
+    throw e;
+  }
   if (token === null) return SELF_HEAL_UPGRADE_SPAWN.skippedRunning;
   try {
-    const proc = Bun.spawn(
+    // The live environment (`spawnSelfDetached`); the config path
+    // travels the way every brain verb reads it.
+    spawnSelfDetached(
       [...o2bCommand(), "brain", "upgrade", "--vault", vault, SELF_HEAL_FLAG, token],
       {
-        stdin: "ignore",
-        stdout: "ignore",
-        stderr: "ignore",
-        windowsHide: true,
-        detached: process.platform === "win32",
-        // The live environment, for the reason given in
-        // `startSelfHealReindex`; the config path travels the way every
-        // brain verb reads it.
         env: {
           ...process.env,
           ...(configPath !== undefined ? { OPEN_SECOND_BRAIN_CONFIG: configPath } : {}),
         },
       },
     );
-    proc.unref();
   } catch (e) {
     // Nothing was started, so nothing else will release the claim.
     releaseSelfHealUpgradeLock(vault, token);
@@ -368,6 +397,16 @@ export function startDecisionOf(why: GateNone): AutoMigrationSpawnDecision | nul
  * refuses the upgrade's writes). Every other answer starts no worker, so
  * the start runs the upgrade itself.
  */
+/**
+ * Whether an index at `dbPath` would be built into `vault` itself: the
+ * legacy device-local folder, where a machine keeps it until it switches to
+ * the brain store. A switched machine's index lives in device-local state
+ * outside the vault, and is never skipped for this.
+ */
+export function rebuildsIntoLegacyFolder(vault: string, dbPath: string): boolean {
+  return isPathInsideResolved(dbPath, vault, process.platform);
+}
+
 export function migrationOwnsUpgrade(spawn: AutoMigrationSpawnDecision | null): boolean {
   return spawn === AUTO_MIGRATION_SPAWN.spawned || spawn === AUTO_MIGRATION_SPAWN.skippedRunning;
 }
@@ -404,7 +443,13 @@ function spawnAutoMigrationWorker(
   now: Date,
 ): AutoMigrationSpawnDecision {
   // Judged without an identity query: a start never waits on a subprocess.
-  const token = claimAutoMigrationLock(vault, now, { judge: AUTO_MIGRATION_LOCK_JUDGE.cheap });
+  let lost: LostAutoMigrationWorker | null = null;
+  const token = claimAutoMigrationLock(vault, now, {
+    judge: AUTO_MIGRATION_LOCK_JUDGE.cheap,
+    onLostWorker: (worker) => {
+      lost = worker;
+    },
+  });
   if (token === null) {
     // A live pid holds the claim, older than a running worker is trusted
     // for: hung, or a later process that reuses the pid. Only an identity
@@ -415,16 +460,65 @@ function spawnAutoMigrationWorker(
     spawnWorker(vault, configPath, AUTO_MIGRATION_SELF_CLAIM);
     return AUTO_MIGRATION_SPAWN.spawned;
   }
+  const lostWorker: LostAutoMigrationWorker | null = lost;
+  if (lostWorker !== null) {
+    // The worker an earlier start handed this claim to never confirmed it:
+    // it could not run. Recorded as a failed attempt under this claim (its
+    // cooldown holds the next starts off), and nothing is started now.
+    try {
+      underOwnAutoMigrationClaim(
+        vault,
+        token,
+        () => recordLostAutoMigrationWorker(vault, lostWorker, now),
+        claimMutexBudgetMs(AUTO_MIGRATION_LOCK_JUDGE.cheap),
+      );
+    } finally {
+      releaseAutoMigrationLock(vault, token);
+    }
+    return AUTO_MIGRATION_SPAWN.workerLost;
+  }
   startOnClaim({
-    start: () => spawnWorker(vault, configPath, token).pid,
+    start: () => {
+      const proc = spawnWorker(vault, configPath, token);
+      watchWorker(vault, token, proc);
+      return proc.pid;
+    },
     // The claim now names the worker, so it stays live after this start's
     // process ends and goes stale the moment the worker is gone. Its start
     // identity is the worker's to stamp: reading it here could cost an
     // external query (Windows) on the start's path.
     handOver: (pid) => void handAutoMigrationLock(vault, token, pid, null),
     release: () => releaseAutoMigrationLock(vault, token),
+    failed: (e) =>
+      underOwnAutoMigrationClaim(
+        vault,
+        token,
+        () => recordAutoMigrationSpawnFailure(vault, message(e), now),
+        claimMutexBudgetMs(AUTO_MIGRATION_LOCK_JUDGE.cheap),
+      ),
   });
   return AUTO_MIGRATION_SPAWN.spawned;
+}
+
+/**
+ * While this process lives, watch the worker it spawned: when it exits
+ * before it confirmed its claim, its failure is recorded at once (with its
+ * exit and its error output) instead of at the next start. The watch never
+ * keeps this process alive and never waits for the claim's mutex; a start
+ * that ends first leaves the record to the next start.
+ */
+function watchWorker(vault: string, token: string, proc: ReturnType<typeof Bun.spawn>): void {
+  const pid = proc.pid;
+  void proc.exited.then(
+    (code) => {
+      const exit =
+        proc.signalCode !== null && proc.signalCode !== undefined
+          ? `signal ${proc.signalCode}`
+          : `exit code ${code}`;
+      settleExitedAutoMigrationWorker(vault, token, pid, exit);
+    },
+    () => {},
+  );
 }
 
 /**
@@ -440,11 +534,18 @@ export function startOnClaim(steps: {
   readonly start: () => number;
   readonly handOver: (pid: number) => void;
   readonly release: () => void;
+  /** Records why no worker could be started, under the claim, before it is released. */
+  readonly failed?: (e: unknown) => void;
 }): void {
   let pid: number;
   try {
     pid = steps.start();
   } catch (e) {
+    try {
+      steps.failed?.(e);
+    } catch {
+      // The record is best effort; the error still reaches the caller.
+    }
     // Nothing was started, so nothing else will release the claim.
     steps.release();
     throw e;
@@ -462,25 +563,32 @@ function spawnWorker(
   configPath: string | undefined,
   token: string,
 ): ReturnType<typeof Bun.spawn> {
-  const proc = Bun.spawn(
+  // The live environment (`spawnSelfDetached`); the config path travels
+  // the way every brain verb reads it. The worker's error output goes to a
+  // small device-local log that a failure names. Each spawn opens a new
+  // attempt in it and keeps the last few before it (`worker-log.ts`): a
+  // worker started after a killed one keeps what the killed run wrote.
+  const log = autoMigrationWorkerLogPath(vault);
+  try {
+    mkdirSync(dirname(log), { recursive: true });
+  } catch {
+    // the spawn's own open says so
+  }
+  beginWorkerLogAttempt(
+    log,
+    workerLogAttemptHeader(new Date(), `started by process ${process.pid}`),
+  );
+  return spawnSelfDetached(
     [...o2bCommand(), "brain", "migrate-store", "--vault", vault, AUTO_MIGRATION_FLAG, token],
     {
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-      windowsHide: true,
-      detached: process.platform === "win32",
-      // The live environment, for the reason given in
-      // `startSelfHealReindex`; the config path travels the way every
-      // brain verb reads it.
       env: {
         ...process.env,
         ...(configPath !== undefined ? { OPEN_SECOND_BRAIN_CONFIG: configPath } : {}),
       },
+      stderrLog: log,
+      appendStderrLog: true,
     },
   );
-  proc.unref();
-  return proc;
 }
 
 /**
@@ -531,7 +639,7 @@ function spawnWorker(
  * function records on the spawn row, so the two rows pair without a pid;
  * see `self-heal-reindex.ts` for why the parent cannot record the outcome.
  */
-function startSelfHealReindex(
+export function startSelfHealReindex(
   vault: string,
   configPath: string,
   dbPath: string,
@@ -554,40 +662,27 @@ function startSelfHealReindex(
   // Minted BEFORE the spawn: it is what the child is told to write on its
   // own terminal row, so the pair exists whichever process writes first.
   const runId = mintSelfHealRunId();
-  const proc = Bun.spawn(
-    [
-      ...o2bCommand(),
-      "search",
-      "reindex",
-      "--vault",
-      vault,
-      "--config",
-      configPath,
-      SELF_HEAL_FLAG,
-      runId,
-    ],
-    {
-      stdin: "ignore",
-      stdout: "ignore",
-      stderr: "ignore",
-      // No console window flashing up on Windows for a background rebuild.
-      windowsHide: true,
-      // On Windows a child that is not detached is ended together with its
-      // parent, so a rebuild started by a short-lived hook process died the
-      // moment the hook exited and never recorded an outcome. POSIX already
-      // lets an `unref`ed child outlive its parent, and its process group is
-      // left as it was.
-      detached: process.platform === "win32",
-      // Bun hands a child spawned without `env` the environment this
-      // process STARTED with, not the live `process.env`. A config the
-      // process selected after start (`--config`, an embedding host, the
-      // test preload) would then be invisible to the rebuild, which would
-      // resolve the default config instead - another vault, and on a first
-      // run a device id minted into a config file nobody asked for.
-      env: { ...process.env },
-    },
-  );
-  proc.unref();
+  // Detached on every platform, with the live environment
+  // (`spawnSelfDetached`): on Windows a child that is not detached is
+  // ended together with its parent, so a rebuild started by a short-lived
+  // hook process died the moment the hook exited and never recorded an
+  // outcome; and Bun hands a child spawned without `env` the environment
+  // this process STARTED with, so a config the process selected after
+  // start (`--config`, an embedding host, the test preload) would be
+  // invisible to the rebuild, which would resolve the default config
+  // instead - another vault, and on a first run a device id minted into a
+  // config file nobody asked for.
+  spawnSelfDetached([
+    ...o2bCommand(),
+    "search",
+    "reindex",
+    "--vault",
+    vault,
+    "--config",
+    configPath,
+    SELF_HEAL_FLAG,
+    runId,
+  ]);
   recordSelfHealSpawn(vault, SELF_HEAL_SPAWN.spawned, runId);
   return SELF_HEAL_SPAWN.spawned;
 }
@@ -595,6 +690,15 @@ function startSelfHealReindex(
 export async function ensureVaultCurrent(
   vault: string,
   opts: EnsureCurrentOptions = {},
+): Promise<EnsureCurrentResult> {
+  // A start never queries a process identity, also not to word the refusal
+  // of a write the gate turns away on its way (a metrics row).
+  return withGateJudge("cheap", () => ensureVaultCurrentJudged(vault, opts));
+}
+
+async function ensureVaultCurrentJudged(
+  vault: string,
+  opts: EnsureCurrentOptions,
 ): Promise<EnsureCurrentResult> {
   const background = opts.background ?? true;
   if (background) {
@@ -736,12 +840,41 @@ export async function ensureVaultCurrent(
         ...(opts.freshenSpawn !== undefined ? { spawn: opts.freshenSpawn } : {}),
       });
     };
-    if (inspectIndex(config) !== "current") {
-      if (background) {
-        reindexSpawn = startSelfHealReindex(vault, configPath, config.dbPath, errors);
-        // A run that declined to spawn started nothing, and saying it did
-        // would report a rebuild that is not this run's.
-        reindexTriggered = reindexSpawn === SELF_HEAL_SPAWN.spawned;
+    // ONE decision about what a stale index needs (`planIndexRepair`),
+    // the same one the read path takes: an older schema is upgraded in
+    // place, and only an index no upgrade can repair is rebuilt.
+    const plan = planIndexRepair(config);
+    if (plan.kind !== "current") {
+      if (
+        background &&
+        migrationOwnsUpgrade(migrationSpawn) &&
+        rebuildsIntoLegacyFolder(vault, config.dbPath)
+      ) {
+        // The migration worker this start left the vault to switches this
+        // machine to the brain store, where the index lives in device-local
+        // state and is built anew: a rebuild here would write a whole index
+        // into the vault's legacy folder (hundreds of MB on a large vault)
+        // that nothing reads after the switch and that stays behind in the
+        // vault. The first start after the switch builds the new one.
+        reindexSpawn = SELF_HEAL_SPAWN.skippedMigration;
+      } else if (background) {
+        // An older schema is left to the read that meets it: the read path
+        // upgrades it in place, and a background job would take the writer
+        // lock that upgrade needs and race it for it. The command line and
+        // the MCP server therefore meet an old index the same way - one
+        // decision, one repair, whichever surface the read came from.
+        //
+        // Unless the index owes a repair BEYOND that upgrade - entity rows
+        // of the older rule, chunks of older rules. The reader that
+        // upgrades the schema answers from the index it upgraded and does
+        // not repair it; the background heal does, and it re-plans after
+        // the upgrade, so it ends current on both counts.
+        if (plan.kind !== "upgrade-in-place" || owesRepairBeyondUpgrade(config)) {
+          reindexSpawn = startSelfHealReindex(vault, configPath, config.dbPath, errors);
+          // A run that declined to spawn started nothing, and saying it did
+          // would report a rebuild that is not this run's.
+          reindexTriggered = reindexSpawn === SELF_HEAL_SPAWN.spawned;
+        }
       } else {
         const healed = await healIndex(config);
         reindexTriggered = healed.kind === "rebuilt";
@@ -756,6 +889,16 @@ export async function ensureVaultCurrent(
     }
   } catch (e) {
     errors.push(`search-reindex: ${message(e)}`);
+  }
+
+  // 4. The dream owner's device hands a pending transfer over, and notes
+  //    its own fresh claim (change agent-neutral-dream, design D3): a few
+  //    settings records read, and a release written only on the owner's
+  //    device under its pass lock, so a pass in progress is never cut.
+  try {
+    maintainDreamOwner(vault, opts.configPath);
+  } catch (e) {
+    errors.push(`dream-owner: ${message(e)}`);
   }
 
   return {

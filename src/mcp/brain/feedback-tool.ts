@@ -6,6 +6,7 @@
  * registry, which preserves the public FEEDBACK_TOOLS surface.
  */
 
+import { contextRecordOrigin } from "./shared.ts";
 import { resolve } from "node:path";
 import { loadPermissionsDocumentFor } from "../../core/brain/permissions/document-source.ts";
 import { resolveAgentName } from "../../core/config.ts";
@@ -24,13 +25,13 @@ import { loadFeedbackDefaultScopeSafe } from "../../core/brain/policy.ts";
 import {
   loadPreference,
   preferencePresence,
+  resolvePreferenceSlug,
   writePreference,
 } from "../../core/brain/preference.ts";
 import { sha256Hex } from "../../core/integrity/digest.ts";
 import { normalizeExpirationDate } from "../../core/brain/expiration.ts";
 import { validateBrainFeedbackInput } from "../../core/brain/sessions/validate-feedback.ts";
 import { isoDate, isoSecond } from "../../core/brain/time.ts";
-import { slugify } from "../../core/vault.ts";
 import { normalizeAgentArgument } from "../../core/agent-identity.ts";
 import {
   BRAIN_LOG_EVENT_KIND,
@@ -52,6 +53,7 @@ import {
 import { nextCommandField, requireNextStep } from "../../core/brain/next-step.ts";
 import { resolvePermission } from "../../core/brain/permissions/resolve.ts";
 import { substrateSubject } from "../../core/brain/write-disposition.ts";
+import { computeDedupHash } from "../../core/brain/dedup-hash.ts";
 import { contextVault, type ServerContext } from "../tool-contract.ts";
 import { refuseAgentClaim } from "./agent-claim.ts";
 import { coerceStr, coerceIsoDate } from "../coerce.ts";
@@ -82,11 +84,19 @@ export function writeRefusedToMcp(tool: string, err: WriteRefusedError): MCPErro
  * Build the slug used in the signal / preference filename. We never let
  * the agent decide the slug directly — taking `topic` as the slug stem
  * is what the design doc §9.2 prescribes (slugs are deterministic from
- * topic). The slug is run through `slugify` defensively so a slightly
- * mis-shaped topic still yields a filesystem-safe basename.
+ * topic). `titleSlug` keeps letters of any script and still yields a
+ * filesystem-safe basename; a topic whose rule an older release filed
+ * under the Latin-only slug keeps that slug, so a re-recorded topic meets
+ * its existing rule instead of minting a second one
+ * (`resolvePreferenceSlug`).
  */
-export function deriveSlug(topic: string): string {
-  return slugify(topic);
+export function deriveSlug(
+  vault: string | null,
+  topic: string,
+  configPath?: string,
+  readable?: (rel: string) => boolean,
+): string {
+  return resolvePreferenceSlug(vault, topic, configPath, readable);
 }
 
 /** How a result names a record written with no vault. */
@@ -283,7 +293,14 @@ export async function toolBrainFeedback(
   const signalStamp = eventTime ?? now;
   const signalCreatedAt = isoSecond(signalStamp);
   const signalDate = isoDate(signalStamp);
-  const slug = deriveSlug(topic);
+  // At the caller's reach: a rule it may not read is never consulted, so
+  // the slug (and a refusal naming it) is the one an absent rule gives.
+  const slug = deriveSlug(
+    vault,
+    topic,
+    ctx.configPath ?? undefined,
+    readableAtContextReachOrUndefined(ctx),
+  );
 
   // Vault-configured fallback scope (`feedback.default_scope`). Applied
   // only when the call passes no explicit scope. Compute one effective
@@ -316,6 +333,18 @@ export async function toolBrainFeedback(
     ...(eventTime ? { valid_from: signalCreatedAt, recorded_at: signalCreatedAt } : {}),
     ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
     ...(expires !== undefined ? { expiration_date: expires } : {}),
+    // The shared capture hash (topic, sign, principle, the scope the call
+    // named), so the session hook's replay of this very call, a session
+    // import of it, or the same rule from a marker dedups against this
+    // signal instead of writing it twice. It never dedups this call: an
+    // explicit call is one more observation of the rule.
+    dedup_hash: computeDedupHash({
+      topic,
+      signal: signalRaw as BrainSignalSign,
+      principle,
+      ...(scope ? { scope } : {}),
+    }),
+    origin: contextRecordOrigin(ctx),
   };
   let sigResult;
   try {

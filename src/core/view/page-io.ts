@@ -26,7 +26,8 @@
  * milliseconds, and a sync setup should ignore them.
  */
 
-import { randomBytes } from "node:crypto";
+import { sameDevIno } from "../fs-identity.ts";
+import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
   constants as fsConstants,
@@ -41,16 +42,18 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  readSync,
   renameSync,
   rmdirSync,
   symlinkSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
-import type { Stats } from "node:fs";
+import type { BigIntStats } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import { READ_NO_FOLLOW_FLAGS } from "../derived-store-guard.ts";
+import { syncConflictOriginalName } from "../brain/ledger-shards.ts";
 import { NO_LINK_CODES } from "../store/blobs.ts";
 import { VIEW_PAGE_EXT, VIEW_TEMP_PREFIX } from "./constants.ts";
 
@@ -310,15 +313,12 @@ function putBackOther(away: string, path: string): void {
   }
 }
 
-/** Syncthing: `.sync-conflict-<YYYYMMDD>-<HHMMSS>-<device id prefix>`. */
-const SYNCTHING_COPY_RE = /^\.sync-conflict-\d{8}-\d{6}-[a-z0-9]{7}$/;
-/** Dropbox, Nextcloud and similar: ` (<who>conflicted copy <date ...>)`. */
-const CONFLICTED_COPY_RE = /^ \([^)]*conflicted copy[^)]*\d{4}-\d{2}-\d{2}[^)]*\)$/;
-
 /**
  * Conflict copies a sync tool made of the page at `path`: Syncthing's
  * `<name>.sync-conflict-<stamp>.md`, and the `<name> (conflicted copy ...).md`
- * form other sync clients use.
+ * form other sync clients use. The names are recognised in one place
+ * (`brain/ledger-shards.ts`, `syncConflictOriginalName`): a user's own
+ * `about-me (conflict notes).md` is not a copy of the page.
  */
 export function conflictCopies(path: string): string[] {
   const dir = dirname(path);
@@ -329,16 +329,13 @@ export function conflictCopies(path: string): string[] {
   } catch {
     return [];
   }
+  const own = `${stem}${VIEW_PAGE_EXT}`;
   return names
     .filter((name) => {
       const lower = name.toLowerCase();
       if (!lower.endsWith(VIEW_PAGE_EXT) || lower.startsWith(VIEW_TEMP_PREFIX)) return false;
-      const middle = lower.slice(0, -VIEW_PAGE_EXT.length);
-      if (!middle.startsWith(stem)) return false;
-      // Only the stamped shapes sync tools make: a user's own
-      // `about-me (conflict notes).md` is not a copy of the page.
-      const rest = middle.slice(stem.length);
-      return SYNCTHING_COPY_RE.test(rest) || CONFLICTED_COPY_RE.test(rest);
+      // Matched on the lowercased name: a stamp spelled in capitals is a copy too.
+      return syncConflictOriginalName(lower) === own;
     })
     .toSorted()
     .map((name) => join(dir, name));
@@ -378,16 +375,36 @@ export function listCompanions(dir: string, skip: ReadonlySet<string>): string[]
   }
 }
 
-/** Whether two stats are one version of one file: same file, same size, same modification time. */
-function sameVersion(a: Stats, b: Stats | null): boolean {
-  return (
-    b !== null && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs
-  );
+/**
+ * Whether two stats are one version of one file: same file (device and
+ * inode as bigint, `fs-identity.ts`), same size, same modification time.
+ */
+function sameVersion(a: BigIntStats, b: BigIntStats | null): boolean {
+  return b !== null && sameDevIno(a, b) && a.size === b.size && a.mtimeNs === b.mtimeNs;
 }
 
-function lstatOrNull(path: string): Stats | null {
+/** The sha256 of the file at `path` (not followed through a link), or null when it cannot be read. */
+function sumOf(path: string): string | null {
+  let fd: number | null = null;
   try {
-    return lstatSync(path);
+    fd = openSync(path, READ_NO_FOLLOW_FLAGS);
+    const hash = createHash("sha256");
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    for (;;) {
+      const n = readSync(fd, chunk, 0, chunk.length, null);
+      if (n === 0) return hash.digest("hex");
+      hash.update(chunk.subarray(0, n));
+    }
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+function lstatOrNull(path: string): BigIntStats | null {
+  try {
+    return lstatSync(path, { bigint: true });
   } catch {
     return null;
   }
@@ -414,7 +431,7 @@ function lstatOrNull(path: string): Stats | null {
  * until that program lets go.
  */
 function moveNoReplace(from: string, to: string): void {
-  const stat = lstatSync(from);
+  const stat = lstatSync(from, { bigint: true });
   if (stat.isSymbolicLink()) return;
   if (stat.isDirectory()) {
     if (existsSync(to)) return;
@@ -422,20 +439,33 @@ function moveNoReplace(from: string, to: string): void {
     return;
   }
   // The version this move put under the new name: the source itself for a
-  // link, the copy as written otherwise.
+  // link, the copy as written otherwise. A copy is also known by the sum
+  // of its bytes, taken right after it was written: on a volume with no
+  // hard links (FAT, exFAT) an edit saved in place at the same size inside
+  // one tick of the clock (2 s on FAT) keeps inode, size and mtime, so the
+  // stat alone cannot tell the copy, or the source, from an edit of it.
+  // A link shares the file, so there is nothing to tell apart.
   let placed = stat;
+  let placedSum: string | null = null;
   try {
     linkSync(from, to);
   } catch (err) {
     const code = errnoCode(err);
     if (code === undefined || !NO_LINK_CODES.has(code)) throw err;
     copyFileSync(from, to, fsConstants.COPYFILE_EXCL);
-    placed = lstatSync(to);
+    placed = lstatSync(to, { bigint: true });
+    placedSum = sumOf(to);
+    if (placedSum === null) {
+      // The copy cannot be read back: it is no proof of anything.
+      removeIfVersion(to, placed, null);
+      return;
+    }
   }
+  const copied = placedSum !== null;
   const now = lstatOrNull(from);
   if (now === null) return; // gone meanwhile: the new name holds the only copy
   if (!sameVersion(stat, now)) {
-    removeIfVersion(to, placed);
+    removeIfVersion(to, placed, placedSum);
     return;
   }
   const away = tempName(dirname(from), "move");
@@ -443,33 +473,43 @@ function moveNoReplace(from: string, to: string): void {
     renameSync(from, away);
   } catch (err) {
     if (errnoCode(err) === "ENOENT") return; // gone meanwhile, as above
-    removeIfVersion(to, placed);
+    removeIfVersion(to, placed, placedSum);
     throw err;
   }
-  if (sameVersion(stat, lstatOrNull(away))) {
+  // The source is removed only when it still is what the new name was
+  // made from: its stat for a link, and for a copy its bytes as well. An
+  // edit of the copy meanwhile does not matter here: the copy keeps it.
+  if (sameVersion(stat, lstatOrNull(away)) && (!copied || sumOf(away) === placedSum)) {
     removeQuietly(away);
     return;
   }
   // A newer version took the old name between the check and the rename:
   // it goes back under that name, and the move is taken back.
   restore(away, from);
-  removeIfVersion(to, placed);
+  removeIfVersion(to, placed, placedSum);
 }
 
 /**
  * Remove `path` only while it is still the version `ours` (the name this
  * move created): it is renamed to a temp name first and checked there, so
  * a file a sync tool put under the name meanwhile is put back, not removed.
+ * A copy (`oursSum` set) must also still hold the bytes it was written
+ * with: an edit of it in place keeps its stat inside one clock tick, and is
+ * put back, never removed on stat equality alone. `null` for a copy whose
+ * bytes could not be read back: then the stat decides, as nothing was read.
  */
-function removeIfVersion(path: string, ours: Stats): void {
+function removeIfVersion(path: string, ours: BigIntStats, oursSum: string | null): void {
   const away = tempName(dirname(path), "back");
   try {
     renameSync(path, away);
   } catch {
     return; // gone already
   }
-  if (sameVersion(ours, lstatOrNull(away))) removeQuietly(away);
-  else restore(away, path);
+  if (sameVersion(ours, lstatOrNull(away)) && (oursSum === null || sumOf(away) === oursSum)) {
+    removeQuietly(away);
+  } else {
+    restore(away, path);
+  }
 }
 
 /** Remove a page folder once nothing is left in it; a folder with anything in it stays. */

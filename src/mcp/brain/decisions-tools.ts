@@ -50,7 +50,7 @@ import {
   coerceStrList,
   unknownOperationError,
 } from "../coerce.ts";
-import { wrapToolErrors } from "./shared.ts";
+import { contextRecordOrigin, wrapToolErrors } from "./shared.ts";
 import { DECISION_RATING_MAX, DECISION_RATING_MIN } from "../../core/brain/decisions/record.ts";
 import { BRAIN_COMMITMENT_TIER, type BrainCommitmentTier } from "../../core/brain/types.ts";
 import {
@@ -147,6 +147,8 @@ async function toolBrainDecision(
           ...(rationale ? { rationale } : {}),
           ...(commitment ? { commitment: commitment as BrainCommitmentTier } : {}),
           agent: agent ?? "",
+          origin: contextRecordOrigin(ctx),
+          ...reads,
         });
         return {
           action,
@@ -422,6 +424,8 @@ async function toolBrainDecision(
           choice,
           ...(rationale ? { rationale } : {}),
           ...(agent ? { actor: agent } : {}),
+          origin: contextRecordOrigin(ctx),
+          ...reads,
         });
         return { action, id, decision: res.decision };
       }

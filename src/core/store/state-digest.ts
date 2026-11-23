@@ -28,11 +28,20 @@ import { join } from "node:path";
 
 import { canonicalJson, sha256Hex } from "../integrity/digest.ts";
 import { compareCodeUnits } from "./compare.ts";
+import { gcHintTick } from "./gc-hint.ts";
 import { appendRecord, type AppendResult } from "./appender.ts";
 import { observeClock, type WallClock } from "./clock-store.ts";
 import {
   DAY_MS,
   LEDGER_STREAM,
+  PINNED_CLEAR_KIND,
+  PINNED_SET_KIND,
+  PREFERENCE_EVIDENCE_KIND,
+  PREFERENCE_REMOVE_KIND,
+  PREFERENCE_SET_KIND,
+  SETTING_ENTRY_KIND,
+  SETTING_SET_KIND,
+  SETTING_UNSET_KIND,
   STATE_DIGEST_KIND,
   STORE_STREAMS,
   type StateDigestFold,
@@ -44,8 +53,15 @@ import { foldPinned, pinnedFingerprint } from "./fold-pinned.ts";
 import { foldPreferences, preferencesFingerprint } from "./fold-preferences.ts";
 import { foldSettings, settingsFingerprint } from "./fold-settings.ts";
 import { foldTopics, topicsFingerprint } from "../topics/fold.ts";
+import { isTopicRecordKind } from "../topics/records.ts";
 import { parseHlc } from "./hlc.ts";
-import { readShard, replacedShards, shardReadGap, type Compaction } from "./reader.ts";
+import {
+  replacedShards,
+  scanShard,
+  shardScanGap,
+  type Compaction,
+  type ShardScan,
+} from "./reader.ts";
 import { SEEN_SHARD_MISSING_REASON, trackSeenShards } from "./seen-shards.ts";
 import { listShards } from "./shard-list.ts";
 import type { StoreHandle } from "./store-open.ts";
@@ -97,6 +113,12 @@ export interface ReadPartitionOptions {
    * as unread; a caller that only needs the cut may skip it.
    */
   readonly onUnreadable?: (shard: UnreadableShard) => void;
+  /**
+   * {@link forEachPartitionShard} only: true for a shard the caller already
+   * holds what it needs of (it compares the file's stamp): the shard is not
+   * read and not handed on. Such a read names no shard as missing.
+   */
+  readonly reuse?: (shard: { readonly rel: string; readonly path: string }) => boolean;
 }
 
 export interface CutEntry {
@@ -132,7 +154,8 @@ function ledgerNames(partitionRoot: string): string[] {
   }
 }
 
-function streamRefs(partitionRoot: string): Array<StreamRef & { stream: StoreStream }> {
+/** Every stream of a partition, one ref per ledger for `ledgers`, in stream order. */
+export function streamRefs(partitionRoot: string): Array<StreamRef & { stream: StoreStream }> {
   const refs: Array<StreamRef & { stream: StoreStream }> = [];
   for (const stream of STORE_STREAMS) {
     if (stream === LEDGER_STREAM) {
@@ -155,52 +178,176 @@ export function readPartition(
   options: ReadPartitionOptions = {},
 ): PartitionShard[] {
   const out: PartitionShard[] = [];
+  forEachPartitionShard(partitionRoot, options, (shard) => out.push(shard));
+  return out;
+}
+
+/** A throw of a record visitor, told apart from a failure to read the shard. */
+class VisitorFailure {
+  constructor(readonly cause: unknown) {}
+}
+
+/** Where one shard of a partition sits, before its records are read. */
+export interface PartitionShardHead {
+  /** Partition-relative path, `/`-separated. */
+  readonly rel: string;
+  readonly device: string;
+  readonly stream: StoreStream;
+}
+
+/** What a streamed read of one shard saw, without its records. */
+export interface PartitionShardTotals extends PartitionShardHead {
+  /** Verified records, pending ones included. */
+  readonly count: number;
+  /** Records whose body is a blob that has not arrived yet. */
+  readonly pending: number;
+  /** The id of the last verified record, in file order; null for none. */
+  readonly last: string | null;
+  /** Bytes after the last verified line that the reader held back. */
+  readonly heldTailBytes: number;
+}
+
+/** What {@link forEachPartitionRecord} hands on. */
+export interface PartitionRecordVisitor {
+  /** Each verified record, in file order; `pending` when its body is a blob not arrived. */
+  readonly record?: (shard: PartitionShardHead, record: StoreRecord, pending: boolean) => void;
+  /** Each shard read to its end, after its records (and after an `incomplete` report). */
+  readonly shard?: (totals: PartitionShardTotals) => void;
+}
+
+/**
+ * {@link readPartition} one shard at a time, in the same order (sorted by
+ * relative path): `onShard` gets each shard as it is read and the read
+ * keeps none of them, so a caller that needs only some of each shard's
+ * records (their ids and checksums, the marked ones) never holds the
+ * whole partition at once.
+ */
+export function forEachPartitionShard(
+  partitionRoot: string,
+  options: ReadPartitionOptions,
+  onShard: (shard: PartitionShard) => void,
+): void {
+  let all: StoreRecord[] = [];
+  let records: StoreRecord[] = [];
+  let pending: StoreRecord[] = [];
+  let at: string | null = null;
+  forEachPartitionRecord(partitionRoot, options, {
+    record: (head, record, isPending) => {
+      // A shard whose read failed part way is never handed on: its
+      // records so far are dropped with the next shard's first record.
+      if (at !== head.rel) {
+        all = [];
+        records = [];
+        pending = [];
+        at = head.rel;
+      }
+      all.push(record);
+      (isPending ? pending : records).push(record);
+    },
+    shard: (totals) => {
+      const mine = at === totals.rel;
+      onShard({
+        rel: totals.rel,
+        device: totals.device,
+        stream: totals.stream,
+        all: mine ? all : [],
+        records: mine ? records : [],
+        pending: mine ? pending : [],
+        heldTailBytes: totals.heldTailBytes,
+      });
+      all = [];
+      records = [];
+      pending = [];
+      at = null;
+    },
+  });
+}
+
+/**
+ * The partition read one RECORD at a time, in {@link readPartition}'s
+ * order: the read keeps no record, not even one shard's. A store's busiest
+ * shard (this device's `log` shard of the month it migrated) can hold
+ * every record a migration imported, so a caller that needs only part of
+ * each record (an id and checksum, a mark, a device's newest clock) reads
+ * the store in memory that does not grow with it.
+ *
+ * The shards the read cannot see in full are reported as
+ * {@link forEachPartitionShard} reports them. A shard whose read fails
+ * part way (an I/O error) has handed on the records before the failure
+ * and is then named unreadable; its `shard` call never comes. A throw of
+ * the visitor itself is no unreadable shard: it ends the walk and reaches
+ * the caller as it was thrown.
+ */
+export function forEachPartitionRecord(
+  partitionRoot: string,
+  options: ReadPartitionOptions,
+  visit: PartitionRecordVisitor,
+): void {
   const listed: string[] = [];
   const compactions: Compaction[] = [];
+  const listing: Array<{
+    readonly ref: StreamRef & { stream: StoreStream };
+    readonly shard: ReturnType<typeof listShards>[number];
+  }> = [];
   for (const ref of streamRefs(partitionRoot)) {
-    for (const shard of listShards(partitionRoot, ref)) {
-      listed.push(shard.rel);
-      let read: ReturnType<typeof readShard>;
-      try {
-        read = readShard(shard.path, { partitionRoot });
-      } catch (error) {
-        if (options.onUnreadable === undefined) throw error;
-        options.onUnreadable({ rel: shard.rel, path: shard.path, error });
-        continue;
-      }
-      // A link or special file under a shard name holds no record here; the
-      // caller that asks hears of it rather than seeing an empty shard.
-      const notAFile = read.diagnostics.find((d) => d.kind === "not-a-file");
-      if (notAFile !== undefined && options.onUnreadable !== undefined) {
-        options.onUnreadable({
-          rel: shard.rel,
-          path: shard.path,
-          error: new Error(notAFile.reason),
-        });
-        continue;
-      }
-      const gap = shardReadGap(read);
-      if (gap !== null) {
-        options.onUnreadable?.({
-          rel: shard.rel,
-          path: shard.path,
-          error: new Error(`the shard was read only in part: ${gap}`),
-          incomplete: true,
-        });
-      }
-      compactions.push(...read.compactions);
-      const all = read.records.map((r) => r.record);
-      out.push({
+    for (const shard of listShards(partitionRoot, ref)) listing.push({ ref, shard });
+  }
+  listing.sort((a, b) => compareCodeUnits(a.shard.rel, b.shard.rel));
+  for (const { ref, shard } of listing) {
+    listed.push(shard.rel);
+    if (options.reuse?.(shard) === true) continue;
+    const head: PartitionShardHead = { rel: shard.rel, device: shard.device, stream: ref.stream };
+    let count = 0;
+    let pending = 0;
+    let last: string | null = null;
+    let read: ShardScan;
+    try {
+      read = scanShard(shard.path, { partitionRoot }, (r) => {
+        count += 1;
+        if (r.bodyState === "pending") pending += 1;
+        last = r.record.id;
+        // Each record parsed is garbage at once (`gc-hint.ts`).
+        gcHintTick();
+        try {
+          visit.record?.(head, r.record, r.bodyState === "pending");
+        } catch (error) {
+          throw new VisitorFailure(error);
+        }
+      });
+    } catch (error) {
+      // The caller's own failure (a scratch write that could not be made)
+      // is never a shard this machine cannot read: it ends the walk.
+      if (error instanceof VisitorFailure) throw error.cause;
+      if (options.onUnreadable === undefined) throw error;
+      options.onUnreadable({ rel: shard.rel, path: shard.path, error });
+      continue;
+    }
+    // A link or special file under a shard name holds no record here; the
+    // caller that asks hears of it rather than seeing an empty shard.
+    const notAFile = read.diagnostics.find((d) => d.kind === "not-a-file");
+    if (notAFile !== undefined && options.onUnreadable !== undefined) {
+      options.onUnreadable({
         rel: shard.rel,
-        device: shard.device,
-        stream: ref.stream,
-        all,
-        records: read.records.filter((r) => r.bodyState !== "pending").map((r) => r.record),
-        pending: read.records.filter((r) => r.bodyState === "pending").map((r) => r.record),
-        heldTailBytes: read.pendingTailBytes,
+        path: shard.path,
+        error: new Error(notAFile.reason),
+      });
+      continue;
+    }
+    const gap = shardScanGap(read);
+    if (gap !== null) {
+      options.onUnreadable?.({
+        rel: shard.rel,
+        path: shard.path,
+        error: new Error(`the shard was read only in part: ${gap}`),
+        incomplete: true,
       });
     }
+    compactions.push(...read.compactions);
+    visit.shard?.({ ...head, count, pending, last, heldTailBytes: read.pendingTailBytes });
   }
+  // Shards the caller reused were not read, so their compactions are not
+  // known: a reusing read names nothing as missing.
+  if (options.reuse !== undefined) return;
   for (const rel of trackSeenShards(
     partitionRoot,
     { prefix: "" },
@@ -213,7 +360,30 @@ export function readPartition(
       error: new Error(SEEN_SHARD_MISSING_REASON),
     });
   }
-  return out.toSorted((a, b) => compareCodeUnits(a.rel, b.rel));
+}
+
+/**
+ * The cut of a partition ({@link computeCut} of {@link readPartition}),
+ * read one record at a time: only each shard's count, last id and pending
+ * count are kept.
+ */
+export function readPartitionCut(
+  partitionRoot: string,
+  options: ReadPartitionOptions = {},
+): CutEntry[] {
+  const cut: CutEntry[] = [];
+  forEachPartitionRecord(partitionRoot, options, {
+    shard: (totals) => {
+      if (totals.stream === DIGEST_STREAM || totals.count === 0 || totals.last === null) return;
+      cut.push({
+        shard: totals.rel,
+        count: totals.count,
+        last: totals.last,
+        pending: totals.pending,
+      });
+    },
+  });
+  return cut.toSorted((a, b) => compareCodeUnits(a.shard, b.shard));
 }
 
 /** The shards a cut covers: every stream but the digests. */
@@ -278,16 +448,81 @@ export type PublishDigestResult =
   | { readonly published: true; readonly body: DigestBody; readonly append: AppendResult }
   | { readonly published: false; readonly body: DigestBody; readonly reason: "unchanged" };
 
-function latestOwnDigest(
-  shards: ReadonlyArray<PartitionShard>,
+/** Whether a digested fold (`foldHashes`) reads `record` at all. */
+function isDigestFoldInput(record: StoreRecord): boolean {
+  return DIGEST_FOLD_KINDS.has(record.kind) || isTopicRecordKind(record.kind);
+}
+
+const DIGEST_FOLD_KINDS: ReadonlySet<string> = new Set([
+  PREFERENCE_SET_KIND,
+  PREFERENCE_REMOVE_KIND,
+  PREFERENCE_EVIDENCE_KIND,
+  PINNED_SET_KIND,
+  PINNED_CLEAR_KIND,
+  SETTING_SET_KIND,
+  SETTING_UNSET_KIND,
+  SETTING_ENTRY_KIND,
+]);
+
+/**
+ * What a digest of the partition at `partitionRoot` is made of, read
+ * record by record ({@link forEachPartitionRecord}): the cut
+ * ({@link computeCut}), the records the digested folds read of the shards
+ * the cut covers (the same folds as {@link buildDigestBody}, which keeps
+ * every record), `device`'s latest digest, and the newest record read.
+ */
+function readDigestInputs(
+  partitionRoot: string,
   device: string,
-): StoreRecord | null {
-  const own = shards
-    .filter((shard) => shard.stream === DIGEST_STREAM && shard.device === device)
-    .flatMap((shard) => shard.records)
-    .filter((record) => record.kind === STATE_DIGEST_KIND)
-    .toSorted(compareRecords);
-  return own.at(-1) ?? null;
+): {
+  cut: CutEntry[];
+  covered: StoreRecord[];
+  latestOwn: StoreRecord | null;
+  newest: StoreRecord | undefined;
+} {
+  const cut: CutEntry[] = [];
+  const covered: StoreRecord[] = [];
+  let latestOwn: StoreRecord | null = null;
+  let newest: StoreRecord | undefined;
+  let kept: StoreRecord[] = [];
+  let at: string | null = null;
+  forEachPartitionRecord(
+    partitionRoot,
+    {},
+    {
+      record: (head, record, pending) => {
+        if (at !== head.rel) {
+          kept = [];
+          at = head.rel;
+        }
+        if (newest === undefined || compareRecords(record, newest) > 0) newest = record;
+        if (head.stream === DIGEST_STREAM) {
+          const own = head.device === device && !pending && record.kind === STATE_DIGEST_KIND;
+          if (own && (latestOwn === null || compareRecords(record, latestOwn) > 0)) {
+            latestOwn = record;
+          }
+          return;
+        }
+        if (!pending && isDigestFoldInput(record)) kept.push(record);
+      },
+      shard: (totals) => {
+        const mine = at === totals.rel;
+        if (totals.stream !== DIGEST_STREAM && totals.count > 0 && totals.last !== null) {
+          cut.push({
+            shard: totals.rel,
+            count: totals.count,
+            last: totals.last,
+            pending: totals.pending,
+          });
+          if (mine) covered.push(...kept);
+        }
+        kept = [];
+        at = null;
+      },
+    },
+  );
+  cut.sort((a, b) => compareCodeUnits(a.shard, b.shard));
+  return { cut, covered, latestOwn, newest };
 }
 
 /**
@@ -301,9 +536,14 @@ export function publishStateDigest(
   options: PublishDigestOptions,
 ): PublishDigestResult {
   const now = options.now ?? (() => Date.now());
-  const shards = readPartition(partitionDir(store.root, options.partition));
-  const body = buildDigestBody(options.partition, shards);
-  const latest = latestOwnDigest(shards, store.device);
+  const read = readDigestInputs(partitionDir(store.root, options.partition), store.device);
+  const body: DigestBody = {
+    partition: options.partition,
+    cut: read.cut,
+    cut_hash: cutHash(read.cut),
+    folds: foldHashes(read.covered),
+  };
+  const latest = read.latestOwn;
   if (latest !== null) {
     const age = now() - parseHlc(latest.hlc)!.physical;
     const same =
@@ -313,13 +553,7 @@ export function publishStateDigest(
       return { published: false, body, reason: "unchanged" };
     }
   }
-  // The newest record by fold order: one linear scan, no sort.
-  let newest: StoreRecord | undefined;
-  for (const shard of shards) {
-    for (const record of shard.all) {
-      if (newest === undefined || compareRecords(record, newest) > 0) newest = record;
-    }
-  }
+  const newest = read.newest;
   if (newest !== undefined) {
     observeClock(store.deviceStateDir, store.device, parseHlc(newest.hlc)!, now);
   }

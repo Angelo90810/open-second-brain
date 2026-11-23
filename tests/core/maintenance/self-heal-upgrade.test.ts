@@ -11,7 +11,7 @@
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import { bootstrapBrain } from "../../../src/core/brain/init.ts";
@@ -25,6 +25,8 @@ import {
   migrationGatePath,
   releaseMigrationGate,
 } from "../../../src/core/migration-gate.ts";
+import * as gateModule from "../../../src/core/migration-gate.ts";
+import { treeSnapshot } from "../../helpers/vault-digest.ts";
 import {
   ensureVaultCurrent,
   SELF_HEAL_UPGRADE_SPAWN,
@@ -39,9 +41,12 @@ import {
   claimSelfHealUpgradeLock,
   selfHealUpgradeMarkerPath,
   readSelfHealUpgradeFailure,
+  readSelfHealUpgradeLock,
+  selfHealUpgradeLockAdvice,
   releaseSelfHealUpgradeLock,
   selfHealUpgradeLockPath,
   SELF_HEAL_UPGRADE_BASE_COOLDOWN_MS,
+  SELF_HEAL_UPGRADE_HANDOVER_GRACE_MS,
 } from "../../../src/core/maintenance/self-heal-upgrade-state.ts";
 import { runCli } from "../../helpers/run-cli.ts";
 import { waitForSelfHealChildren } from "../../helpers/self-heal-children.ts";
@@ -189,8 +194,12 @@ describe("a migration holding the gate", () => {
     makeManualStale();
     holdMigrationGate(vault, "migrate-run");
     try {
+      // With modification times: the lock's claim and release would leave
+      // the per-vault state folder touched even with no file left behind.
+      const before = treeSnapshot(vault, { mtime: true });
       const run = runSelfHealUpgrade(vault, { now: T0 });
       expect(run.outcome).toBe(SELF_HEAL_UPGRADE_OUTCOME.running);
+      expect(treeSnapshot(vault, { mtime: true })).toEqual(before);
       expect(readSelfHealUpgradeFailure(vault)).toBeNull();
       expect(upgradeRows()).toEqual([]);
     } finally {
@@ -199,8 +208,53 @@ describe("a migration holding the gate", () => {
   });
 });
 
+describe("a gate closed between the upgrade's own check and its lock claim", () => {
+  test("the upgrade answers the quiet gate outcome, not a failed lock", () => {
+    makeManualStale();
+    // The check before the claim saw no gate; the gate is closed by the time
+    // the claim asks.
+    const check = spyOn(gateModule, "migrationGateRefusal").mockReturnValueOnce(null);
+    holdMigrationGate(vault, "migrate-run");
+    try {
+      const run = runSelfHealUpgrade(vault, { now: T0 });
+      expect(run.outcome).toBe(SELF_HEAL_UPGRADE_OUTCOME.running);
+      expect(readSelfHealUpgradeFailure(vault)).toBeNull();
+    } finally {
+      check.mockRestore();
+      releaseMigrationGate(vault, "migrate-run");
+    }
+  });
+
+  test("a start answers skipped_migration_gate, not an upgrade error", async () => {
+    makeManualStale();
+    // The gate is closed at the very moment of the claim: every earlier
+    // check of this start saw it open, and the claim's own check refuses.
+    const real = gateModule.assertNoMigrationInProgress;
+    const atClaim = spyOn(gateModule, "assertNoMigrationInProgress").mockImplementation(
+      (target: string) => {
+        if (new Error().stack?.includes("claimSelfHealUpgradeLock") === true) {
+          throw new gateModule.MigrationInProgressError({
+            vault: target,
+            run_id: "migrate-run",
+            since: "2026-11-19T10:00:00Z",
+            pid: process.pid,
+          });
+        }
+        real(target);
+      },
+    );
+    try {
+      const r = await ensureVaultCurrent(vault, { background: true, configPath });
+      expect(r.brainUpgradeSpawn).toBe(SELF_HEAL_UPGRADE_SPAWN.skippedMigrationGate);
+      expect(r.errors.filter((e) => e.includes("brain-upgrade"))).toEqual([]);
+    } finally {
+      atClaim.mockRestore();
+    }
+  });
+});
+
 describe("a migration whose holder is gone", () => {
-  test("a gate left by a stopped run is a failure with the resume command, not running", () => {
+  test("a gate left by a stopped run writes nothing, and the outcome says why", () => {
     makeManualStale();
     // A run killed with the gate closed: its holder is a process that ended.
     const gone = spawnSync(process.execPath, ["-e", ""]).pid!;
@@ -210,11 +264,15 @@ describe("a migration whose holder is gone", () => {
       JSON.stringify({ vault: resolve(vault), run_id: "migrate-run", since: "", pid: gone }),
     );
     try {
+      const before = treeSnapshot(vault, { mtime: true });
       const run = runSelfHealUpgrade(vault, { now: T0 });
-      expect(run.outcome).toBe(SELF_HEAL_UPGRADE_OUTCOME.failed);
-      // The marker is the record: the closed gate refuses the metrics row
-      // like every other write to the vault.
-      expect(readSelfHealUpgradeFailure(vault)?.error).toContain("--resume");
+      // The gate refuses every write into the vault, the failure marker and
+      // the worker lock included: the run that stopped is what to continue.
+      expect(run.outcome).toBe(SELF_HEAL_UPGRADE_OUTCOME.migrationStopped);
+      expect(run.error).toContain("stopped without finishing");
+      expect(run.error).toContain("--resume");
+      expect(treeSnapshot(vault, { mtime: true })).toEqual(before);
+      expect(readSelfHealUpgradeFailure(vault)).toBeNull();
     } finally {
       rmSync(migrationGatePath(), { force: true });
     }
@@ -515,5 +573,162 @@ describe("the worker applies the plan it computed", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+/** The pid of a process that has ended: spawned, reaped, gone. */
+async function deadPid(): Promise<number> {
+  const child = Bun.spawn([process.execPath, "-e", ""], {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  await child.exited;
+  return child.pid;
+}
+
+/** A claim file as a release writes it, or as sync brought it from another machine. */
+function plantClaim(text: string): void {
+  const path = selfHealUpgradeLockPath(vault);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, text);
+}
+
+function claimRecord(fields: { pid: number; host?: string; worker: boolean }): string {
+  return JSON.stringify({
+    token: "b".repeat(32),
+    pid: fields.pid,
+    host: fields.host ?? hostname(),
+    since: new Date().toISOString(),
+    worker: fields.worker,
+  });
+}
+
+describe("the worker lock in a vault the file sync shares", () => {
+  test("a claim another machine made holds nothing here, and is taken over", () => {
+    // Its pid is alive here only by chance: this test process.
+    plantClaim(claimRecord({ pid: process.pid, host: "another-machine", worker: true }));
+
+    expect(readSelfHealUpgradeLock(vault, new Date())).toMatchObject({
+      kind: "other-device",
+      held: false,
+    });
+    makeManualStale();
+    expect(runSelfHealUpgrade(vault).outcome).toBe(SELF_HEAL_UPGRADE_OUTCOME.applied);
+    expect(existsSync(selfHealUpgradeLockPath(vault))).toBe(false);
+  });
+
+  test("a claim of this machine whose process is gone holds nothing", async () => {
+    plantClaim(claimRecord({ pid: await deadPid(), worker: true }));
+
+    expect(readSelfHealUpgradeLock(vault, new Date())).toMatchObject({ kind: "gone", held: false });
+    const token = claimSelfHealUpgradeLock(vault, new Date());
+    expect(token).not.toBeNull();
+    releaseSelfHealUpgradeLock(vault, token!);
+  });
+
+  test("a claim handed to a worker holds while the worker starts, and not past the grace", async () => {
+    // The start that claimed has exited; the worker has not stamped yet.
+    plantClaim(claimRecord({ pid: await deadPid(), worker: false }));
+
+    expect(readSelfHealUpgradeLock(vault, new Date()).held).toBe(true);
+    const late = new Date(Date.now() + SELF_HEAL_UPGRADE_HANDOVER_GRACE_MS + 5_000);
+    expect(readSelfHealUpgradeLock(vault, late)).toMatchObject({ kind: "gone", held: false });
+    rmSync(selfHealUpgradeLockPath(vault));
+  });
+
+  test("the worker a claim was handed to stamps itself as its holder", () => {
+    makeManualStale();
+    const token = claimSelfHealUpgradeLock(vault, new Date(), { handed: true });
+    expect(token).not.toBeNull();
+    expect(JSON.parse(readFileSync(selfHealUpgradeLockPath(vault), "utf8")).worker).toBe(false);
+
+    expect(runSelfHealUpgrade(vault, { lockToken: token! }).outcome).toBe(
+      SELF_HEAL_UPGRADE_OUTCOME.applied,
+    );
+    const stamped = JSON.parse(readFileSync(selfHealUpgradeLockPath(vault), "utf8"));
+    expect([stamped.token, stamped.pid, stamped.worker]).toEqual([token, process.pid, true]);
+    releaseSelfHealUpgradeLock(vault, token!);
+  });
+
+  test("a claim that is there but cannot be read is held, never taken over as absent", () => {
+    // A directory where the claim file belongs: the stat succeeds, the read fails.
+    mkdirSync(selfHealUpgradeLockPath(vault), { recursive: true });
+
+    expect(readSelfHealUpgradeLock(vault, new Date())).toMatchObject({
+      kind: "unknown",
+      held: true,
+    });
+    expect(claimSelfHealUpgradeLock(vault, new Date())).toBeNull();
+    // Past the staleness ceiling it is stale, as a bare token is: an hour-old
+    // claim nobody can attribute never blocks the upgrade for good.
+    const later = new Date(Date.now() + 2 * HOUR);
+    expect(readSelfHealUpgradeLock(vault, later)).toMatchObject({ kind: "unknown", held: false });
+    rmSync(selfHealUpgradeLockPath(vault), { recursive: true });
+  });
+
+  test("a worker that cannot stamp its handed claim upgrades nothing and leaves it retryable", () => {
+    makeManualStale();
+    const token = claimSelfHealUpgradeLock(vault, new Date(), { handed: true });
+    expect(token).not.toBeNull();
+    const refused = spyOn(gateModule, "assertNoMigrationInProgress").mockImplementation(() => {
+      throw new Error("disk full");
+    });
+    try {
+      const run = runSelfHealUpgrade(vault, { lockToken: token! });
+
+      expect(run.outcome).toBe(SELF_HEAL_UPGRADE_OUTCOME.running);
+      expect(planUpgrade(vault).pending).toBe(1);
+      expect(readSelfHealUpgradeFailure(vault)).toBeNull();
+    } finally {
+      refused.mockRestore();
+      releaseSelfHealUpgradeLock(vault, token!);
+    }
+  });
+
+  test("a live process's claim past the ceiling is said to run, and to be taken over", () => {
+    // This test process is alive; its claim is two hours old.
+    plantClaim(claimRecord({ pid: process.pid, worker: true }));
+    const holder = readSelfHealUpgradeLock(vault, new Date(Date.now() + 2 * HOUR));
+    expect(holder).toMatchObject({ kind: "stale", held: false });
+
+    const advice = selfHealUpgradeLockAdvice(holder);
+    expect(advice).toContain(`process ${process.pid} of this machine still runs`);
+    expect(advice).toContain(
+      "older than the one-hour ceiling, so the next start takes the lock over",
+    );
+    expect(advice).toContain("do not remove the file while it runs");
+    expect(advice).not.toContain("holds nothing");
+    rmSync(selfHealUpgradeLockPath(vault));
+  });
+
+  test("a lock whose age cannot be read promises no expiry, and says to check access", () => {
+    const base = {
+      kind: "unknown" as const,
+      held: true,
+      path: selfHealUpgradeLockPath(vault),
+      pid: null,
+      host: null,
+      since: null,
+    };
+    const advice = selfHealUpgradeLockAdvice({ ...base, ageMs: null });
+    expect(advice).toContain("its age, and when it would expire, cannot be told");
+    expect(advice).toContain("check this user's access to the file");
+    expect(advice).not.toContain("an hour");
+    // With a known age the hour rule is still what it says.
+    expect(selfHealUpgradeLockAdvice({ ...base, ageMs: 1000 })).toContain(
+      "until an hour after it was written",
+    );
+  });
+
+  test("an older release's bare token keeps the age rule it always had", () => {
+    plantClaim("c".repeat(32));
+
+    expect(readSelfHealUpgradeLock(vault, new Date())).toMatchObject({
+      kind: "unknown",
+      held: true,
+    });
+    expect(readSelfHealUpgradeLock(vault, new Date(Date.now() + 2 * HOUR)).held).toBe(false);
+    rmSync(selfHealUpgradeLockPath(vault));
   });
 });

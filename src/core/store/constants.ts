@@ -34,6 +34,7 @@ export const STORE_STREAMS = Object.freeze([
   "topics",
   "settings",
   "digests",
+  "dream-work",
 ] as const);
 export type StoreStream = (typeof STORE_STREAMS)[number];
 
@@ -211,11 +212,18 @@ export const SETTING_VIEW_LANGUAGE = "view.language";
 export const SETTING_TOPIC_MIN_RECORDS = "topics.new_min_records";
 export const SETTING_TOPIC_MIN_SESSIONS = "topics.new_min_sessions";
 export const SETTING_TOPIC_QUIET_DAYS = "topics.quiet_days";
+/**
+ * Days without evidence of life after which a migration cohort device that
+ * has not switched counts as retired (change stale-device-retirement); 0
+ * turns the rule off.
+ */
+export const SETTING_SILENT_DEVICE_DAYS = "migration.silent_device_days";
 export const SETTING_KEYS = Object.freeze([
   SETTING_VIEW_LANGUAGE,
   SETTING_TOPIC_MIN_RECORDS,
   SETTING_TOPIC_MIN_SESSIONS,
   SETTING_TOPIC_QUIET_DAYS,
+  SETTING_SILENT_DEVICE_DAYS,
 ] as const);
 export type SettingKey = (typeof SETTING_KEYS)[number];
 

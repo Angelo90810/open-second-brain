@@ -405,9 +405,9 @@ export const BRAIN_LOG_EVENT_KIND = {
   /**
    * `decision-record` (Belief lifecycle suite, Track B anchor, t_ac03214d)
    * - a first-class decision note was captured under `Brain/decisions/`.
-   * Payload carries the `decision` wikilink, the `chosen` option, the
-   * `review_date`, whether a review `obligation` was opened, and the
-   * `agent`. One event per capture; re-capturing an existing decision
+   * Payload carries the `decision` wikilink, the decision's `title`, the
+   * `chosen` option, the `review_date`, whether a review `obligation` was
+   * opened, and the `agent`. One event per capture; re-capturing an existing decision
    * slug rejects instead of double-logging.
    */
   decisionRecord: "decision-record",
@@ -452,7 +452,8 @@ export const BRAIN_LOG_EVENT_KIND = {
    * `decision-resolved` (write-side-trust wave, Task 10) - an open
    * decision was closed by choosing one of its options, minting a real
    * `type: decision` page. Payload carries the `open` wikilink, the
-   * minted `decision` wikilink, the `choice`, and the `agent`. The
+   * minted `decision` wikilink, the question's `title`, the `choice`, and
+   * the `agent`. The
    * minted page itself carries the usual `decision-record` event; this
    * event records the transition so the open record's history stays in
    * the merged timeline.
@@ -1397,8 +1398,8 @@ export interface BrainMergeLogEvent extends BrainLogEventBase {
 /**
  * `upgrade` entry — operator ran `o2b brain upgrade --apply`.
  * Payload carries the upgrade run id (`upgrade-<ts>`), agent
- * identity, the pre-apply snapshot path, and the vault-relative
- * paths of every managed file the run rewrote.
+ * identity, the vault-relative path of the pre-apply snapshot, and
+ * the vault-relative paths of every managed file the run rewrote.
  */
 export interface BrainUpgradeLogEvent extends BrainLogEventBase {
   readonly kind: typeof BRAIN_LOG_EVENT_KIND.upgrade;
@@ -1938,6 +1939,17 @@ export interface BrainGuardrailConfig {
  * guardrails, which govern fact visibility — this only categorizes
  * freshly-recorded feedback signals.
  */
+/**
+ * Optional `quote_check:` block: the mode of each answer-time quote check
+ * phase (`off`, `shadow` or `enforce`). A phase left out takes the
+ * resolver's default.
+ */
+export interface BrainQuoteCheckConfig {
+  readonly recall?: "off" | "shadow" | "enforce";
+  readonly active?: "off" | "shadow" | "enforce";
+  readonly subagent?: "off" | "shadow" | "enforce";
+}
+
 export interface BrainFeedbackConfig {
   /**
    * Default scope applied to `brain_feedback` / `o2b brain feedback`
@@ -2117,6 +2129,11 @@ export interface BrainConfig {
    * per-call scope. Absent: scope-less calls stay scope-less.
    */
   readonly feedback?: BrainFeedbackConfig;
+  /**
+   * Optional `quote_check:` block. The per-phase modes of the answer-time
+   * quote check. Absent: every phase takes the resolver's default.
+   */
+  readonly quote_check?: BrainQuoteCheckConfig;
   /**
    * Optional `hygiene:` block (continuity-hygiene-freshness suite).
    * Tunes the hygiene pipeline: the external conflict-resolver command

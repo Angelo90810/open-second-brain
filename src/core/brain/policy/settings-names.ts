@@ -15,11 +15,12 @@
  */
 
 import { SETTING_RULES } from "../../store/fold-settings.ts";
-import { SETTING_VIEW_LANGUAGE } from "../../store/constants.ts";
+import { SETTING_SILENT_DEVICE_DAYS, SETTING_VIEW_LANGUAGE } from "../../store/constants.ts";
 import {
   parsePermissionsDocumentText,
   PERMISSIONS_DOCUMENT_SETTING,
 } from "../permissions/document.ts";
+import { invalidVaultMapValue, VAULT_MAP_SETTING } from "../portability/vault-map-document.ts";
 import { DEFAULT_VIEW_LANGUAGE, isViewLanguage, VIEW_LANGUAGES } from "../../view/i18n.ts";
 import { DEFAULT_BRAIN_CONFIG } from "./defaults.ts";
 import { brainConfigKey, brainKeyHome, brainSettingKey } from "./settings-keys.ts";
@@ -98,6 +99,27 @@ export const STORE_NATIVE_SETTINGS: Readonly<Record<string, StoreNativeSetting>>
       }
     },
     default: null,
+    operatorOnly: true,
+  },
+  // The vault map of a store-only machine (`_vault-map.yaml` once
+  // switched): the role tokens' folder names, as the file's text.
+  // Operator-only, as the file was: an agent never wrote it, and a token
+  // pointed elsewhere moves what the note walk and graph import read.
+  [VAULT_MAP_SETTING]: {
+    invalid: invalidVaultMapValue,
+    default: null,
+    operatorOnly: true,
+  },
+  // Days without evidence of life after which a cohort device counts as
+  // retired, so the legacy tree may leave the vault (change
+  // stale-device-retirement). Operator-only: lowering it lets a removal
+  // pass that the owner did not mean.
+  [SETTING_SILENT_DEVICE_DAYS]: {
+    invalid: (value: unknown) =>
+      SETTING_RULES[SETTING_SILENT_DEVICE_DAYS].valid(value)
+        ? null
+        : `${SETTING_SILENT_DEVICE_DAYS} must be ${SETTING_RULES[SETTING_SILENT_DEVICE_DAYS].expected}`,
+    default: SETTING_RULES[SETTING_SILENT_DEVICE_DAYS].fallback,
     operatorOnly: true,
   },
 });

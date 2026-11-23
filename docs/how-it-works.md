@@ -85,8 +85,8 @@ A preference moves between five states from first signal to retirement:
 stateDiagram-v2
     [*] --> Inbox: brain_feedback
     Inbox --> Unconfirmed: dream (≥candidate_threshold<br/>same-sign signals on topic)
-    Unconfirmed --> Confirmed: brain_apply_evidence applied<br/>(first such event)
-    Unconfirmed --> Retired_Expired: dream (now > unconfirmed_until,<br/>no applied evidence)
+    Unconfirmed --> Confirmed: brain_apply_evidence applied<br/>(event time ≤ unconfirmed_until)
+    Unconfirmed --> Retired_Expired: dream (now > unconfirmed_until,<br/>no qualifying applied evidence)
     Confirmed --> Quarantine: dream (violated_count ≥ applied_count<br/>AND applied_count > low_max_applied)
     Quarantine --> Confirmed: dream (applied_count > violated_count)
     Quarantine --> Retired_Quarantine: dream (one further violated)
@@ -192,7 +192,7 @@ Four independent paths land a signal in `Brain/inbox/`:
 - **Live** - the agent calls `brain_feedback` (MCP) or `o2b brain feedback` (CLI) the moment the rule is formulated. This is the path the end-to-end sequence above documents.
 - **Inline** - the user (or agent) writes an `@osb` marker into any vault Markdown file. `o2b brain scan-inline` finds every marker, creates the corresponding signal, and annotates the source file with `@osb✓ [[sig-...]]` so a re-run is a no-op. Two marker shapes: a single line `@osb feedback negative topic=... principle="..."` or a fenced ` ```osb` block with YAML inside.
 - **Session import** - `o2b brain import-session <path>` reads a Claude Code / Codex CLI / Hermes session JSONL and extracts both `@osb` markers from message text and replays of `brain_feedback` tool-use calls. Useful when MCP was not available at recording time or the agent did not make the call live. Since v1.50.0 the same verb also sweeps the machine: `--status` reports per-runtime coverage over the session roots this build declares, `--discover` lists the logs that have never been imported, and `--discover --all` imports them through the same code path a named path takes. A content-digest ledger under `<vault>/.open-second-brain/` keeps a re-run from re-parsing a log whose bytes have not changed.
-- **Lifecycle hook** - Claude Code / Codex hooks call `o2b brain session-hook` through `hooks/session-capture.ts`. `UserPromptSubmit` prompt markers and `PostToolUse` `brain_feedback` inputs are captured immediately through the same signal dedup hash, while SessionStart / Stop / SessionEnd / PostCompact observations append non-blocking lifecycle audit/log rows.
+- **Lifecycle hook** - Claude Code / Codex hooks call `o2b brain session-hook` through `hooks/session-capture.ts`. `UserPromptSubmit` prompt markers and `PostToolUse` `brain_feedback` inputs are captured immediately through the same signal dedup hash, while SessionStart / Stop / SessionEnd / PostCompact observations append non-blocking lifecycle audit/log rows. The PostToolUse replay takes the tool under the name the host gives it (`brain_feedback`, or `mcp__<server>__brain_feedback` and `<server>__brain_feedback` for an MCP tool; the plugin's matcher is `(^|__)brain_feedback$`) and skips a call the host reports as failed. A payload creates a signal when its `tool_input` passes the `brain_feedback` validation (topic, a `positive` or `negative` sign, a principle that passes the quality gate) and the session is captured; it counts as deduped when a signal with the same hash (topic, sign, principle, scope) already exists in the inbox, processed or archived signals, on either layout.
 
 Session capture is role-filterable (since v0.37.0): `session_capture_roles`
 in the config (comma-separated subset of `user,assistant,system,tool,meta`)
@@ -214,7 +214,7 @@ current-intention chains live at `Brain/intentions/<scope>.md`
 update bumps `version` and appends the superseded text to an in-file history
 trail, and `move` retires the chain into `Brain/intentions/history/`.
 
-All four paths share a normalised payload hash so the same rule captured twice from different surfaces dedups automatically. Pinned preferences are exempt from automatic retire (`stale-no-evidence`, `expired-unconfirmed`, `rebutted`); only `o2b brain reject` can retire them.
+All four paths share a normalised payload hash (topic, sign, principle, scope) so the same rule captured twice from different surfaces dedups automatically: the live call stamps the hash on the signal it writes, and a replay of that call by the lifecycle hook or a session import, or the same rule written as a marker, is counted as deduped instead of written again. The live path itself does not dedup: an explicit `brain_feedback` or `o2b brain feedback` call with the principle of an existing signal records one more signal, because each explicit call is one more observation of the rule (a retried call that carries the same `idempotency_key` is the exception and writes nothing). Pinned preferences are exempt from automatic retire (`stale-no-evidence`, `expired-unconfirmed`, `rebutted`); only `o2b brain reject` can retire them.
 
 Session mining has a memory of its own (since v1.86.0). When `o2b brain extract-signals` (or the `brain_extract_signals` tool) commits a mine that ends with nothing written and nothing staged - an empty answer, every item already deduped, every item refused by the durability gate, or any mix - it records a zero-yield tombstone for the session in a mining ledger beside the import ledger, keyed on a SHA-256 of the mined turn material (turn id, text, timestamp). The next plan over that session returns the recorded breakdown instead of an envelope, so an unchanged transcript is never re-offered to the model; a re-import that changes the turns changes the hash and re-opens the session with no clearing step. Because removing a downstream preference does not change a session's turns, the tombstone never lifts on its own: `--force` (MCP `force`) bypasses the gate for exactly one plan call when the session should be re-proposed. A commit that succeeds but cannot record its tombstone still succeeds and names the failure, so a ledger that stopped being written is never a silent fact.
 
@@ -230,11 +230,11 @@ are both explicit.
 
 When coding work happens in a project directory that is not the vault itself, add a pointer snippet to your project's `CLAUDE.md` or `AGENTS.md` so the agent knows where to read preferences from. The canonical snippet, the rules for multi-device Syncthing setups, and the `o2b brain set-primary` invocation are in [`cross-project-pointer.md`](cross-project-pointer.md).
 
-A vault shared across hosts should declare a single `primary_agent` in `Brain/_brain.yaml` - the runtime that owns the dream cron. Dream runs from a different agent emit a non-fatal warning (stderr for CLI, `warnings` array for MCP) and tag the dream summary log with `non_primary_agent: <caller>`.
+A vault shared across hosts has one dream owner: one agent installation on one device, recorded in the brain store and shown by `o2b dream owner` (MCP `brain_dream_owner`). The installation that creates the brain becomes it; `o2b dream owner --here` moves it (on another device as a request the owner's device releases the next time it looks). On every other device a live dream pass is refused with `dream_not_owner` before anything is asked or written, and a dry run still answers. A brain from before the dream owner has no owner record and runs as before: a live pass from any device, with the non-fatal `non-primary-dream-run` warning when a declared `primary_agent` differs from the caller, until it is adopted with `o2b dream owner --here`. The walkthrough is in [`cross-project-pointer.md`](cross-project-pointer.md).
 
 ## The dream pass in detail
 
-A single dream invocation is a deterministic pipeline:
+A live dream pass runs on the dream owner's device only (see "Dream owner" below); a dry run runs anywhere. A single dream invocation is a deterministic pipeline:
 
 ```mermaid
 flowchart TD
@@ -382,7 +382,7 @@ no-op by default:
 - **Sources dashboard.** `o2b brain sources` / `brain_sources` aggregate
   the brain's signals by (agent, source_type) - a read-only projection.
 - **Vault-map tokens.** `{{role}}` tokens resolve to user content folders
-  via an optional `Brain/_vault-map.yaml` (defaults otherwise), wired into
+  via an optional vault map (the operator-only `vault_map.document` brain setting, which the migration fills from `Brain/_vault-map.yaml`; defaults otherwise), wired into
   scan-inline read paths and graph import. The fixed `Brain/*` layout is
   never routed through the resolver.
 - **Multi-vault profiles.** A `profiles.json` registry beside the config;
@@ -498,7 +498,12 @@ flowchart LR
   path but resolves it through the weaker containment-only resolver - is
   refused by a named guard that knows this one file (and, since v1.70.0,
   the `Brain/standing-rules/` directory beside it). Nothing generates or
-  rewrites it.
+  rewrites it. On a machine switched to the brain store the file and the
+  scoped rule files are entries of the store's `standing-rule` lane,
+  imported by the migration byte for byte, and every reader reads them
+  there, also while a legacy `Brain/` is still on disk; the operator
+  changes them with `o2b brain standing-rules set|clear` (CLI only, see
+  [`brain-store.md`](brain-store.md)).
 - **SessionStart hook** (`startup | resume | clear | compact`) injects
   the body as `additionalContext` so the agent sees current rules at
   the start of every session and again after `/compact` - the
@@ -515,8 +520,14 @@ flowchart LR
   notice names the sections that were reduced to headlines and the
   sections that were dropped, how many characters survived out of how
   many, and points the agent at `brain_context` for the full set.
-  When `Brain/lessons.md` exists, its (separately budgeted) body is
-  appended so the unified lessons corpus loads on the same surface.
+  When `Brain/lessons.md` exists, its body is appended so the unified
+  lessons corpus loads on the same surface; it takes what the active
+  body leaves of the room the two share. Everything the hook emits in
+  one run - the standing and scoped rules, the topic heads, the pinned
+  context, the runtime notices and both bodies - stays under 9,000
+  characters, because Claude Code replaces a hook's context past 10,000
+  characters with a file path and a short preview (see "Host context
+  limit" in [`cli-reference.md`](cli-reference.md)).
   Two more blocks ride the same digest between the scoped rules and
   the memory body, both charged against the same budget: the heads of
   the session's project topics (title, status, id, description and
@@ -525,7 +536,8 @@ flowchart LR
   first, with a cut line naming how many more topics exist and the
   `o2b topic list` / `brain_topic` commands that show them) and the
   pinned context (neutralised, capped by `active.pinned_max_chars`,
-  default 1200, with a cut line naming `brain_pinned_context`). Both
+  default 1200; a cut is counted in the digest's one truncation note,
+  whose `brain_context` call returns the whole pinned context). Both
   ride the untrusted fence as stored, agent-authored text, and each
   block fits its cap whole - heading, fence and cut line included. The
   two together take at most half of what the budget leaves after the
@@ -542,10 +554,40 @@ flowchart LR
   they run whenever a brain store is in use, on every host OpenCode
   included, and the machine-config key `neighbour_updates_enabled` set to
   `false` or `0` (environment `OPEN_SECOND_BRAIN_NEIGHBOUR_UPDATES_ENABLED`)
-  turns them off. Each turn asks the index for the records other devices
-  wrote on topics since the last turn, so a large import of other records
-  in between hides nothing; the session's own topics come from its own
-  newest records. The first prompt of a session, the first after an index
+  turns them off. Each turn reads the records appended to the store's
+  `topics` shards since the session's last turn, straight from the
+  shards past a per-session byte cursor: it takes no lock and does not
+  wait for the search index, so another process writing the index (a
+  catch-up, a reindex, a view render) never empties a turn, and a large
+  import of other records in between hides nothing. A turn the hook
+  cannot finish within its ceiling shows nothing and moves no cursor, so
+  its updates come on the next turn. The session's own topics come from
+  its own records. "Own" is the session, not the agent name: another window of
+  the same agent on the same machine is a neighbour. A Claude Code
+  session stamps the topic records its MCP server writes with a stamp of
+  its session id, and the hook drops only the records stamped with its
+  own session; a record with no stamp (an older release, the CLI without
+  `OPEN_SECOND_BRAIN_SESSION_ID`, a host that names no session to its MCP
+  server, such as Codex) still counts as own when this device and agent
+  name wrote it. The stamp is the first 32 characters of the lowercase
+  hex sha256 of the UTF-8 bytes of `open-second-brain-session`, one NUL
+  character (U+0000) and the trimmed session id. The writer and the hook
+  take the session id by one rule: `OPEN_SECOND_BRAIN_SESSION_ID` when
+  it is set (any launcher can name the session with it, and `o2b topic`
+  stamps from it too), else the host's own id (`CLAUDE_CODE_SESSION_ID`
+  for the Claude Code MCP server, the payload's `session_id` for the
+  hook). Set it in the environment of the host process, which its hooks
+  and its MCP server both inherit (Codex forwards it to an MCP server
+  only when the server's `env_vars` names it), never only in an MCP
+  server's own `env` block, never machine-wide and never once for a
+  launcher or bridge that serves several sessions. A value several
+  sessions share gives them one stamp: each takes the others' records
+  for its own and gets none of their neighbour updates. A value that
+  reaches only one side (the writer or the hook) gives the two sides
+  different stamps: each session is shown its own records once. Use a
+  value nobody can guess, such as a UUID:
+  the stamp is an unsalted hash of the value and travels with the synced
+  record. The first prompt of a session, the first after an index
   rebuild and the first after a day without a prompt start at the head of
   the store, so old history is never replayed.
   Fails soft - every error path in the memory lane exits 0 and the
@@ -579,9 +621,11 @@ flowchart LR
   not wait for an explicit `brain_hygiene` call. A hash ledger beside
   the hook-state directory keeps an unchanged finding set silent - once
   per change, not once per turn; zero eligible findings and flag-off
-  installs emit nothing. The line rides Claude Code's non-blocking Stop
-  feedback channel only; on runtimes where a Stop block would force a
-  continuation turn the hook stays silent.
+  installs emit nothing. The line rides Claude Code only: the synchronous
+  hook hands it to the `async` Stop deliver hook, so the model reads it
+  with the next user message, the chat does not print it and it starts no
+  model turn of its own; on runtimes where
+  a Stop block would force a continuation turn the hook stays silent.
 - **MCP Resources** expose the same content for hosts that prefer
   pull access (`osb://preferences/active` and friends in the table
   above). The MCP `initialize` reply advertises the `resources`
@@ -790,6 +834,18 @@ written after that. A snapshot interrupted during compression therefore
 leaves no recovery point behind, only a `<run_id>.tar.zst.partial-*` file
 that nothing lists; retention removes it once it is a day old.
 
+A restore treats the archive as untrusted input, because the vault is
+agent-writable and, in a peer-replicated vault, writable by every peer.
+Three things are refused before anything live is touched: an archive (or a
+derived-store archive) that is not a real file, an extracted `Brain/` root
+that is not a real directory — a link in its place is refused by name
+rather than read through — and an archive that inflates past the ceiling
+the in-process gzip path holds in memory (512 MiB by default; raise it
+with `OPEN_SECOND_BRAIN_SNAPSHOT_MAX_INFLATED_BYTES` for a vault that is
+really larger). Symbolic links inside the tree that stay inside it are
+kept: a vault that uses in-tree links produces archives carrying them, and
+a restore must not break on its own output.
+
 From v0.10.6 every snapshot ships with a SHA-256 sidecar manifest
 (`Brain/.snapshots/<run_id>.manifest.json`) listing every regular
 file the snapshot **covers** — the same tree, minus the two excluded
@@ -963,6 +1019,15 @@ auditing stay byte-equal:
   into a sibling tmp dir, compute the live → snapshot diff, print it,
   drop the tmp dir. Mutually exclusive with `--yes` since
   preview-vs-execute is contradictory. No live writes; no log entry.
+  The list names every file under `Brain/` the restore would put back,
+  change or remove, in any folder (files outside the preference folders
+  are in the `Other` section), and a closing `Not listed` section says
+  what it leaves out and why: `.snapshots/` and `.artifacts/`, which no
+  archive holds and a restore leaves in place; symbolic links, which the
+  differ never reads and the restore replaces with what the snapshot
+  holds; and the derived store (search index), which a rollback puts back
+  from its own archive when the snapshot covers it. `--json` carries the
+  same facts as `derived_store` and `not_listed` beside the diff.
 - **`o2b brain snapshot diff <run_id_a> [<run_id_b>]`** — same
   renderer, but compares snapshot ↔ snapshot when both ids are
   supplied (and snapshot ↔ live when only one is). `--json` yields
@@ -972,7 +1037,10 @@ auditing stay byte-equal:
 name the reason too — it is the one fact that distinguishes two archives
 minted seconds apart.
 
-The diff classifies every file under each root into six artifact
+The diff skips the top-level entries the snapshot family never touches
+(`.snapshots/`, `.artifacts/` and a restore's staging folder), so a
+preview never announces a change no rollback makes. It classifies every
+other file under each root into six artifact
 kinds (preference, retired, signal, log, config, other). Preference
 and retired files receive a typed field-level diff for the derived
 counters (`_status`, `_applied_count`, `_violated_count`,
@@ -1006,22 +1074,70 @@ shard; the empty device id writes the legacy un-suffixed name, and a
 legacy file stays readable without any migration. The full contract is in
 [`observability.md`](observability.md#the-per-device-shard-rule).
 
-## Primary agent declaration
+## Dream owner
 
-`Brain/_brain.yaml` carries an optional `primary_agent: <name> | null`
-key. When set, dream runs invoked from a different agent emit:
+A brain whose records live in the brain store has at most one dream
+owner: one agent installation on one device. Three record kinds in the
+`settings` stream of the `shared` partition hold the role, folded the
+same way on every device: `dream-owner-claim` (a device takes the role,
+or the owner's device changes its agent), `dream-owner-request` (another
+device asks for it) and `dream-owner-released` (the owner's device hands
+it to the request it answers, or gives it up). Two devices that claim
+before either claim has synced resolve to the lower (clock, device) on
+every device, and a device that holds the role through its own claim
+runs its first live pass only from the look after the one that first
+saw it hold the role, so a rival claim still in transit can arrive.
+
+One gate sits under every live dream path: `o2b brain dream`, the staged
+`stage`, `apply`, `discard` and `retriage`, the writing step
+`heal-enrich`, the MCP `brain_dream` tool and the maintenance lane's
+dream task. It runs before any model is asked and before the first
+write. On a device that is not the owner it refuses with
+`dream_not_owner`, naming the owner's device and agent and the transfer
+command; the lane records its dream task as skipped with the reason and
+runs its other tasks. Previews and dry runs answer on every device. The
+gate is the device, not the agent: any agent on the owner's device may
+start the pass, and the pass summary and its log event name the owner
+and the agent that started it. A live pass on the owner's device holds a
+device-local pass lock for its whole length and checks the role again
+once it holds the lock, before its first write; the owner's device
+writes a release under that lock. The lock records the holder's process
+and is taken over only once that process is gone, so a pass keeps it
+for as long as it runs, however long; only a holder whose process cannot
+be checked falls back to a 60 second age. A device that does not hold
+the `shared` partition cannot read the owner, so its live passes are
+refused with `dream_not_owner`, naming the missing partition, while its
+previews still answer.
+
+The owner's device releases a pending request when it next looks at the
+role, and a look that finds the pass lock held leaves the release to the
+following look; `o2b dream owner --release` that finds it held past the
+lock wait refuses. The looks are a live pass, `o2b dream owner`, and
+the background maintenance a session start and an MCP server start run.
+`o2b dream owner --here --force` takes the role without a release, for
+an owner device that is lost; the old owner may keep running until its first catch-up after the
+forced claim reaches it. Doctor reports `dream-owner-unbound`,
+`dream-owner-elsewhere`, `dream-owner-pending` and
+`dream-owner-agent-differs` as advice.
+
+`primary_agent` stays the declared name. On a brain with no owner record
+(every brain from before the dream owner, until it is adopted) a live
+pass runs from any device and a declared `primary_agent` keeps its
+warning for another agent:
 
 - a stderr warning of the form `warning: non-primary-dream-run: …`,
 - a `warnings` array entry on the MCP `brain_dream` response,
 - a `non_primary_agent: <caller>` payload row in the dream summary
   log event.
 
-The dream pass still completes — the declaration is observability,
-not access control. Set / clear via `o2b brain set-primary <name>`
-or `o2b brain set-primary --clear`. A vault initialised with
-`o2b brain init --primary-agent <name>` writes the value into the
-fresh `_brain.yaml`. The full multi-device walkthrough is in
-[`docs/cross-project-pointer.md`](./cross-project-pointer.md).
+Set / clear the declaration via `o2b brain set-primary <name>` or
+`o2b brain set-primary --clear`; on a brain with an owner, `set-primary
+<name>` changes the owner's agent on the owner's device and refuses
+elsewhere. A vault initialised with `o2b brain init --primary-agent
+<name>` writes the value into the fresh `_brain.yaml`. A brain whose
+records still live in the legacy `Brain/` tree has no owner: the role is
+enforced once the brain moves to the store. The full multi-device
+walkthrough is in [`docs/cross-project-pointer.md`](./cross-project-pointer.md).
 
 ## Hygiene: sanitisation and lints
 
@@ -1374,9 +1490,144 @@ Key behaviours, all driven from `Brain/_brain.yaml`-free `search_*` /
   cached; a cut one is cached under a key that carries the effective
   window and the query prefix, so a changed window re-keys it.
 - **Atomic reindex.** `o2b search reindex` writes to
-  `brain.sqlite.new`, renames to `brain.sqlite`, and keeps the
-  previous file as `brain.sqlite.bak`. If the main file is missing on
+  `brain.sqlite.new`, parks the previous file at `brain.sqlite.bak` and
+  renames the new one to `brain.sqlite`. If the main file is missing on
   open and a `.bak` exists, it is auto-restored with a stderr notice.
+  Each database moves as a set with its `-wal`, `-shm` and `-journal`
+  (`src/core/sqlite-file-set.ts`, shared with the snapshot restore), so a
+  killed writer's log is never replayed into the new index. A move that
+  fails part way is undone siblings first, and the main file comes back
+  only with all of its journals; what could not be moved back is named
+  in the error. The new index is renamed in only while the rebuild still
+  holds the writer lock, which is kept fresh for every retry the swap or
+  corrupt-index rollback can spend. A lone `-shm` left after SQLite has
+  switched out of WAL mode is not a data-bearing journal, so it does not
+  make an otherwise sound index unverified; `-wal` and `-journal` still
+  block verification and publication. Once the new file is live, opened
+  for writing, passes an integrity check and carries the generation the
+  rebuild built, the
+  `.bak` is removed, unless it holds stored embeddings the new index
+  lacks (a keyword-only rebuild cannot recompute them) or its count
+  cannot be read; a parked index that is kept is named: the rebuild's
+  end line says where it is, what it occupies on disk, why it is kept
+  and the one step that releases it, and `o2b search status` reports the
+  same block under `parked_indexes` (`parked_indexes` in `--json`). The
+  step names the index the report names: a report made for another index
+  (`--db`, `--vault`, a config that names another one) prints a command
+  that acts on that index, carrying only the flags that differ from the
+  default (`--config`, `--db`, `--vault`), and a command with no flags
+  names the default index. When an
+  unreadable parked index holds the other parked name, the step frees
+  that name first, because the rebuild it names cannot start while both
+  names are held. A kept parked index is never a surprise, and how long
+  it stays depends on what it is: a parked index whose stored embeddings
+  cannot be counted is kept while that count cannot be read, because it
+  may be the only copy of stored embeddings a keyword-only rebuild
+  cannot compute again - no later rebuild removes it either; a parked
+  index that can be read is kept only while it holds more stored
+  embeddings than the live index, and a verified rebuild removes it once
+  the index that rebuild builds holds as many as it does. `o2b search
+  status` reports a parked index the live index outweighs as one the
+  rule does not keep, without promising the next rebuild removes it: a
+  keyword-only rebuild builds none, and may keep it again. The step that
+  releases it is chosen from the parked index itself: one that holds
+  stored embeddings is released by the rebuild that computes them again
+  (`o2b search reindex --embeddings`), one that holds none by an
+  ordinary rebuild, and one that cannot be read by setting it aside,
+  because no rebuild removes a parked index it cannot read. Setting
+  aside is the product's own move: `o2b search set-aside bak|old
+  --apply` takes the writer lock and moves the parked main file with its
+  `-wal`, `-shm` and `-journal` files into a new folder under
+  `set-aside/` in the index folder, and deletes nothing. A move by hand
+  that took only the main file would lose the commits only its `-wal`
+  held, since the next rebuild clears journals it finds at a free parked
+  name. A set-aside writes the swap's own park record (the parked suffix,
+  in one atomically written line) inside its new folder before its first
+  rename, and removes it once the whole set is there; a set-aside stopped
+  between two renames is finished from that record by the next set-aside,
+  and by the next rebuild before it reuses a parked name, so the journals
+  left at the parked name follow the main file instead of being cleared.
+  A failed move that was undone removes the record, and a folder that
+  already exists is refused before anything moves. The set-aside decides
+  under the writer lock whether the parked index is still there. It
+  refuses while a rebuild that stopped part way through its swap may
+  still need the parked set to put back, and names the rebuild of the
+  same index, with the flags that select it, that restores it; the step
+  printed for an unreadable parked index in that state names that
+  rebuild first. The embeddings step
+  also names the set-aside for the case no rebuild can reach: when the
+  notes that produced the parked embeddings are gone. A printed
+  `--config` always carries `--db` and `--vault`, since another config
+  may name another index and another vault. A path in the printed command is quoted for the shell
+  that reads it: a single quote on a POSIX shell; on Windows one
+  double-quoted line when cmd.exe and PowerShell read it alike, and
+  otherwise a line for each shell, each named (PowerShell expands `$`
+  inside double quotes and ends a string at a typographic quote, cmd.exe
+  passes single quotes through); a path with `%`, which cmd.exe expands
+  even inside double quotes, or `!`, which it expands when delayed expansion
+  is enabled, gets only the PowerShell line, named. A new index
+  that fails the check is swapped back out
+  and the previous one put back, and a check that could not run (an I/O
+  error, a busy file) counts as neither pass nor failure, so nothing is
+  removed or undone. Nothing parked is removed before that point: a
+  rebuild killed between the renames of its swap leaves the previous
+  index at `.bak` or `.old`, possibly split from its journals, and the
+  next open, self-heal, rebuild or snapshot restore puts it back
+  together first. Before a swap moves the live main file it records the
+  parked name it uses in `brain.sqlite.parking`, so a set split by a stop
+  between the renames is reunited under that name, not by guessing from
+  `.old` and `.bak`; the record is removed once a live index is back in
+  place. The crash restore on open keeps the writer lock fresh through
+  its renames, which retry for seconds on Windows, and checks before each
+  rename and before removing the record that the lock is still its own;
+  once another writer has taken the lock over, it moves nothing more and
+  leaves the record for that writer. A lease loss during a file-set move
+  stops the next rename and names any stranded paths; a parked set is not
+  restored over an occupied live path. When both `.bak` and `.old` are
+  taken by indexes no verified rebuild may remove (one whose stored
+  embeddings cannot be counted, one richer in them than the live index),
+  the rebuild refuses with `INDEX_LOCKED` and removes neither; the
+  message names the unreadable parked file and the `o2b search
+  set-aside` command that moves it aside, after which the next
+  rebuild parks the live index at the freed name. That refusal is
+  decided before the build whenever it can be: the parked names and
+  their readability are known up front, so the operator gets the answer
+  without a full build and no staging index of the full size is written
+  for a build that could not be swapped in. The preflight refuses only
+  what the swap would refuse: a live index that fails its integrity
+  check is left to the swap, which puts the parked `.old` back over it
+  and frees the name it needs, and whether a removal succeeds stays at
+  the swap too. A staging index a late refusal leaves behind is the one
+  a later resumed rebuild uses. When the check after the swap cannot complete (on
+  POSIX a search still holding the renamed file keeps its log beside
+  it), the rebuild still succeeds: it says so on stderr and in
+  `swap_unverified` of `o2b search reindex --json`, names where the
+  previous index is kept, and removes and undoes nothing; the next
+  rebuild whose check completes removes what it kept. The end line and
+  `duration_ms` give the whole rebuild's wall time.
+- **What the index stores (schema v18).** One row per chunk with its
+  text once: the full-text form is a generated column over the content,
+  with a stored override only where CJK expansion changes the text. The
+  `chunk_trigram` substring index exists only on an index opened for
+  writing with `search_trigram_prefilter_enabled` on, the one setting
+  that reads it; turning the setting on builds it at the next index run,
+  and until then the lane answers nothing with a
+  `trigram_degraded [not_built]` warning. Entities are extracted from
+  whole tokens only, and the entity table stores each row once. An index
+  whose entities were extracted by the older rules (chunker version 3)
+  is served as it is and brought current by the background heal: rebuilt
+  when it holds no stored embeddings, its entities re-extracted in place
+  when it does. An index on an older schema is upgraded in place by the
+  read that meets it - the command line and the MCP server the same way
+  - and the background heal still runs for an index that owes a repair
+  beyond that upgrade (entity rows of the older rule, chunks of older
+  rules): it upgrades the schema, re-plans and repairs, so such an index
+  ends current on both counts. On a brain store of 400,000 records the index takes
+  517 MB; `o2b search status` and the migration's dry run estimate the
+  size and build time from 401 bytes per store record, 1,777 bytes per
+  indexed document, 0.15 ms per record and 20 ms per note file. The
+  migration's dry run counts no note files, so its estimate leaves out
+  their build time: add 20 ms per note file to it.
 - **Embedding model fingerprint.** Model + dimension are recorded in
   the index. Changing either drops the `embeddings` and `chunk_vec`
   tables on next open, logs one line, and preserves `chunks` and

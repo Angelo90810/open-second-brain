@@ -10,7 +10,7 @@
  * them.
  */
 
-import type { StorePartition } from "../store/constants.ts";
+import type { StorePartition, StoreStream } from "../store/constants.ts";
 import { compareRecords, type StoreRecord } from "../store/envelope.ts";
 import { prepareRecords } from "../store/fold.ts";
 import { observeClock } from "../store/clock-store.ts";
@@ -18,7 +18,11 @@ import { parseHlc } from "../store/hlc.ts";
 import { readShard, shardReadGap } from "../store/reader.ts";
 import { trackSeenShards } from "../store/seen-shards.ts";
 import { listShards } from "../store/shard-list.ts";
-import { readPartition, type UnreadableShard } from "../store/state-digest.ts";
+import {
+  forEachPartitionRecord,
+  readPartition,
+  type UnreadableShard,
+} from "../store/state-digest.ts";
 import type { StoreHandle } from "../store/store-open.ts";
 import { partitionDir } from "../store/store-paths.ts";
 
@@ -28,6 +32,13 @@ export interface ViewCatchUp {
   readonly records: ReadonlyMap<StorePartition, ReadonlyArray<StoreRecord>>;
   /** Shards that could not be read; the pass must not render over an incomplete read. */
   readonly unreadable: ReadonlyArray<UnreadableShard & { partition: StorePartition }>;
+  /**
+   * By partition, the envelope kinds of the records left out because their
+   * body has not arrived (a pending blob, quarantined or not), counted.
+   * Absent when the read did not count them: a reader that must know
+   * whether a record of some kind is missing takes it as incomplete.
+   */
+  readonly pendingKinds?: ReadonlyMap<StorePartition, ReadonlyMap<string, number>>;
 }
 
 /** Read the held partitions and observe their newest clock. */
@@ -50,6 +61,51 @@ export function catchUp(store: StoreHandle, now?: () => number): ViewCatchUp {
     observeClock(store.deviceStateDir, store.device, parseHlc(newest.hlc)!, now);
   }
   return { records, unreadable };
+}
+
+/**
+ * {@link catchUp} keeping only the records `keep` passes, judged record by
+ * record as each is read (`forEachPartitionRecord`): for a pass that folds
+ * a few kinds out of a large store (topic planning reads signals, notes
+ * and topic records, the view its page inputs, not the whole migrated
+ * log), so a record it drops is never held, not even with its shard.
+ * The clock is raised past the newest record read, kept or not, exactly as
+ * {@link catchUp} raises it, and an unreadable shard is reported the same
+ * way.
+ */
+export function catchUpWhere(
+  store: StoreHandle,
+  keep: (record: StoreRecord, stream: StoreStream) => boolean,
+  now?: () => number,
+): ViewCatchUp {
+  const records = new Map<StorePartition, ReadonlyArray<StoreRecord>>();
+  const unreadable: Array<UnreadableShard & { partition: StorePartition }> = [];
+  const pendingKinds = new Map<StorePartition, Map<string, number>>();
+  let newest: StoreRecord | undefined;
+  for (const partition of store.partitions) {
+    const kept: StoreRecord[] = [];
+    const pendingHere = new Map<string, number>();
+    pendingKinds.set(partition, pendingHere);
+    forEachPartitionRecord(
+      partitionDir(store.root, partition),
+      { onUnreadable: (shard) => unreadable.push({ ...shard, partition }) },
+      {
+        record: (shard, record, pending) => {
+          if (pending) {
+            pendingHere.set(record.kind, (pendingHere.get(record.kind) ?? 0) + 1);
+            return;
+          }
+          if (newest === undefined || compareRecords(record, newest) > 0) newest = record;
+          if (keep(record, shard.stream)) kept.push(record);
+        },
+      },
+    );
+    records.set(partition, prepareRecords(kept).records);
+  }
+  if (newest !== undefined) {
+    observeClock(store.deviceStateDir, store.device, parseHlc(newest.hlc)!, now);
+  }
+  return { records, unreadable, pendingKinds };
 }
 
 /** Every record read, all partitions together, in fold order. */
@@ -76,7 +132,11 @@ export function withOwnRecord(
 ): ViewCatchUp {
   const records = new Map(read.records);
   records.set(partition, [...(records.get(partition) ?? []), record]);
-  return { records, unreadable: read.unreadable };
+  return {
+    records,
+    unreadable: read.unreadable,
+    ...(read.pendingKinds !== undefined ? { pendingKinds: read.pendingKinds } : {}),
+  };
 }
 
 /**

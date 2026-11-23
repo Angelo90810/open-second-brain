@@ -29,6 +29,11 @@ beforeEach(() => {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
+  // A config of this test's own that does not exist yet: a machine with no
+  // config, which a tool that mints the installation secret writes into
+  // (`second_brain_query`). Unset, the default path is the per-user config
+  // base, shared by every test of the process.
+  process.env["OPEN_SECOND_BRAIN_CONFIG"] = join(tmp, "machine-config.yaml");
   // `vault_health` runs the full doctor, which consults the codegraph
   // partner whenever that binary is on PATH. The partner's cache lives
   // under HOME and this suite mandates a clean one, so each consultation
@@ -205,6 +210,8 @@ describe("tool listing", () => {
         // lifecycle review tools added in v0.17.0.
         "brain_feedback",
         "brain_dream",
+        // The dream owner: status, take and release (agent-neutral dream).
+        "brain_dream_owner",
         "brain_intent_review",
         "brain_retention",
         "brain_review_candidates",

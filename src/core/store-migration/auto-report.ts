@@ -11,6 +11,10 @@
  * files of `auto-state.ts`. It never claims, writes or clears anything.
  */
 
+import {
+  describeSelfHealUpgradeLock,
+  readSelfHealUpgradeLock,
+} from "../maintenance/self-heal-upgrade-state.ts";
 import { autoStoreMigrationSetting, describeAutoStoreMigrationProblem } from "../config.ts";
 import {
   MIGRATE_STORE_COMMAND,
@@ -23,6 +27,12 @@ import {
   type GateRefusal,
 } from "./gate-decision.ts";
 import { gatherGate, stoppedGateOf } from "./gate-state.ts";
+import type { OwnMigrationRunRead } from "./auto-probe.ts";
+import {
+  describeMigrationGateProgress,
+  readMigrationGateProgress,
+  type MigrationGateProgress,
+} from "../migration-gate.ts";
 import {
   AUTO_MIGRATION_ROLLBACK_COMMAND,
   type AutoMigrationFailure,
@@ -33,7 +43,10 @@ import {
   readAutoMigrationFailure,
   readAutoMigrationRunning,
   describeAutoMigrationRunning,
+  describeLostAutoMigrationWorker,
   readAutoMigrationWaiting,
+  readLostAutoMigrationWorker,
+  reportableText,
   type AutoMigrationWaiting,
   AUTO_MIGRATION_LOCK_JUDGE,
   AUTO_MIGRATION_WAIT_RECHECK_MS,
@@ -84,11 +97,19 @@ export interface AutoMigrationReport {
   readonly retryAfter: string | null;
   /** `waiting`: the devices whose cut this machine waits for. */
   readonly firstMachines: ReadonlyArray<string>;
+  /** `running`: how far the run's import is, when the run has recorded it. */
+  readonly progress: { readonly journaled: number; readonly planned: number } | null;
   /**
    * Why the opt-out reads as off without a plain off value (an
    * unrecognised value, an unreadable machine config), or `null`.
    */
   readonly settingProblem: string | null;
+  /**
+   * What the pending migration waits for, as one clause ("this machine's
+   * managed-file upgrade to end: process N of this machine holds ..."), or
+   * null: the one text status and the doctor both show.
+   */
+  readonly waitsFor: string | null;
 }
 
 export interface AutoMigrationReportSource {
@@ -113,7 +134,9 @@ function report(
     error: null,
     retryAfter: null,
     firstMachines: [],
+    progress: null,
     settingProblem: null,
+    waitsFor: null,
     ...fields,
   });
 }
@@ -139,6 +162,13 @@ export interface ReportFacts {
   readonly storeAbsent: boolean;
   /** The worker claim, when a worker runs. */
   readonly running: AutoMigrationRunning | null;
+  /**
+   * The worker a start spawned and handed its claim to exited before it
+   * confirmed it ({@link describeLostAutoMigrationWorker}), as one
+   * sentence; absent or null when there is none. The next start records it
+   * as a failure.
+   */
+  readonly lostWorker?: string | null;
   readonly failure: AutoMigrationFailure | null;
   readonly waiting: AutoMigrationWaiting | null;
   readonly settingProblem: string | null;
@@ -159,6 +189,15 @@ export interface ReportFacts {
    * the run state reads rolled back (gate decision rule 10).
    */
   readonly rollbackPending: "unfinished" | "unreadable" | null;
+  /** How far this device's run in progress is (the gate's progress file, `migration-gate.ts`), or null. */
+  readonly progress?: MigrationGateProgress | null;
+  /**
+   * A live managed-file upgrade of this machine holds its lock, which keeps
+   * the migration worker from starting the migration (it runs the upgrade
+   * first), as one sentence; absent or null otherwise. A claim another
+   * machine's sync brought here holds nothing (`self-heal-upgrade-state.ts`).
+   */
+  readonly upgradeLock?: string | null;
 }
 
 /** The report for `vault` on this machine. Never throws on a missing file. */
@@ -183,6 +222,7 @@ export function autoMigrationReport(source: AutoMigrationReportSource): AutoMigr
     error: availability.error,
     storeAbsent: availability.storeExists === false,
     running: readAutoMigrationRunning(source.vault, now, EXACT),
+    lostWorker: lostWorkerText(source.vault, now),
     failure: readAutoMigrationFailure(source.vault),
     waiting: readAutoMigrationWaiting(source.vault),
     settingProblem: describeAutoStoreMigrationProblem(autoStoreMigrationSetting(source.configPath)),
@@ -194,7 +234,44 @@ export function autoMigrationReport(source: AutoMigrationReportSource): AutoMigr
       g.state.run?.phase === "rolled-back"
         ? null
         : g.state.rollback,
+    progress: runProgress(g.context.own),
+    upgradeLock: upgradeLockText(source.vault, now),
   });
+}
+
+/** The live upgrade holding the migration off on `vault`, as one sentence, or null. */
+function upgradeLockText(vault: string, now: Date): string | null {
+  try {
+    const holder = readSelfHealUpgradeLock(vault, now);
+    return holder.kind === "here" ? describeSelfHealUpgradeLock(holder) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The lost worker's sentence for `vault`, or null (read judged exactly). */
+function lostWorkerText(vault: string, now: Date): string | null {
+  const lost = readLostAutoMigrationWorker(vault, now, EXACT);
+  return lost === null ? null : describeLostAutoMigrationWorker(vault, lost, null);
+}
+
+/** A worker that exited before it started, before any start recorded it. */
+function lostWorkerReport(text: string): AutoMigrationReport {
+  return report(AUTO_MIGRATION_STATE.failed, {
+    automatic: true,
+    message: `${reportableText(text)}; run \`${MIGRATE_STORE_COMMAND}\` to run it yourself`,
+    nextStart: "records this as a failed attempt and starts nothing until its cooldown has run out",
+    manualCommand: MIGRATE_STORE_COMMAND,
+    error: reportableText(text),
+  });
+}
+
+/** The progress file of this device's run in progress, or null. */
+function runProgress(own: OwnMigrationRunRead): MigrationGateProgress | null {
+  if (own.kind !== "run" || own.run.state.kind !== "state") return null;
+  const state = own.run.state.state;
+  if (state.phase !== "in-progress") return null;
+  return readMigrationGateProgress(state.run_id);
 }
 
 /** A path as one shell argument: quoted when it holds a space or a shell character. */
@@ -377,6 +454,20 @@ function failedReport(
  * the details (the failure, the wait, the worker's process). Pure.
  */
 export function reportOf(d: GateDecision, f: ReportFacts): AutoMigrationReport {
+  const r = decisionReport(d, f);
+  if (r.state !== AUTO_MIGRATION_STATE.running || f.progress == null) return r;
+  // The run's one progress file: its step, and its counts once known.
+  const { journaled, planned } = f.progress;
+  return Object.freeze({
+    ...r,
+    message: `${r.message}; ${describeMigrationGateProgress(f.progress)}`,
+    ...(journaled !== undefined && planned !== undefined
+      ? { progress: { journaled, planned: Math.max(planned, journaled) } }
+      : {}),
+  });
+}
+
+function decisionReport(d: GateDecision, f: ReportFacts): AutoMigrationReport {
   const manual = f.nextCommands.join(", then ") || null;
   // The claim's answer first: a worker that runs is what happens now,
   // unless there is nothing to migrate or finish at all.
@@ -421,6 +512,19 @@ export function reportOf(d: GateDecision, f: ReportFacts): AutoMigrationReport {
       }
       if (f.waiting !== null) return waitingReport(f, f.waiting, "tries again");
       if (f.failure !== null) return failedReport(f, f.failure, true, "tries again");
+      if (f.lostWorker != null) return lostWorkerReport(f.lostWorker);
+      if (f.upgradeLock != null) {
+        const waitsFor = `this machine's managed-file upgrade to end: ${reportableText(f.upgradeLock)}`;
+        return report(AUTO_MIGRATION_STATE.pending, {
+          automatic: true,
+          waitsFor,
+          message: `a migration into the brain store is available on this machine, and waits for ${waitsFor}`,
+          nextStart:
+            "runs the migration in the background once that upgrade has ended (a claim older " +
+            "than an hour is taken over)",
+          manualCommand: manual,
+        });
+      }
       return report(AUTO_MIGRATION_STATE.pending, {
         automatic: true,
         message: "a migration into the brain store is available on this machine",
@@ -570,6 +674,19 @@ function noneReport(why: GateNone, f: ReportFacts, manual: string | null): AutoM
           settingProblem: f.settingProblem,
         });
       }
+      // A worker lost before the opt-out: no start records or retries it
+      // any more, so it is named here, with the command that is left.
+      if (f.lostWorker != null) {
+        return report(AUTO_MIGRATION_STATE.failed, {
+          message:
+            `${reportableText(f.lostWorker)}; no start runs the migration again while the ` +
+            `automatic migration is off: run \`${MIGRATE_STORE_COMMAND}\` to run it yourself`,
+          nextStart: off,
+          manualCommand: MIGRATE_STORE_COMMAND,
+          error: reportableText(f.lostWorker),
+          settingProblem: f.settingProblem,
+        });
+      }
       return report(AUTO_MIGRATION_STATE.pending, {
         message:
           "a migration into the brain store is available on this machine" +
@@ -657,6 +774,7 @@ export function autoMigrationReportJson(r: AutoMigrationReport): Record<string, 
     manual_command: r.manualCommand,
     ...(r.pid !== null ? { pid: r.pid } : {}),
     ...(r.since !== null ? { since: r.since } : {}),
+    ...(r.progress !== null ? { progress: r.progress } : {}),
     ...(r.error !== null ? { error: r.error } : {}),
     ...(r.retryAfter !== null ? { retry_after: r.retryAfter } : {}),
     ...(r.firstMachines.length > 0 ? { first_machines: r.firstMachines } : {}),

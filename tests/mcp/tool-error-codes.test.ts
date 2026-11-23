@@ -104,6 +104,7 @@ const NEW_TOKENS = [
   "argument_forbidden",
   "quote_unverified",
   "store_write_failed",
+  "vault_unreadable",
 ] as const;
 
 /**
@@ -186,6 +187,12 @@ const TYPE_ONLY_MEMBERS = [
   "ExpirationValueError",
   "ExpirationTargetNotFoundError",
   "InvalidExpirationTargetError",
+  // brain_topic: a refused action, and a refused topic write by its reason
+  "topic_invalid",
+  "topic_unknown-topic",
+  "topic_unreadable",
+  // a live dream path on a device that is not the dream owner
+  "dream_not_owner",
 ] as const;
 
 /** A core-style error class that, like several real ones, never sets `this.name`. */

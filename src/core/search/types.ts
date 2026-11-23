@@ -37,6 +37,7 @@ import type {
 import type { SearchTrustGateMode } from "../brain/trust/retrieval-gate.ts";
 import type { RetrievalTrail } from "./retrieval-trail.ts";
 import type { ProviderProbeState } from "./provider-probe.ts";
+import type { KeptParkedIndex } from "./parked-index.ts";
 
 export type { VaultPathRule, VaultScopeRules };
 export type { BrainSearchResult, ScoreBreakdown, TrustMetadata };
@@ -441,6 +442,22 @@ export interface IndexStats {
    * spend emits the shape it always emitted.
    */
   readonly spend?: MaintenanceSpendReceipt;
+  /**
+   * Set when a rebuild published its index but the check after the swap
+   * could not complete (another handle on the file, a busy scan): the
+   * index is in place and nothing was rolled back or pruned. Names why,
+   * and where the previous index is kept, if there was one. Absent on
+   * every run whose swap was verified or that swapped nothing.
+   */
+  readonly swapUnverified?: string;
+  /**
+   * The parked indexes a verified rebuild kept beside the live index, each
+   * with the reason it is there and the one step that releases it. A
+   * rebuild that keeps one says so at its end: a file that stays beside
+   * the index is named, sized and explained rather than left to be found.
+   * Absent when the rebuild left nothing parked beside the index.
+   */
+  readonly keptParkedIndexes?: ReadonlyArray<KeptParkedIndex>;
   readonly durationMs: number;
 }
 
@@ -795,6 +812,19 @@ export interface ExpandHitInput {
    * follows, for the same reason.
    */
   readonly transportReach?: TransportReach;
+  /**
+   * The caller's content-visibility scope, on the terms
+   * {@link SearchOptions.visibility} has: absent reaches untagged pages
+   * only. The search that handed out the card withheld a tagged page
+   * outside this scope, so the drill-down withholds it too, refused like
+   * an absent chunk.
+   */
+  readonly visibility?: ReadonlyArray<string>;
+  /**
+   * The caller's session/project scope, on the terms
+   * {@link SearchOptions.scope} has: an absent axis filters nothing.
+   */
+  readonly scope?: SearchOptions["scope"];
 }
 
 /**

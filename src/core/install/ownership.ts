@@ -475,6 +475,12 @@ export const OUT_OF_VAULT_STATE: ReadonlyArray<OutOfVaultState> = Object.freeze(
  */
 export const OUT_OF_VAULT_SWEEP_EXCLUSIONS: ReadonlyMap<string, string> = new Map([
   [
+    "src/core/install/payload.ts",
+    "it computes the default config path only to COMPARE it with the configured one, so a host " +
+      "registration carries an explicit config path exactly when the launched server would not " +
+      "find it by default; it builds no out-of-vault path that it or anything else writes to",
+  ],
+  [
     "src/mcp/brain/device-path.ts",
     "the remote-reach redaction only names this machine's roots (home, temp, vault, store, " +
       "device state, config) to recognise them inside tool results and rewrite them; it builds " +
@@ -565,18 +571,6 @@ export const OUT_OF_VAULT_SWEEP_EXCLUSIONS: ReadonlyMap<string, string> = new Ma
       "written by those adapters",
   ],
   [
-    "src/cli/install/uninstall-target.ts",
-    "it builds `InstallEnv.home` to REMOVE what an adapter wrote, per that target's install " +
-      "manifest. A verb that only deletes cannot add a location an operator will find, and the " +
-      "locations it deletes are the runtime_config_blocks row",
-  ],
-  [
-    "src/cli/update.ts",
-    "it rebuilds the same `InstallEnv.home` to re-apply existing install targets after a plugin " +
-      "update; the files it can change are the runtime_config_blocks row, and it introduces no " +
-      "path of its own outside the vault",
-  ],
-  [
     "src/cli/uninstall.ts",
     "it only removes: the machine-local config directory (the machine_config row, behind a " +
       "name-and-shape guard) and, with --remove-cli, the cli_symlinks row. The home-rooted " +
@@ -633,6 +627,13 @@ export const OUT_OF_VAULT_SWEEP_EXCLUSIONS: ReadonlyMap<string, string> = new Ma
     "it answers `InstallAdapter.sessionPaths` by resolving the session roots `host-facts.ts` " +
       "declares against the home and environment already carried on `InstallEnv`. The agent " +
       "runtimes wrote those logs and own them; this module opens nothing and writes nothing",
+  ],
+  [
+    "hooks/lib/detect.ts",
+    "it resolves the Codex session roots `host-facts.ts` declares against HOME, USERPROFILE or " +
+      "the home directory only to compare a hook payload's `transcript_path` against them as " +
+      "strings when it infers the runtime. It opens, creates and deletes nothing at those roots, " +
+      "which belong to the agent runtime that wrote them",
   ],
   [
     "src/core/brain/sessions/discover.ts",

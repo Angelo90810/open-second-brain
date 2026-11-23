@@ -26,7 +26,7 @@ import { statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { processDirsEnv, stateRootDir } from "../platform-dirs.ts";
-import { STORE_PARTITIONS } from "./constants.ts";
+import { STORE_PARTITIONS, type Authority } from "./constants.ts";
 import type { StoreRecord } from "./envelope.ts";
 import { parseHlc } from "./hlc.ts";
 import {
@@ -49,6 +49,12 @@ export interface LaneFolded {
   readonly clocks: ReadonlyMap<string, number>;
   /** Keys of the live entries whose winning record is in `private`. */
   readonly privateKeys: ReadonlySet<string>;
+  /**
+   * The authority of each live entry's winning record: a rewrite that only
+   * adds to an entry (a privacy restamp) keeps it, so a later writer of the
+   * same standing can still replace the entry.
+   */
+  readonly authorities: ReadonlyMap<string, Authority>;
   /**
    * `<partition>/<rel>` of every `events` shard whose records the fold
    * could not see (unreadable, or gone since this machine read it).
@@ -89,11 +95,17 @@ const EMPTY_FOLD: LaneFolded = {
   entries: new Map(),
   clocks: new Map(),
   privateKeys: new Set(),
+  authorities: new Map(),
   unreadable: [],
   pendingBlobs: [],
 };
 
 const cache = new Map<string, LaneFolded>();
+
+/** The records a lane fold reads: lane entries and their tombstones. */
+function isLaneRecord(record: StoreRecord): boolean {
+  return record.kind === LANE_ENTRY_KIND || record.kind === LANE_ENTRY_REMOVE_KIND;
+}
 
 /**
  * A stamp of every `events` shard of `store` and the quarantine ledger:
@@ -152,7 +164,17 @@ export function laneStoreFold(): LaneFolded {
   const pendingBlobs: string[] = [];
   for (const partition of STORE_PARTITIONS) {
     if (!store.partitions.has(partition)) continue;
-    const read = readStreamRecords(store.root, partition, { stream: "events" });
+    // Only the lane records are held: the rest of `events` (signals, the
+    // log, preferences) is parsed and dropped as it streams by, so a hook
+    // that reads one lane entry never holds the whole stream. A record of
+    // another kind waiting for its blob opens no gap in a lane entry, so
+    // it is not counted among the skipped blobs either.
+    const read = readStreamRecords(
+      store.root,
+      partition,
+      { stream: "events" },
+      { keep: isLaneRecord },
+    );
     for (const rel of read.unreadable) unreadable.push(`${partition}/${rel}`);
     for (const sha of read.pendingBlobs) pendingBlobs.push(`${partition}/${sha}`);
     for (const record of read.records) {
@@ -164,9 +186,12 @@ export function laneStoreFold(): LaneFolded {
   const entries = new Map<string, LaneEntryValue>();
   const clocks = new Map<string, number>();
   const privateKeys = new Set<string>();
+  const authorities = new Map<string, Authority>();
   for (const [key, state] of foldLaneEntries(records).entries) {
     if (state.value === null) continue;
     entries.set(key, state.value);
+    const winner = state.history.find((h) => h.record.id === state.winner);
+    if (winner !== undefined) authorities.set(key, winner.authority);
     if (inPrivate.has(state.winner)) privateKeys.add(key);
     let newest = 0;
     for (const h of state.history) newest = Math.max(newest, parseHlc(h.record.hlc)?.physical ?? 0);
@@ -193,6 +218,7 @@ export function laneStoreFold(): LaneFolded {
     entries,
     clocks,
     privateKeys,
+    authorities,
     unreadable,
     pendingBlobs,
   };

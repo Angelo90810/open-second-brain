@@ -46,6 +46,7 @@ import {
 } from "../../src/core/brain/answer-quotes/check.ts";
 import { untrustedFramingHeader } from "../../src/core/brain/untrusted-source.ts";
 import { QUOTE_SPAN_PREVIEW_MAX_CHARS } from "../../src/core/brain/distill/quote-verdict.ts";
+import { stopAdvisoryHandoverDir } from "../../hooks/lib/stop-advisory-handover.ts";
 import { CLI_SPAWN_BUDGET_MS } from "../helpers/cli-timeout.ts";
 
 // Tests here spawn processes; see tests/helpers/cli-timeout.ts.
@@ -144,25 +145,30 @@ interface RunResult {
 async function runHook(
   overrides: Record<string, unknown> = {},
   envOverrides: Record<string, string> = {},
+  hook: string = HOOK,
+  preload?: string,
 ): Promise<RunResult> {
   const transcriptPath =
     typeof overrides["transcript_path"] === "string"
       ? (overrides["transcript_path"] as string)
       : join(tmp, "transcript.jsonl");
-  const proc = Bun.spawn(["bun", "run", HOOK], {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-    // Bun hands a child without `env` the environment this process STARTED
-    // with; pass the live one so the child keeps the hermetic defaults the
-    // suite preload installed, plus this test's VAULT_DIR and recall gate.
-    env: {
-      ...process.env,
-      VAULT_DIR: vault,
-      OPEN_SECOND_BRAIN_RECALL_INJECT_ENABLED: "true",
-      ...envOverrides,
+  const proc = Bun.spawn(
+    preload === undefined ? ["bun", "run", hook] : ["bun", "run", "--preload", preload, hook],
+    {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+      // Bun hands a child without `env` the environment this process STARTED
+      // with; pass the live one so the child keeps the hermetic defaults the
+      // suite preload installed, plus this test's VAULT_DIR and recall gate.
+      env: {
+        ...process.env,
+        VAULT_DIR: vault,
+        OPEN_SECOND_BRAIN_RECALL_INJECT_ENABLED: "true",
+        ...envOverrides,
+      },
     },
-  });
+  );
   proc.stdin.write(
     JSON.stringify({
       hook_event_name: "Stop",
@@ -204,6 +210,12 @@ function logDays(): ReadonlyArray<string> {
 /** The reply-presence continuity records the hook wrote to the vault. */
 function presenceRecords(): ReadonlyArray<ContinuityRecord> {
   return listContinuityRecords(vault, { kind: "reply_presence" });
+}
+
+/** The hand-over files waiting in the device-local directory. */
+function handovers(): string[] {
+  const dir = stopAdvisoryHandoverDir();
+  return existsSync(dir) ? readdirSync(dir).filter((name) => name.endsWith(".json")) : [];
 }
 
 describe("answer-quote-check hook - output shape", () => {
@@ -1234,6 +1246,50 @@ describe("answer-quote-check hook - reply presence records", () => {
     ]);
   }, 20000);
 
+  test("a note the budget cut inside a verified span reads note-unavailable, never absent", async () => {
+    // The cut lands INSIDE the walk of the last span, after that span has
+    // already verified against the first candidate: the second candidate is
+    // then left unread, and the fold has no verdict for it at all. `absent`
+    // would claim the reply had every chance to touch that note; the cut
+    // is exactly the case where it did not, so the note reads
+    // `note-unavailable` - the same verdict the cut before the walk
+    // produces.
+    writeConfig("shadow");
+    writeNote("Brain/notes/a-first.md", "Restaking reuses staked capital.\n");
+    writeNote("Brain/notes/b-second.md", "Elsewhere collects unrelated facts.\n");
+    expect(
+      recordRecallInjected(vault, SESSION, [
+        "local:Brain/notes/a-first.md#L1-L1",
+        "local:Brain/notes/b-second.md#L1-L1",
+      ]),
+    ).toBe(true);
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('As the context showed, restaking "reuses staked capital".'),
+    ]);
+    // The hook reads its clock five times before the second candidate is
+    // looked at: the start of the budget, the check before the message, the
+    // check before the span, the check before the first candidate and the
+    // check before the second. The preload makes the fifth read jump past
+    // the deadline, so the cut lands between the two candidates - after the
+    // first one verified the span.
+    const run = await runHook(
+      {},
+      { OSB_TEST_CLOCK_JUMP_AT: "5" },
+      HOOK,
+      join(import.meta.dir, "..", "fixtures", "hooks", "quote-check-deadline-cut.ts"),
+    );
+    expect(run.exit).toBe(0);
+    expect(run.stderr).toBe("");
+    const records = presenceRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0]!.payload["checked"]).toBe(1);
+    expect(records[0]!.payload["per_note"]).toEqual([
+      { path: "Brain/notes/a-first.md", start_line: 1, end_line: 1, verdict: "verified" },
+      { path: "Brain/notes/b-second.md", start_line: 1, end_line: 1, verdict: "note-unavailable" },
+    ]);
+  }, 20000);
+
   test("a note the reply cites reads its check verdict, never absent", async () => {
     // The span sits under a wikilink mark naming the injected note: the
     // check measured the span against that note's evidence, so the note
@@ -1401,4 +1457,157 @@ describe("answer-quote-check hook - reply presence records", () => {
     expect(run.stdout).toBe("");
     expect(presenceRecords()).toEqual([]);
   }, 20000);
+});
+
+describe("answer-quote-check hook - the delivered stream and the master switch", () => {
+  test("the synchronous stream outside the hand-over: one JSON line, this-turn wording, framed spans", async () => {
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('Per Brain/notes/restaking.md: it "reuses pooled capital".'),
+    ]);
+    // No Claude Code marker in this payload: the hook prints its own line.
+    const run = await runHook();
+    expect(run.exit).toBe(0);
+    expect(run.stdout).toBe(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "Stop",
+          additionalContext: [
+            "Open Second Brain quote check: 1 quoted span(s) were not found in the notes this turn had:",
+            "Advisory only; the answer is not blocked. Verify the quotes against the note, or reword.",
+            untrustedFramingHeader("quoted-answer-spans"),
+            '- [not-in-note] "reuses pooled capital"',
+          ].join("\n"),
+        },
+      }) + "\n",
+    );
+    // Advisory: never a block, never a continuation request.
+    expect(run.stdout).not.toContain('"decision"');
+    expect(run.stdout).not.toContain('"continue"');
+  });
+
+  // Every test here shares one Stop event key: start each from an empty
+  // hand-over directory.
+  beforeEach(() => rmSync(stopAdvisoryHandoverDir(), { recursive: true, force: true }));
+  afterEach(() => rmSync(stopAdvisoryHandoverDir(), { recursive: true, force: true }));
+
+  /** A Claude Code Stop payload: the shape names the runtime. */
+  const CLAUDE_STOP = {
+    prompt_id: "prompt-quote-1",
+    last_assistant_message: 'Per Brain/notes/restaking.md: it "reuses pooled capital".',
+  };
+  /** The deliver runs wait only for this producer. */
+  const ONLY_QUOTE_CHECK = { OPEN_SECOND_BRAIN_STOP_GUARDRAIL_ENABLED: "0" };
+  const DELIVER = join(dirname(HOOK), "stop-advisory-deliver.ts");
+
+  /** An enforce turn with a live recall ledger and one quote the note lacks. */
+  function enforceTurn(): void {
+    writeConfig("enforce");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    expect(recordRecallInjected(vault, SESSION, ["semantic:Brain/notes/restaking.md#L1-L1"])).toBe(
+      true,
+    );
+    writeTranscript([ccUser("summarize"), ccAssistant(CLAUDE_STOP.last_assistant_message)]);
+  }
+
+  test("Claude Code: the synchronous part alone writes every durable record and prints nothing", async () => {
+    enforceTurn();
+    // Only the synchronous hook runs, as on a `claude -p` teardown that
+    // kills the async deliver hook before it starts.
+    const run = await runHook(CLAUDE_STOP);
+    expect(run.exit).toBe(0);
+    expect(run.stderr).toBe("");
+    expect(run.stdout).toBe("");
+    expect(presenceRecords()).toHaveLength(1);
+    const lines = hookEnforceLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("reuses pooled capital");
+    // The text waits, device-local, for the deliver hook.
+    expect(handovers()).toHaveLength(1);
+    expect(stopAdvisoryHandoverDir().startsWith(vault)).toBe(false);
+  }, 20000);
+
+  test("Claude Code: the deliver hook prints the handed-over annotation once, removes it, and reads nothing else", async () => {
+    enforceTurn();
+    await runHook(CLAUDE_STOP);
+    const first = await runHook(CLAUDE_STOP, ONLY_QUOTE_CHECK, DELIVER);
+    expect(first.exit).toBe(0);
+    expect(first.stdout).toBe(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "Stop",
+          additionalContext: [
+            "Open Second Brain quote check: 1 quoted span(s) in the previous answer were not found in the notes that turn had:",
+            "Advisory only; the answer was not blocked. Verify those quotes against the note, and correct any that do not hold.",
+            untrustedFramingHeader("quoted-answer-spans"),
+            '- [not-in-note] "reuses pooled capital"',
+          ].join("\n"),
+        },
+      }) + "\n",
+    );
+    expect(handovers()).toEqual([]);
+    // The check ran once: the deliver hook added no record of its own.
+    expect(presenceRecords()).toHaveLength(1);
+    expect(hookEnforceLines()).toHaveLength(1);
+    const second = await runHook(CLAUDE_STOP, ONLY_QUOTE_CHECK, DELIVER);
+    expect(second.exit).toBe(0);
+    expect(second.stdout).toBe("");
+  }, 30000);
+
+  test("Claude Code: a deliver hook started before the check waits for its hand-over", async () => {
+    enforceTurn();
+    // Hooks of one event start in parallel, so the deliver hook may run first.
+    const deliver = runHook(CLAUDE_STOP, ONLY_QUOTE_CHECK, DELIVER);
+    await runHook(CLAUDE_STOP);
+    const out = await deliver;
+    expect(annotations(out)).toHaveLength(1);
+    expect(annotations(out)[0]).toContain("in the previous answer");
+    expect(handovers()).toEqual([]);
+  }, 30000);
+
+  test("Claude Code with stop_advisory_delivery sync: the check prints this turn's annotation itself and hands nothing over", async () => {
+    enforceTurn();
+    const run = await runHook(CLAUDE_STOP, { OPEN_SECOND_BRAIN_STOP_ADVISORY_DELIVERY: "sync" });
+    expect(annotations(run)).toHaveLength(1);
+    expect(annotations(run)[0]).toContain("were not found in the notes this turn had");
+    expect(presenceRecords()).toHaveLength(1);
+    expect(hookEnforceLines()).toHaveLength(1);
+    expect(handovers()).toEqual([]);
+  }, 20000);
+
+  test("quote_check_enabled false turns the whole hook off: no annotation, no record, no log", async () => {
+    writeConfig("enforce");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    // A live recall ledger, so with the switch on this turn would both
+    // annotate and write its reply_presence record and enforce event.
+    expect(recordRecallInjected(vault, SESSION, ["semantic:Brain/notes/restaking.md#L1-L1"])).toBe(
+      true,
+    );
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('Per Brain/notes/restaking.md: it "reuses pooled capital".'),
+    ]);
+    const configPath = join(tmp, "machine-config.yaml");
+    writeFileSync(configPath, `vault: ${vault}\nquote_check_enabled: "false"\n`);
+    const run = await runHook({}, { OPEN_SECOND_BRAIN_CONFIG: configPath });
+    expect(run.exit).toBe(0);
+    expect(run.stdout).toBe("");
+    expect(run.stderr).toBe("");
+    expect(hookEnforceLines()).toEqual([]);
+    expect(presenceRecords()).toEqual([]);
+  });
+
+  test("OPEN_SECOND_BRAIN_QUOTE_CHECK_ENABLED=0 turns the hook off", async () => {
+    writeConfig("shadow");
+    writeNote("Brain/notes/restaking.md", "Restaking reuses staked capital.\n");
+    writeTranscript([
+      ccUser("summarize"),
+      ccAssistant('Per Brain/notes/restaking.md: it "reuses pooled capital".'),
+    ]);
+    const run = await runHook({}, { OPEN_SECOND_BRAIN_QUOTE_CHECK_ENABLED: "0" });
+    expect(run.exit).toBe(0);
+    expect(run.stdout).toBe("");
+  });
 });

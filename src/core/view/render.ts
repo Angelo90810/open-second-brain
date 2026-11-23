@@ -40,8 +40,8 @@ import { withLocalLock } from "../store/local-lock.ts";
 import { textCarriesPrivateRegion, valueCarriesPrivateRegion } from "../store/private-region.ts";
 import type { StoreHandle } from "../store/store-open.ts";
 import {
-  catchUp,
   catchUpSettings,
+  catchUpWhere,
   partitionRecords,
   withOwnRecord,
   type ViewCatchUp,
@@ -65,6 +65,7 @@ import {
   confirmedPreferences,
   decisionsPage,
   historyPages,
+  isViewInput,
   sharedPreferences,
   viewEntries,
   type PageModel,
@@ -87,10 +88,19 @@ import {
   type ReplacedReason,
 } from "./view-records.ts";
 import { claimSettled, releaseIfRequested, renderLockTarget } from "./writer.ts";
-import { readPageStats, sameStat, statPage, writePageStats, type PageStats } from "./page-stats.ts";
+import {
+  readPageStats,
+  sameStat,
+  settledStat,
+  statPage,
+  writePageStats,
+  type PageStats,
+} from "./page-stats.ts";
 import { pageFileInside } from "./page-path.ts";
 import { retirePages, type RetireContext } from "./retire.ts";
 import { topicPages } from "./topic-pages.ts";
+import { withHeldDecisions } from "../topics/held-decisions.ts";
+import { decisionTitlesOfCatchUp } from "../topics/decision-titles.ts";
 import { foldViewWriter } from "./writer-fold.ts";
 
 export interface ViewPassOptions extends RecordOptions {
@@ -137,11 +147,18 @@ export function buildPages(store: StoreHandle, read: ViewCatchUp): Map<string, P
   const strings = viewStrings(typeof lang === "string" ? lang : null);
   const all = sharedPreferences(shared);
   const prefs = confirmedPreferences(all);
-  const entries = viewEntries(shared, all);
+  // The decision page titles of this read, for every page that names a
+  // decision: every shared version folded, none when the read missed one
+  // (`topics/decision-titles.ts`).
+  const titles = decisionTitlesOfCatchUp(read, ["shared"]);
+  const entries = viewEntries(shared, all, titles);
   const corrections = foldCorrections(shared);
   // Topic records that carry a `<private>` region stay off the pages, as
   // every other record family's do.
-  const topics = foldTopics(shared.filter((r) => !valueCarriesPrivateRegion(r.body)));
+  const plain = shared.filter((r) => !valueCarriesPrivateRegion(r.body));
+  // A topic shows the decisions it holds as decision items, derived from
+  // the same shared records (`topics/held-decisions.ts`).
+  const topics = withHeldDecisions(foldTopics(plain), plain, new Set(), titles);
   const models = [
     aboutMePage(store.storeId, prefs, strings),
     decisionsPage(store.storeId, entries, strings),
@@ -209,7 +226,7 @@ function ingest(
       ? { records: [], refusal: null }
       : reviewedEdits(page, pageLines(base.text), base.keys, pageLines(text));
   const done = ingestVersion(ctx.store, page, text, reason, reviewed.records, ctx.options);
-  ctx.read = catchUp(ctx.store, ctx.options.now);
+  ctx.read = catchUpWhere(ctx.store, isViewInput, ctx.options.now);
   delete ctx.models;
   return {
     records: done.records,
@@ -220,14 +237,23 @@ function ingest(
 
 function renderOnePage(ctx: PageContext, page: string, path: string): PageReport {
   if (unchangedByStat(ctx, page, path)) return { page, status: "unchanged", ingested: 0 };
+  // The observation clock: wall-clock time (not the pass clock, it is
+  // compared with file times), captured before this pass reads or writes
+  // the page. A stat taken later proves the bytes only if the page's times
+  // are older than this by the racy window: a clock read after the render
+  // could be past a same-size edit that landed between the read and the
+  // stat, and would vouch for it as the writer's own render.
+  const observedAtMs = Date.now();
   const report = renderPageNow(ctx, page, path);
   const stat = statPage(path);
   const last = lastRender(ctx.read, page);
   // Cached only when this pass left the writer's own render on disk: a
   // page left as found (its base not synced, refused, busy) must be read
-  // again next pass, or an edit on it would never be ingested.
+  // again next pass, or an edit on it would never be ingested. A stat
+  // too recent to vouch for the bytes is not kept either: an edit saved
+  // at the same size in the same tick of the volume's clock keeps it.
   const settled = report.status === "written" || report.status === "unchanged";
-  if (stat !== null && last !== null && settled) {
+  if (stat !== null && last !== null && settled && settledStat(stat, observedAtMs)) {
     ctx.stats.set(page, { ...stat, sum: last.record.body["sum"] as string });
   } else {
     ctx.stats.delete(page);
@@ -326,6 +352,7 @@ function renderPageNow(ctx: PageContext, page: string, path: string): PageReport
 
 /** Write the render records a dead pass left only as intents. */
 function recoverIntents(ctx: PageContext, target: string): void {
+  let wrote = false;
   for (const intent of pendingIntents(ctx.store)) {
     const path = pageFileInside(target, intent.page);
     let disk: Buffer | null = null;
@@ -337,10 +364,14 @@ function recoverIntents(ctx: PageContext, target: string): void {
     const recorded = ownSums(ctx.read, intent.page).has(intent.sum);
     if (disk !== null && bytesSum(disk) === intent.sum && !recorded) {
       writeRender(ctx.store, intent, ctx.options);
+      wrote = true;
     }
     clearIntent(ctx.store, intent.page);
   }
-  ctx.read = catchUp(ctx.store, ctx.options.now);
+  // Read again only when a render record was written: the pass's own read
+  // (taken under the render lock) already holds everything else, and a
+  // second whole-store read cost a large store as much as the first.
+  if (wrote) ctx.read = catchUpWhere(ctx.store, isViewInput, ctx.options.now);
 }
 
 /** Errors of a page another program holds; the page is rendered on a later pass. */
@@ -426,7 +457,7 @@ export function runViewPass(store: StoreHandle, options: ViewPassOptions): ViewP
     // The catch-up is taken under the lock too: a pass that rendered while
     // this one waited wrote render records a read from before the wait
     // would not know, and its pages would then read as a human edit.
-    const read = catchUp(store, options.now);
+    const read = catchUpWhere(store, isViewInput, options.now);
     if (read.unreadable.length > 0) {
       return { status: "incomplete-read", shards: read.unreadable.map((s) => s.path) };
     }

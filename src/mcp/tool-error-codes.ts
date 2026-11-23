@@ -53,6 +53,8 @@ import { NOTE_REVERT_ERROR, NoteRevertError } from "../core/brain/notes/revert.t
 import type { ScaffoldStubErrorCode } from "../core/brain/notes/scaffold-stub.ts";
 import { ScaffoldStubError } from "../core/brain/notes/scaffold-stub.ts";
 import { BrainParseError } from "../core/brain/parse-error.ts";
+import { DREAM_NOT_OWNER_CODE } from "../core/brain/dream-owner/constants.ts";
+import { DreamNotOwnerError } from "../core/brain/dream-owner/gate.ts";
 import type { PinnedBatchErrorCode } from "../core/brain/pinned.ts";
 import { PinnedBatchError } from "../core/brain/pinned.ts";
 import { BrainConfigError } from "../core/brain/policy/errors.ts";
@@ -70,6 +72,7 @@ import { WriteBatchError } from "../core/brain/write-batch.ts";
 import { ConfigReadError } from "../core/config.ts";
 import { SEARCH_ERROR_CODES, SearchError } from "../core/search/search-error.ts";
 import { StoreWriteError, type StoreWriteFailure } from "../core/store/store-write.ts";
+import type { TopicRefusalCode } from "../core/topics/write.ts";
 import { WRITE_BINDING_REFUSED_CODE } from "../core/write-binding/index.ts";
 import {
   VAULT_ADAPTER_REQUIRED_CODE,
@@ -94,6 +97,7 @@ import {
 } from "./protocol.ts";
 import { OutputContractError } from "./output-contract.ts";
 import { REACH_REFUSAL } from "./reach-refusal.ts";
+import { VaultUnexaminableError } from "../core/vault-unexaminable.ts";
 
 /** The `_meta` key an `isError` result carries its code under. */
 export const TOOL_ERROR_META_KEY = "open-second-brain/error";
@@ -152,6 +156,12 @@ export const TOOL_ERROR_CODE = Object.freeze({
    * 1); the payload names its reason and remedy ({@link ToolErrorDetail}).
    */
   storeWriteFailed: "store_write_failed",
+  /**
+   * The machine cannot tell whether the vault holds a legacy `Brain/`
+   * tree, because the vault cannot be examined (`VaultUnexaminableError`):
+   * the tool read and wrote nothing rather than guess a layout.
+   */
+  vaultUnreadable: "vault_unreadable",
 } as const);
 
 /** Closed union over {@link TOOL_ERROR_CODE}. */
@@ -300,6 +310,18 @@ const STORAGE_CAPACITY_CODES = exhaustiveMembers<StorageErrorCode>()([
 ]);
 
 /**
+ * The `brain_topic` refusals: a refused action is `topic_invalid`, a
+ * refused topic write `topic_` and its reason (`topics/write.ts`). The
+ * kebab `unknown-topic` is the reason's own spelling, kept as the wire
+ * already carries it.
+ */
+const TOPIC_REFUSAL_CODES = exhaustiveMembers<TopicRefusalCode>()([
+  "topic_invalid",
+  "topic_unknown-topic",
+  "topic_unreadable",
+]);
+
+/**
  * The leaf vocabulary, re-exported under the one name consumers of the
  * wire vocabulary already import from here. The canonical home stays in
  * the leaf; this only spares callers a second import path.
@@ -354,6 +376,9 @@ export const TOOL_ERROR_CODES = Object.freeze([
     ...STORAGE_CAPACITY_CODES,
     COUNT_GUARD_WIRE_CODE,
     ...EXPIRATION_REFUSAL_CODES,
+    ...TOPIC_REFUSAL_CODES,
+    // A live dream path refused on a device that is not the dream owner.
+    DREAM_NOT_OWNER_CODE,
   ] as const),
 ]);
 
@@ -465,6 +490,7 @@ const CLASSIFICATION: ReadonlyArray<ClassificationRule> = Object.freeze([
   // Carries the mismatch's code on purpose (see its class): the message
   // tells a damaged binding file from a swapped vault.
   carried(VaultBindingsUnreadableError),
+  carried(DreamNotOwnerError),
   fixed(CountGuardError, COUNT_GUARD_WIRE_CODE),
   fixed(VaultFrozenError, VAULT_FROZEN_REFUSAL),
   fixed(MigrationInProgressError, MIGRATION_IN_PROGRESS_REFUSAL),
@@ -480,6 +506,10 @@ const CLASSIFICATION: ReadonlyArray<ClassificationRule> = Object.freeze([
   fixed(InvalidExpirationTargetError, EXPIRATION_REFUSAL_CODE.invalidTarget),
   fixed(QuoteCheckError, TOOL_ERROR_CODE.quoteUnverified),
   fixed(StoreWriteError, TOOL_ERROR_CODE.storeWriteFailed),
+  // The class, not a call site: the store-only predicate's error extends
+  // it, and so does the path-safety check's realpath of a vault it cannot
+  // look at (macOS answers a mode-000 vault's realpath with EACCES).
+  fixed(VaultUnexaminableError, TOOL_ERROR_CODE.vaultUnreadable),
 ]);
 
 /**

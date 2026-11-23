@@ -24,11 +24,15 @@
  *   an answer to a remote caller's read.
  */
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
 
 import { lexCode } from "../../helpers/source-lexer.ts";
+import { SOURCE_SCAN_BUDGET_MS } from "../../helpers/source-scan-timeout.ts";
+
+// A test here reads the whole source tree; see tests/helpers/source-scan-timeout.ts.
+setDefaultTimeout(SOURCE_SCAN_BUDGET_MS);
 
 const REPO_ROOT = join(import.meta.dir, "..", "..", "..");
 const SRC_ROOT = join(REPO_ROOT, "src");
@@ -130,14 +134,19 @@ const LOG_READERS: Readonly<Record<string, LogReaderRow>> = Object.freeze(
       "`logEntryAtReach` with the caller's view; the digest's log window moved out of `digest.ts` in the 700-line split (task 3.19)",
     ),
     ...rows(
+      ["core/brain/schema-report.ts"],
+      "at-reach",
+      "the store log's event kinds for the schema report; a caller below local reach (`privateWithheld`) is not counted the private partition's events",
+    ),
+    ...rows(
       ["core/brain/doctor/orphan-session-check.ts", "core/brain/doctor/records.ts"],
       "computation",
       "D2, settled rows",
     ),
     ...rows(
-      ["core/brain/dream-refresh.ts", "core/brain/evidence.ts"],
+      ["core/brain/evidence-read.ts"],
       "computation",
-      "dream and evidence (task 3.18)",
+      "window-owned evidence reads and the direct retire snapshot (dream-window-context)",
     ),
     ...rows(
       [

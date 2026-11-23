@@ -4,11 +4,14 @@
  * into its fuller note (layer 2) and paginated raw chunks (layer 3).
  */
 
+import { storeRecordJudge } from "./brain-store/entity-filter.ts";
 import { normalizeAgentScope } from "../graph/agent-scope.ts";
 import { formatLinePointer } from "./line-numbering.ts";
+import { admitIndexRefs, resolvePoolFilters } from "./pipeline/pool-filters.ts";
 import { isPathOwnerVisible, isPathReadableAtReach } from "./result-filters.ts";
 import { resolvedTransportReach, type TransportReach } from "../graph/transport-reach.ts";
 import { markWindow, matchOffset, toCodePointOffset, windowStartWithin } from "./snippet-window.ts";
+import { openReadWithUpgrade } from "./self-heal.ts";
 import { Store } from "./store.ts";
 import { SearchError } from "./types.ts";
 import type {
@@ -152,7 +155,9 @@ export async function expandHit(
   }
   const agentScope = normalizeAgentScope(input.agentScope);
   const reach = resolvedTransportReach(input.transportReach);
-  const store = await Store.open(config, { mode: "read" });
+  // The same in-place upgrade the query path performs: an older schema
+  // is upgraded here rather than reported as a rebuild to do.
+  const store = await openReadWithUpgrade(config);
   try {
     const hit = store.hydrateChunks([input.chunkId]).get(input.chunkId);
     if (hit === undefined) {
@@ -162,6 +167,17 @@ export async function expandHit(
       throw notFound(input.chunkId);
     }
     if (!reachReadable(config, store, hit.path, reach)) {
+      throw notFound(input.chunkId);
+    }
+    // A card handed out before its store record was forgotten, marked or
+    // staged expands to nothing once the store rule hides it, also while
+    // the index still holds it (`brain-store/entity-filter.ts`).
+    //
+    // Every other rule the result list runs (visibility and session/project
+    // scope, the status rule): the card came from a search that withheld
+    // what these withhold, so the drill-down by a sequential id cannot
+    // serve it either.
+    if (!storeRecordJudge(store)(hit.path) || !admittedAsSearchRow(config, store, hit, input)) {
       throw notFound(input.chunkId);
     }
     // Document chunks in `chunkIndex` order: the fuller note (layer 2) is
@@ -227,6 +243,25 @@ function notFound(chunkId: number): SearchError {
  * the page's visibility is honoured beside the file's - see
  * {@link isPathReadableAtReach}.
  */
+function admittedAsSearchRow(
+  config: ResolvedSearchConfig,
+  store: Store,
+  hit: { readonly path: string; readonly documentId: number },
+  input: ExpandHitInput,
+): boolean {
+  const filters = resolvePoolFilters({
+    query: "",
+    ...(input.transportReach !== undefined ? { transportReach: input.transportReach } : {}),
+    ...(input.visibility !== undefined ? { visibility: input.visibility } : {}),
+    ...(input.agentScope !== undefined ? { agentScope: input.agentScope } : {}),
+    ...(input.scope !== undefined ? { scope: input.scope } : {}),
+  });
+  const ctx = { vault: config.vault, store, frontmatterCache: new Map() };
+  return (
+    admitIndexRefs([{ path: hit.path, documentId: hit.documentId }], filters, ctx).length === 1
+  );
+}
+
 function reachReadable(
   config: ResolvedSearchConfig,
   store: Store,

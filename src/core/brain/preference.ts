@@ -65,7 +65,7 @@ import {
   formatFrontmatter,
   parseFrontmatter,
   parseFrontmatterWithNotices,
-  slugify,
+  resolveTitleSlug,
   writeFrontmatterAtomic,
 } from "../vault.ts";
 import { FileAlreadyExistsError } from "../fs-atomic.ts";
@@ -85,7 +85,7 @@ import {
   preferencePageProse,
   renderPreferenceBody,
 } from "./preference-body.ts";
-import { requireObsidianTagValue, scopeTagValues } from "./tag-syntax.ts";
+import { requireObsidianTagValue, scopeTagValues, topicTagValue } from "./tag-syntax.ts";
 import { BrainParseError } from "./parse-error.ts";
 import { FrontmatterTierConflictError, mergeFrontmatterTiered } from "./frontmatter-tiers.ts";
 import { loadSchemaPack } from "./schema-pack.ts";
@@ -102,8 +102,10 @@ import {
   preferencePathOf,
   retiredPath,
   retiredPathOf,
+  isValidSlug,
   validateSlug,
 } from "./paths.ts";
+import { topicKey } from "./dream-plan.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
 import { OWNER_UNRESOLVED, normalizeAgentScope, ownerStampFor } from "../graph/agent-scope.ts";
 import { normalizeAgentArgument } from "../agent-identity.ts";
@@ -437,6 +439,14 @@ export interface MoveToRetiredOptions {
    * not change the legacy file.
    */
   readonly authority?: Authority;
+  /**
+   * The store's fold entry of the preference, already read by the caller
+   * (a store-only retire). A dream pass retires many preferences in one
+   * loop and reads the fold once for all of them; without this each retire
+   * re-read the whole `events` stream, since the previous retire's record
+   * changed the shard the fold cache is stamped on. Absent: read here.
+   */
+  readonly storeEntry?: StorePreference;
 }
 
 export interface MoveToRetiredResult {
@@ -666,6 +676,14 @@ function writeStorePreference(
   );
   recordPreferenceKey(vault, idKey, idContentHash, owned.created_at, id, path, privacy);
   return { path, id };
+}
+
+/** The evidence list of a page about to retire: its derived `_evidenced_by`, else a plain `evidenced_by`. */
+function retiredEvidence(meta: FrontmatterMap, prefPath: string): string[] {
+  const managed = optionalStringArray(meta, "_evidenced_by", prefPath);
+  return managed.length > 0
+    ? [...managed]
+    : [...optionalStringArray(meta, "evidenced_by", prefPath)];
 }
 
 /** Fields only a retire writes: never part of a live preference. */
@@ -1228,7 +1246,7 @@ function composePreferenceTags(input: WritePreferenceInput): string[] {
   // refusal for rewrites of persisted records.
   push("brain");
   push("brain/preference");
-  push(`brain/topic/${requireObsidianTagValue(slugify(input.topic.trim()), "topic")}`);
+  push(`brain/topic/${topicTagValue(input.topic)}`);
   for (const scope of scopeTagValues(input.scope ?? "", {
     record: `pref-${input.slug}`,
     lenient: input.lenientScopeTags === true,
@@ -1385,6 +1403,26 @@ export function loadPreference(
 }
 
 /**
+ * {@link loadPreference} of a store-only machine for a fold entry the
+ * caller already read (a dream pass reads the fold once for its whole
+ * retire loop): the same parse of the same meta, without reading the fold
+ * again after the caller's previous write moved its cache stamp. `null`
+ * for a retired entry, as `loadPreference` answers.
+ */
+export function preferenceFromStoreEntry(
+  vault: string | null,
+  slug: string,
+  entry: StorePreference,
+  options: ParsePreferenceOptions = {},
+): BrainPreference | null {
+  if (!entry.state.exists) return null;
+  const page = storeEntryMeta(entry, slug);
+  return page.retired
+    ? null
+    : preferenceFromMeta(page.meta, preferencePathOf(vault, slug), options);
+}
+
+/**
  * Whether the preference `pref-<slug>` is active, retired or absent: its
  * pages on an unswitched machine, the store's fold once switched.
  */
@@ -1400,6 +1438,69 @@ export function preferencePresence(
   }
   if (existsSync(preferencePath(vault, slug))) return "active";
   return existsSync(retiredPath(vault, slug)) ? "retired" : "absent";
+}
+
+/**
+ * The slug a preference derived from `topic` files under (the
+ * `brain_feedback` force-confirmed rule, a fact marker's derived rule):
+ * `titleSlug`, which keeps letters of any script, unless an older
+ * release already filed this topic's rule under the Latin-only
+ * `slugify` (`pref-unnamed-<hash>` for "без восклицаний", `pref-release`
+ * for "Проект release"). That rule, live or retired, IS this topic's rule
+ * when it carries the same topic under {@link topicKey}, the identity the
+ * dream pass groups topics by, so its slug is answered and a re-recorded
+ * topic meets it (the writer refuses a second rule beside it) instead of
+ * minting `pref-<new slug>` next to it. A different topic that once shared
+ * the old slug, or merely keys like this one, does not reach it
+ * ({@link resolveTitleSlug}). An old slug no rule can hold (a bare device
+ * name such as `con`, which `validateSlug` refuses) counts as absent, and
+ * so does a rule the caller's `readable` withholds: it is never read, and
+ * the answer is the one an absent rule gets. Pages are never renamed, so
+ * no migration is needed; for an ASCII topic both slugs are equal and no
+ * page is read.
+ */
+export function resolvePreferenceSlug(
+  vault: string | null,
+  topic: string,
+  configPath?: string,
+  readable?: (rel: string) => boolean,
+): string {
+  return resolveTitleSlug(
+    topic,
+    (slug) => preferenceTopicsAt(vault, slug, configPath, readable),
+    (stored, value) => topicKey(stored) === topicKey(value),
+  );
+}
+
+/** The topic the rule at `slug` (live or retired) carries, or null when there is none. */
+function preferenceTopicsAt(
+  vault: string | null,
+  slug: string,
+  configPath?: string,
+  readable?: (rel: string) => boolean,
+): readonly string[] | null {
+  if (!isValidSlug(slug)) return null;
+  let meta: FrontmatterMap;
+  if (vault === null || preferencesStoreOnly(vault, configPath)) {
+    // The fold holds one record per rule, live or retired: the reach is
+    // asked of that record's own page (the path an absent one would have
+    // is not there to withhold anything), before its fields are read.
+    const entry = storePreferenceEntry(slug, configPath);
+    if (entry === undefined) return null;
+    const rel = isRetiredEntry(entry) ? retiredPathOf(null, slug) : preferencePathOf(null, slug);
+    if (readable !== undefined && !readable(rel)) return null;
+    const page = storePreferenceMeta(slug, configPath);
+    if (page === null) return null;
+    meta = page.meta;
+  } else {
+    const path = [preferencePath(vault, slug), retiredPath(vault, slug)].find((p) => existsSync(p));
+    if (path === undefined) return null;
+    if (readable !== undefined && !readable(relative(vault, path).replaceAll("\\", "/"))) {
+      return null;
+    }
+    [meta] = parseFrontmatter(path);
+  }
+  return typeof meta["topic"] === "string" ? [meta["topic"]] : [];
 }
 
 /**
@@ -1778,7 +1879,9 @@ export function moveToRetired(
   // Store-only (task 2.10): the preference is read from the store's fold
   // and the retire is records only; no page is written or removed.
   const storeOnly = vault === null || preferencesStoreOnly(vault);
-  const [meta, body] = storeOnly ? storeRetireSource(prefPath) : parseFrontmatter(prefPath);
+  const [meta, body] = storeOnly
+    ? storeRetireSource(prefPath, opts.storeEntry)
+    : parseFrontmatter(prefPath);
   if (meta["kind"] !== "brain-preference") {
     throw new Error(
       `moveToRetired: expected a preference file; got kind ${JSON.stringify(meta["kind"])} (${prefPath})`,
@@ -1870,7 +1973,8 @@ export function moveToRetired(
     // Once switched, a preference the fold holds as private (any of its
     // records sits in `private/`, whatever its fields say) keeps its
     // retire there too: one entity, one partition, as the other writers.
-    const heldPrivate = storeOnly && (storePreferenceEntry(slug)?.private ?? true);
+    const heldPrivate =
+      storeOnly && ((opts.storeEntry ?? storePreferenceEntry(slug))?.private ?? true);
     return preferenceStoreRecords(
       oldId,
       lifecycle,
@@ -1893,7 +1997,10 @@ export function moveToRetired(
         created_at: requireString(meta, "created_at", prefPath),
         unconfirmed_until: requireString(meta, "unconfirmed_until", prefPath),
         status: BRAIN_PREFERENCE_STATUS.confirmed, // body render is status-agnostic
-        evidenced_by: optionalStringArray(meta, "evidenced_by", prefPath),
+        // The page carries the list under its derived `_` name: read there
+        // first, so the retired page's `## Origin` list is the field's, as
+        // a page rebuilt from the store renders it (FORMAT.md "Preferences").
+        evidenced_by: retiredEvidence(meta, prefPath),
         ...(opts.evidenceApplied !== undefined ? { recentApplied: opts.evidenceApplied } : {}),
         ...(opts.evidenceViolated !== undefined ? { recentViolated: opts.evidenceViolated } : {}),
       };
@@ -1902,11 +2009,11 @@ export function moveToRetired(
       // retired file is the canonical historical snapshot in both paths.
       let renderInputWithEvidence: WritePreferenceInput = renderInput;
       if (renderInput.recentApplied === undefined && renderInput.recentViolated === undefined) {
-        // Late-bound import to avoid a cyclic dependency: evidence.ts
-        // imports nothing from preference.ts at module load time.
+        // Late-bound import keeps the command-line read outside dream's
+        // evidence window while avoiding a dependency cycle.
         // eslint-disable-next-line @typescript-eslint/no-require-imports
         const ev = (
-          require("./evidence.ts") as typeof import("./evidence.ts")
+          require("./evidence-read.ts") as typeof import("./evidence-read.ts")
         ).collectEvidenceForSlug(vault, slug, { sinceIso: renderInput.created_at });
         renderInputWithEvidence = {
           ...renderInput,
@@ -1971,9 +2078,17 @@ export function moveToRetired(
  * page is not written). Throws when the fold holds no active preference
  * of that id, as the page read throws for a missing page.
  */
-function storeRetireSource(prefPath: string): [FrontmatterMap, string] {
+function storeRetireSource(
+  prefPath: string,
+  entry: StorePreference | undefined,
+): [FrontmatterMap, string] {
   const slug = basename(prefPath, ".md").slice("pref-".length);
-  const page = slug === "" ? null : storePreferenceMeta(slug);
+  const page =
+    slug === ""
+      ? null
+      : entry !== undefined && entry.state.exists
+        ? storeEntryMeta(entry, slug)
+        : storePreferenceMeta(slug);
   if (page === null || page.retired) {
     throw new Error(`moveToRetired: the brain store holds no active preference pref-${slug}`);
   }

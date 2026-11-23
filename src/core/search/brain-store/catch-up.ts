@@ -24,18 +24,24 @@
  * store into the staging file before the swap ({@link ingestStoreInto}).
  */
 
+import { accessSync, constants as fsConstants, lstatSync, readdirSync } from "node:fs";
+import { join, posix } from "node:path";
+
 import { Database } from "bun:sqlite";
 
 import { readDeviceId } from "../../config.ts";
 import { closeDatabase } from "../../sqlite-close.ts";
 import { observeClock } from "../../store/clock-store.ts";
 import { compareHlc, parseHlc } from "../../store/hlc.ts";
-import { readBlobBody, readShard } from "../../store/reader.ts";
-import { blobPath, partitionDir } from "../../store/store-paths.ts";
+import { readBlobBody, scanShard, type ShardScan } from "../../store/reader.ts";
+import { isReadableDeviceDir, isShardFileName } from "../../store/shard-list.ts";
+import { quarantineStamp } from "../../store/shard-quarantine.ts";
+import { blobPath, blobStamp, partitionDir } from "../../store/store-paths.ts";
 import { SIGNAL_KIND, type StorePartition } from "../../store/constants.ts";
 import { SIGNAL_STATE_KIND } from "../../store/fold-signals.ts";
 import { LANE_ENTRY_KIND } from "../../store/lane-records.ts";
-import { TOMBSTONE_KINDS, voidedRecordIds } from "../../store/removal-backlog.ts";
+import { TOMBSTONE_KINDS } from "../../store/removal-backlog.ts";
+import { isBlobRef, type StoreRecord } from "../../store/envelope.ts";
 import { LATEST_SCHEMA_VERSION, readSchemaVersion } from "../schema.ts";
 import { Store } from "../store.ts";
 import {
@@ -56,7 +62,19 @@ import {
   writerLeaseCheckIn,
 } from "../store/writer-lock.ts";
 import { SearchError, type ResolvedSearchConfig } from "../types.ts";
-import { STORE_CATCH_UP_INTERVAL_ENV, STORE_CATCH_UP_INTERVAL_MS } from "./constants.ts";
+import {
+  STORE_CATCH_UP_INTERVAL_ENV,
+  STORE_CATCH_UP_INTERVAL_MS,
+  STORE_FOLD_CLEANUP_KEY,
+  STORE_LIFECYCLE_MARKS_KEY,
+} from "./constants.ts";
+import {
+  carriesLifecycleMark,
+  forgetting,
+  type ForgottenRefs,
+  isForgettingFoldInput,
+  isForgettingFoldKind,
+} from "./forgotten.ts";
 import { completePendingRecord, ingestRecord, removeRecord } from "./ingest.ts";
 import type { IndexedStore } from "./location.ts";
 import { settleOrphans, type Orphans } from "./orphans.ts";
@@ -111,6 +129,8 @@ interface ProcessState {
    * it triggers a write pass again only once it changes.
    */
   pendingBlobs: ReadonlyMap<string, FileStat | null>;
+  /** The index owes a forgetting fold an earlier pass did not finish (`STORE_FOLD_CLEANUP_KEY`). */
+  cleanupOwed: boolean;
 }
 
 const states = new Map<string, ProcessState>();
@@ -152,6 +172,7 @@ function stateFor(config: ResolvedSearchConfig, store: IndexedStore): ProcessSta
     indexIdentity: null,
     known: null,
     pendingBlobs: new Map(),
+    cleanupOwed: false,
   };
   states.set(config.dbPath, fresh);
   return fresh;
@@ -195,7 +216,11 @@ function pendingBlobPaths(store: IndexedStore, db: Database): string[] {
 function peekIndex(
   dbPath: string,
   store: IndexedStore,
-): { known: Map<string, FileStat>; pendingBlobs: Map<string, FileStat | null> } | null {
+): {
+  known: Map<string, FileStat>;
+  pendingBlobs: Map<string, FileStat | null>;
+  cleanupOwed: boolean;
+} | null {
   let db: Database;
   try {
     db = new Database(dbPath, { readonly: true });
@@ -206,7 +231,11 @@ function peekIndex(
     if (readSchemaVersion(db) !== LATEST_SCHEMA_VERSION || !hasBrainRecordTables(db)) return null;
     // Not looked at yet: a blob already present triggers one pass.
     const pendingBlobs = new Map(pendingBlobPaths(store, db).map((p) => [p, null] as const));
-    return { known: knownFrom(readWatermarks(db)), pendingBlobs };
+    const owed =
+      db
+        .query<{ value: string }, [string]>("SELECT value FROM index_state WHERE key = ?")
+        .get(STORE_FOLD_CLEANUP_KEY)?.value === "1";
+    return { known: knownFrom(readWatermarks(db)), pendingBlobs, cleanupOwed: owed };
   } catch {
     return null;
   } finally {
@@ -218,9 +247,15 @@ interface SyncTotals {
   shardsRead: number;
   /** Tombstones (`signal-removed`, `preference-remove`, `lane-entry-remove`) ingested this pass. */
   tombstones: number;
+  /**
+   * Records read this pass that set or clear an entity's lifecycle status
+   * (`_status: tombstoned` and its undoing, `forgotten.ts`), skipped ones
+   * included.
+   */
+  lifecycleMarks: number;
   added: number;
-  /** Records added this pass of a kind a tombstone can void (a signal, a preference, a lane entry). */
-  voidableAdded: number;
+  /** Records read this pass (added, refreshed or already indexed) of a kind a tombstone can void (a signal, a preference, a lane entry). */
+  voidableRead: number;
   removed: number;
   completed: number;
   /** Largest clock ingested from another device. */
@@ -232,6 +267,13 @@ interface SyncTotals {
    * is read again instead of being taken as already looked at.
    */
   pendingBlobs: Map<string, FileStat | null>;
+  /** The pass's progress callback, called after each record read. */
+  readonly progress?: ShardProgress;
+  /**
+   * Record ids this pass must not index: a rebuild's ids its store's
+   * tombstones already voided ({@link ingestStoreInto}).
+   */
+  readonly skip?: ReadonlySet<string>;
 }
 
 /**
@@ -257,34 +299,53 @@ function readOneShard(
     shard.size >= mark.offset &&
     prefixHash(shard.path, mark.offset) === mark.prefixHash;
   const from = resume ? mark.offset : 0;
-  const read = readShard(shard.path, {
-    offset: from,
-    partitionRoot: partitionDir(store.root, shard.partition),
-  });
-  totals.shardsRead++;
   const seen = new Set<string>();
-  for (const r of read.records) {
-    // A shard read from its start can hold every record the store has; the
-    // writer lock this pass runs under beats as it goes.
-    writerLeaseCheckIn();
-    const outcome = ingestRecord(index, config, r.record, shard, r.bodyState === "pending");
-    // A copy refused for sitting in the other partition does not hold the
-    // record: it must not keep an orphaned row alive.
-    if (outcome === "refused") continue;
-    if (TOMBSTONE_KINDS.has(r.record.kind)) totals.tombstones++;
-    seen.add(r.record.id);
-    orphans.delete(r.record.id);
-    if (outcome === "added") {
-      totals.added++;
-      if (isVoidableKind(r.record.kind)) totals.voidableAdded++;
-    }
-    if (r.record.device !== device) {
-      const hlc = parseHlc(r.record.hlc);
-      const best = totals.remoteHlc === null ? null : parseHlc(totals.remoteHlc);
-      if (hlc !== null && (best === null || compareHlc(hlc, best) > 0))
-        totals.remoteHlc = r.record.hlc;
-    }
+  // Read record by record (a shard read from its start can hold every
+  // record the store has, and none is kept past its ingest), and ingested
+  // in batches of one transaction each: a commit per record synced the
+  // index once per record, minutes for a migrated store.
+  const batch = new IngestBatch(db);
+  let read: ShardScan;
+  try {
+    read = scanShard(
+      shard.path,
+      { offset: from, partitionRoot: partitionDir(store.root, shard.partition) },
+      (r) => {
+        // The writer lock this pass runs under beats as it goes.
+        writerLeaseCheckIn();
+        if (carriesLifecycleMark(r.record)) totals.lifecycleMarks++;
+        if (totals.skip?.has(r.record.id) === true) {
+          totals.progress?.(shard, r.offset + r.length, totals.added);
+          return;
+        }
+        batch.tick();
+        const outcome = ingestRecord(index, config, r.record, shard, r.bodyState === "pending");
+        // A copy refused for sitting in the other partition does not hold
+        // the record: it must not keep an orphaned row alive.
+        if (outcome === "refused") return;
+        if (TOMBSTONE_KINDS.has(r.record.kind)) totals.tombstones++;
+        seen.add(r.record.id);
+        orphans.delete(r.record.id);
+        if (outcome === "added") totals.added++;
+        // Counted whatever the outcome: a record a read that failed later
+        // already committed reads as unchanged on the retry, and the
+        // tombstone cleanup it needs must still run then.
+        if (isVoidableKind(r.record.kind)) totals.voidableRead++;
+        if (r.record.device !== device) {
+          const hlc = parseHlc(r.record.hlc);
+          const best = totals.remoteHlc === null ? null : parseHlc(totals.remoteHlc);
+          if (hlc !== null && (best === null || compareHlc(hlc, best) > 0))
+            totals.remoteHlc = r.record.hlc;
+        }
+        totals.progress?.(shard, r.offset + r.length, totals.added);
+      },
+    );
+    batch.end();
+  } catch (e) {
+    batch.abandon();
+    throw e;
   }
+  totals.shardsRead++;
   if (!resume && mark !== undefined) {
     for (const id of recordIdsOfShard(db, shard.key)) if (!seen.has(id)) orphans.set(id, shard.key);
   }
@@ -315,6 +376,51 @@ function readOneShard(
   return { watermark, fromStart: !resume };
 }
 
+/** Records ingested per transaction of a catch-up. */
+const INGEST_BATCH_RECORDS = 500;
+
+/**
+ * The transactions a shard's ingest runs in: one per
+ * {@link INGEST_BATCH_RECORDS} records. A batch that fails is rolled back
+ * whole; its shard's watermark has not moved, so the next pass reads those
+ * records again (ingest is idempotent by record id). Inside a transaction
+ * the caller holds already, it opens none.
+ */
+class IngestBatch {
+  private open = false;
+  private count = 0;
+  private readonly owned: boolean;
+
+  constructor(private readonly db: Database) {
+    this.owned = !db.inTransaction;
+  }
+
+  /** Before each record: open the batch, or commit a full one and open the next. */
+  tick(): void {
+    if (!this.owned) return;
+    if (this.open && this.count >= INGEST_BATCH_RECORDS) {
+      this.db.exec("COMMIT");
+      this.open = false;
+    }
+    if (!this.open) {
+      this.db.exec("BEGIN");
+      this.open = true;
+      this.count = 0;
+    }
+    this.count += 1;
+  }
+
+  end(): void {
+    if (this.open) this.db.exec("COMMIT");
+    this.open = false;
+  }
+
+  abandon(): void {
+    if (this.open && this.db.inTransaction) this.db.exec("ROLLBACK");
+    this.open = false;
+  }
+}
+
 /** Every preference record kind starts with it (`preference-set`, `preference-evidence`, ...). */
 const PREFERENCE_KIND_PREFIX = "preference-";
 
@@ -329,31 +435,401 @@ function isVoidableKind(kind: string): boolean {
 }
 
 /**
- * Take out of `index` every record a tombstone voided (a forgotten
- * signal, a removed preference, a removed lane entry), over all `events`
- * shards. Returns how many rows
- * left the index.
+ * The body fields the forgetting folds read (`forgotten.ts`): a signal's
+ * capture and state moves, a preference's sets, evidence and removal, a
+ * lane entry's content and removal. A lane entry's text is kept as an
+ * empty string (its fold only checks it is one).
  */
-function dropVoidedRecords(
+const FOLD_BODY_FIELDS = [
+  "authority",
+  "id",
+  // A signal's page path: a forgotten signal's events are found by it too.
+  "path",
+  "staged",
+  "frontmatter",
+  "signal",
+  "state",
+  "fields",
+  "preference",
+  "result",
+  "lane",
+  "entry",
+  "text",
+] as const;
+
+/**
+ * `record` with only the body fields the folds read: the pass holds every
+ * fold record of the store at once, and a signal's raw text or a lane
+ * entry's page body is most of its size.
+ */
+function slimForFold(record: StoreRecord): StoreRecord {
+  // A body still a blob reference is kept whole: the folds set it aside as pending.
+  if (isBlobRef(record.body)) return record;
+  const body: Record<string, unknown> = {};
+  for (const field of FOLD_BODY_FIELDS) {
+    if (!(field in record.body)) continue;
+    const value = record.body[field];
+    body[field] = field === "text" && typeof value === "string" ? "" : value;
+  }
+  return { ...record, body };
+}
+
+/** A record of a fold the forgetting reads, by id, with the shard it was read from. */
+interface PlacedRecord {
+  readonly id: string;
+  readonly shard: ShardStat;
+  /** Its body is a blob that has not arrived: the folds set it aside. */
+  readonly pending: boolean;
+}
+
+/** What {@link forgottenInShards} read. */
+interface ForgettingRead {
+  /** Ids of the records the index must not hold. */
+  readonly ids: ReadonlySet<string>;
+  /** How log events reference the forgotten entities (`forgotten.ts`, `Forgetting.refs`). */
+  readonly refs: ForgottenRefs;
+  readonly records: ReadonlyArray<PlacedRecord>;
+  /**
+   * False when a shard left a gap the folds cannot see past: it could not
+   * be opened or read at all (permissions, a sharing violation), it was
+   * not a regular file when opened (a link or special file replaced it),
+   * or it holds a corrupt line that is neither torn nor quarantined. A
+   * tombstone, mark or approval may sit in the gap. Judged only by
+   * {@link foldComplete}.
+   */
+  readonly complete: boolean;
+  /**
+   * `<partition root>\0<sha>` of the blob of every fold record whose body
+   * is a blob, arrived (`blob`) or not (`pending`): each is an input of
+   * the fold, as present or as absent.
+   */
+  readonly spilledBlobs: ReadonlyArray<{ readonly key: string; readonly pending: boolean }>;
+}
+
+/**
+ * The records of the `events` shards among `shards` that the forgetting
+ * folds read (`forgotten.ts`), each with its shard, and the ids of those
+ * the index must not hold. Read record by record, keeping only what the
+ * folds read: the `events` stream also holds every other kind of the
+ * store's history. Never throws for a shard it cannot read: that shard is
+ * a gap ({@link ForgettingRead.complete}).
+ */
+function forgottenInShards(store: IndexedStore, shards: ReadonlyArray<ShardStat>): ForgettingRead {
+  const slim: StoreRecord[] = [];
+  const records: PlacedRecord[] = [];
+  const spilledBlobs: Array<{ key: string; pending: boolean }> = [];
+  let complete = true;
+  for (const shard of shards) {
+    if (shard.stream !== "events") continue;
+    const partitionRoot = partitionDir(store.root, shard.partition);
+    let read: ShardScan;
+    try {
+      read = scanShard(shard.path, { partitionRoot }, (r) => {
+        if (!isForgettingFoldInput(r.record)) return;
+        const pending = r.bodyState === "pending";
+        slim.push(slimForFold(r.record));
+        records.push({ id: r.record.id, shard, pending });
+        if (r.bodyState !== "inline") {
+          spilledBlobs.push({ key: `${partitionRoot}\0${r.record.sum}`, pending });
+        }
+      });
+    } catch {
+      complete = false;
+      continue;
+    }
+    if (
+      read.diagnostics.some(
+        (d) =>
+          d.kind === "not-a-file" ||
+          (d.kind === "corrupt-line" && d.torn !== true && d.quarantined !== true),
+      )
+    ) {
+      complete = false;
+    }
+  }
+  const { ids, refs } = forgetting(slim);
+  return { ids, refs, records, complete, spilledBlobs };
+}
+
+/**
+ * The one decision every writer of the forgetting fold goes through:
+ * whether a fold read may drive the index. Removals, revivals and the
+ * clearing of the owed-fold flag (`STORE_FOLD_CLEANUP_KEY`) happen only
+ * after a complete read; an incomplete one writes nothing and leaves the
+ * fold owed, so a later catch-up retries it once the gap is gone. Search
+ * fails closed meanwhile (`storeRecordVisibility` answers null for the
+ * same read).
+ */
+function foldComplete(read: ForgettingRead): boolean {
+  return read.complete;
+}
+
+/** Record that the index owes a forgetting fold (`STORE_FOLD_CLEANUP_KEY`). */
+function oweFold(index: Store): void {
+  if (index.getState(STORE_FOLD_CLEANUP_KEY) !== "1") index.setState(STORE_FOLD_CLEANUP_KEY, "1");
+}
+
+/** The owed fold is paid: cleared only by a fold whose read was complete. */
+function settleFold(index: Store, outcome: FoldOutcome): void {
+  if (outcome.complete) index.deleteState(STORE_FOLD_CLEANUP_KEY);
+}
+
+/** Whether an `events` shard name of a held partition is no regular file. */
+function eventsShardNotRegular(store: IndexedStore): boolean {
+  // Read straight from the directory entries, never opening one: the
+  // shard listing admits only regular files and links, and the scanner
+  // only regular files, so a shard-named FIFO, socket, device or folder,
+  // and a device folder that is a link or a file, are in no listing.
+  for (const partition of store.partitions) {
+    const streamDir = join(partitionDir(store.root, partition), "events");
+    const st = lstatSync(streamDir, { throwIfNoEntry: false });
+    if (st === undefined) continue;
+    if (!st.isDirectory()) return true;
+    for (const device of readdirSync(streamDir, { withFileTypes: true })) {
+      if (!isReadableDeviceDir(device.name)) continue;
+      if (!device.isDirectory()) return true;
+      for (const file of readdirSync(join(streamDir, device.name), { withFileTypes: true })) {
+        if (isShardFileName(file.name) && !file.isFile()) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** The availability stamp of each blob `blobs` names (`blobStamp`: `absent` when it is not there). */
+function blobStamps(blobs: ReadonlyArray<string>): string[] {
+  return blobs.map((key) => {
+    const [root, sha] = key.split("\0") as [string, string];
+    return blobStamp(root, sha);
+  });
+}
+
+/** What one fold did to the index, written only after a complete read. */
+interface FoldOutcome {
+  readonly complete: boolean;
+  readonly removed: number;
+  readonly added: number;
+  /** Blob paths of the records revived with their body still pending. */
+  readonly pendingBlobs: ReadonlyArray<string>;
+}
+
+/**
+ * Take out of `index` every record its store's entity readers no longer
+ * show (`forgotten.ts`: a forgotten signal, a removed preference or lane
+ * entry, an entity marked tombstoned, a staged signal), over all `events`
+ * shards. With `revive`, a record of those folds that is not forgotten
+ * and that the index does not hold (an entity whose mark was undone since
+ * it left) is read again from its shard and indexed. Writes nothing and
+ * owes the fold when the read is incomplete ({@link foldComplete}).
+ */
+function dropForgotten(
   index: Store,
+  config: ResolvedSearchConfig,
   store: IndexedStore,
   shards: ReadonlyArray<ShardStat>,
-): number {
-  const records = shards
-    .filter((shard) => shard.stream === "events")
-    .flatMap((shard) =>
-      readShard(shard.path, {
-        partitionRoot: partitionDir(store.root, shard.partition),
-      }).records.map((r) => r.record),
-    );
+  revive: boolean,
+): FoldOutcome {
+  const read = forgottenInShards(store, shards);
+  if (!foldComplete(read)) {
+    oweFold(index);
+    return { complete: false, removed: 0, added: 0, pendingBlobs: [] };
+  }
+  const { ids, records } = read;
   const db = index.brainRecordsConnection();
+  const revivedPending: string[] = [];
   let removed = 0;
-  for (const id of voidedRecordIds(records)) {
+  for (const id of ids) {
     const row = getRecord(db, id);
     if (row === null) continue;
     removeRecord(index, row);
     removed++;
   }
+  let added = 0;
+  if (!revive) return { complete: true, removed, added, pendingBlobs: revivedPending };
+  const wanted = new Map<ShardStat, Set<string>>();
+  for (const placed of records) {
+    if (ids.has(placed.id) || getRecord(db, placed.id) !== null) continue;
+    let set = wanted.get(placed.shard);
+    if (set === undefined) wanted.set(placed.shard, (set = new Set()));
+    set.add(placed.id);
+  }
+  const batch = new IngestBatch(db);
+  try {
+    for (const [shard, set] of wanted) {
+      scanShard(shard.path, { partitionRoot: partitionDir(store.root, shard.partition) }, (r) => {
+        if (!set.has(r.record.id)) return;
+        set.delete(r.record.id);
+        writerLeaseCheckIn();
+        batch.tick();
+        const pending = r.bodyState === "pending";
+        const outcome = ingestRecord(index, config, r.record, shard, pending);
+        if (outcome === "added") added++;
+        if (pending)
+          revivedPending.push(blobPath(partitionDir(store.root, shard.partition), r.record.sum));
+      });
+    }
+    batch.end();
+  } catch (e) {
+    batch.abandon();
+    throw e;
+  }
+  return { complete: true, removed, added, pendingBlobs: revivedPending };
+}
+
+/**
+ * What a search may show of the store's fold records (`entity-filter.ts`),
+ * by the same rule the ingest applies: `hidden` are the ids the index must
+ * not hold (`forgotten.ts`), `known` the ids of every fold record read
+ * whole. A fold record that is not known (a body still pending, a record
+ * of a shard written since) is not shown either.
+ */
+export interface StoreVisibility {
+  readonly hidden: ReadonlySet<string>;
+  readonly known: ReadonlySet<string>;
+  /** How log events reference the forgotten entities: one that does is not shown (`forgotten.ts`). */
+  readonly hiddenRefs: ForgottenRefs;
+}
+
+/**
+ * The last visibility read per store root, with every input of the cold
+ * read it came from ({@link visibilityInputs}).
+ *
+ * THE INVARIANT: a cached visibility answer is served only if a cold read
+ * now would give the same answer or fail closed. A cold read
+ * ({@link forgottenInShards}) depends on exactly these inputs, and the
+ * cache key covers each one:
+ *
+ *  1. which partitions this machine holds, and the shard quarantine
+ *     ledger (a quarantined line reads differently);
+ *  2. the set of `events` shard names, regular or not (a name that is no
+ *     regular file is a gap: no cache, no answer);
+ *  3. each listed shard's identity, size and mtime (its bytes);
+ *  4. each listed shard's readability (a shard that cannot be opened now
+ *     is a gap even with its stat unchanged);
+ *  5. every blob that supplies a fold input, present or absent: the body
+ *     of a spilled record is read from it, and one that appears or goes
+ *     changes what the folds see.
+ *
+ * Inputs 2 to 5 are checked on every hit; inputs 1 and 3 form the stamp.
+ * A read is cached only when the blob stamps taken right after it still
+ * describe what it read (every pending blob still absent, every arrived
+ * one still present), so a blob that moved during the read never vouches
+ * for it. Cost: the check is one directory listing per device folder, one
+ * stat and one access check per shard and two `lstat`s per spilled fold
+ * blob, against a full read of every `events` shard for a cold read.
+ */
+const visibilityCache = new Map<
+  string,
+  {
+    readonly stamp: string;
+    readonly blobs: ReadonlyArray<string>;
+    readonly blobsStamp: string;
+    readonly value: StoreVisibility;
+  }
+>();
+
+/** Inputs 1 and 3 of the cold read ({@link visibilityCache}), as one stamp. */
+function visibilityInputs(store: IndexedStore, shards: ReadonlyArray<ShardStat>): string {
+  return [
+    store.partitions.join(","),
+    `quarantine=${quarantineStamp(store.root)}`,
+    ...shards.map((s) => `${s.key}:${s.identity}:${s.size}:${s.mtimeMs}`),
+  ].join("\n");
+}
+
+/** Input 4: whether every shard of `paths` can be opened for reading now. */
+function shardsReadable(paths: ReadonlyArray<string>): boolean {
+  for (const path of paths) {
+    try {
+      accessSync(path, fsConstants.R_OK);
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * The {@link StoreVisibility} of `store`, from the cache only under its
+ * invariant ({@link visibilityCache}); null when a shard cannot be listed
+ * or read, or one is no regular file (the caller then shows no fold
+ * record: fail closed).
+ */
+export function storeRecordVisibility(store: IndexedStore): StoreVisibility | null {
+  try {
+    // Input 2: a shard-named entry that is no regular file is in no
+    // listing of the scanner, and a tombstone, mark or approval may sit
+    // in it: no answer, cached or not.
+    if (eventsShardNotRegular(store)) {
+      visibilityCache.delete(store.root);
+      return null;
+    }
+    const shards = new ShardScanner(store).scan().filter((s) => s.stream === "events");
+    const stamp = visibilityInputs(store, shards);
+    const shardPaths = shards.map((s) => s.path);
+    // Input 4, before any answer: a cold read of an unreadable shard
+    // fails closed, so the cache must not answer either.
+    if (!shardsReadable(shardPaths)) {
+      visibilityCache.delete(store.root);
+      return null;
+    }
+    const cached = visibilityCache.get(store.root);
+    if (
+      cached !== undefined &&
+      cached.stamp === stamp &&
+      blobStamps(cached.blobs).join("\n") === cached.blobsStamp
+    ) {
+      return cached.value;
+    }
+    const read = forgottenInShards(store, shards);
+    // A gap in a shard may hide the record that hides another: no answer.
+    if (!foldComplete(read)) {
+      visibilityCache.delete(store.root);
+      return null;
+    }
+    const value: StoreVisibility = {
+      hidden: read.ids,
+      hiddenRefs: read.refs,
+      known: new Set(read.records.filter((p) => !p.pending).map((p) => p.id)),
+    };
+    // Input 5, stamped right after the read. It vouches for the read only
+    // when it still says what the read saw: each pending blob absent, each
+    // arrived one present; otherwise the answer is served but not kept.
+    const blobKeys = read.spilledBlobs.map((b) => b.key);
+    const blobs = blobStamps(blobKeys);
+    const consistent = read.spilledBlobs.every((b, i) =>
+      b.pending ? blobs[i] === "absent" : blobs[i] !== "absent",
+    );
+    if (consistent && visibilityInputs(store, shards) === stamp) {
+      visibilityCache.set(store.root, {
+        stamp,
+        blobs: blobKeys,
+        blobsStamp: blobs.join("\n"),
+        value,
+      });
+    } else {
+      visibilityCache.delete(store.root);
+    }
+    return value;
+  } catch {
+    visibilityCache.delete(store.root);
+    return null;
+  }
+}
+
+/**
+ * Take out of `index`, open for writing, every record its store's entity
+ * readers no longer show: for a staging index a rebuild resumes, which an
+ * earlier run built before records it holds may have been forgotten.
+ * Returns how many rows left the index; 0 without a store.
+ */
+export function dropForgottenRecords(index: Store, config: ResolvedSearchConfig): number {
+  const store = config.brainStore;
+  if (store === null || store === undefined) return 0;
+  const { removed } = keepWriterLeasesFresh(WRITER_LEASE_BLOCKING_BUDGET_MS, () =>
+    dropForgotten(index, config, store, new ShardScanner(store).scan(), false),
+  );
+  if (removed > 0) index.bumpIndexRevision();
   return removed;
 }
 
@@ -369,17 +845,27 @@ function syncShards(
   config: ResolvedSearchConfig,
   store: IndexedStore,
   shards: ReadonlyArray<ShardStat>,
+  onShard?: ShardProgress,
+  skip?: ReadonlySet<string>,
 ): SyncTotals {
   return keepWriterLeasesFresh(WRITER_LEASE_BLOCKING_BUDGET_MS, () =>
-    syncShardsInPass(index, config, store, shards),
+    syncShardsInPass(index, config, store, shards, onShard, skip),
   );
 }
+
+/**
+ * Progress of a pass: called after each record and at the end of each
+ * shard with the bytes of that shard read so far and the records added.
+ */
+type ShardProgress = (shard: ShardStat, bytesRead: number, added: number) => void;
 
 function syncShardsInPass(
   index: Store,
   config: ResolvedSearchConfig,
   store: IndexedStore,
   shards: ReadonlyArray<ShardStat>,
+  onShard?: ShardProgress,
+  skip?: ReadonlySet<string>,
 ): SyncTotals {
   const db = index.brainRecordsConnection();
   const marks = readWatermarks(db);
@@ -387,12 +873,15 @@ function syncShardsInPass(
   const totals: SyncTotals = {
     shardsRead: 0,
     tombstones: 0,
+    lifecycleMarks: 0,
     added: 0,
-    voidableAdded: 0,
+    voidableRead: 0,
     removed: 0,
     completed: 0,
     remoteHlc: null,
     pendingBlobs: new Map(),
+    ...(onShard !== undefined ? { progress: onShard } : {}),
+    ...(skip !== undefined ? { skip } : {}),
   };
   try {
     const orphans: Orphans = new Map();
@@ -414,6 +903,7 @@ function syncShardsInPass(
         if (shard.stream === "events") eventsReadInFull.add(shard.key);
       }
       next.push(read.watermark);
+      onShard?.(shard, shard.size, totals.added);
     }
     const vanished = [...marks.keys()].filter((key) => !present.has(key));
     for (const key of vanished) {
@@ -424,16 +914,35 @@ function syncShardsInPass(
     writerLeaseCheckIn();
     totals.removed += settled.removed;
     // A forgotten signal leaves the index with its tombstone (FORMAT.md,
-    // "Removal"): after a pass that read one, that re-read an events shard
-    // from its start, or that added a record a known tombstone may void (a
-    // line from before the tombstone that synced in late, appended to a
-    // shard already read), every record the tombstones voided is taken out.
+    // "Removal"), and an entity marked tombstoned with its mark
+    // (`forgotten.ts`): after a pass that read either, that re-read an
+    // events shard from its start, or that added a record a known
+    // tombstone or mark may void (a line from before it that synced in
+    // late, appended to a shard already read), every record the entity
+    // readers no longer show is taken out. A pass that read a mark also
+    // brings back what a mark undone since had taken out.
+    // A fold read of this pass that met a gap: the fold is owed, and the
+    // rest of the pass does not read the same gap again.
+    let foldGapThisPass = false;
+    const marked = totals.lifecycleMarks > 0;
+    if (marked && index.getState(STORE_LIFECYCLE_MARKS_KEY) !== "1") {
+      index.setState(STORE_LIFECYCLE_MARKS_KEY, "1");
+    }
     if (
       totals.tombstones > 0 ||
-      ((eventsReadInFull.size > 0 || totals.voidableAdded > 0) &&
-        [...TOMBSTONE_KINDS].some((kind) => holdsRecordKind(db, kind)))
+      marked ||
+      ((eventsReadInFull.size > 0 || totals.voidableRead > 0) &&
+        ([...TOMBSTONE_KINDS].some((kind) => holdsRecordKind(db, kind)) ||
+          index.getState(STORE_LIFECYCLE_MARKS_KEY) === "1"))
     ) {
-      totals.removed += dropVoidedRecords(index, store, shards);
+      // Once the index has met a mark, every pass that folds again also
+      // brings back what a mark undone since had taken out (a preference
+      // whose status moved off `tombstoned` carries no mark of its own).
+      const revive = marked || index.getState(STORE_LIFECYCLE_MARKS_KEY) === "1";
+      const forgotten = dropForgotten(index, config, store, shards, revive);
+      totals.removed += forgotten.removed;
+      totals.added += forgotten.added;
+      if (!forgotten.complete) foldGapThisPass = true;
     }
     // Watermarks move only once the orphans are settled: a pass that
     // stops before that reads the same shards again next time, and a
@@ -441,6 +950,7 @@ function syncShardsInPass(
     // (a vanished one keeps its row), so the next pass meets them again.
     for (const w of next) if (!settled.retry.has(w.shard)) writeWatermark(db, w);
     for (const key of vanished) if (!settled.retry.has(key)) deleteWatermark(db, key);
+    let foldBodiesCompleted = 0;
     for (const pending of pendingRecords(db)) {
       const partitionRoot = partitionDir(store.root, pending.partition as StorePartition);
       const path = blobPath(partitionRoot, pending.sum);
@@ -453,8 +963,36 @@ function syncShardsInPass(
         totals.pendingBlobs.set(path, before);
         continue;
       }
+      // Owed before the body lands: a fold that then throws is retried
+      // by the next catch-up, which would otherwise find nothing pending
+      // and every shard level, and return at once.
+      if (isForgettingFoldKind(pending.kind)) oweFold(index);
       completePendingRecord(index, config, pending, blob.body);
       totals.completed++;
+      if (isForgettingFoldKind(pending.kind)) foldBodiesCompleted++;
+    }
+    // A fold record whose body was pending (a signal-state with tombstone
+    // fields, a staged capture) was set aside by every fold so far: now
+    // that it is whole the folds run again, taking out what it forgets and
+    // bringing back what it clears.
+    if (
+      !foldGapThisPass &&
+      (foldBodiesCompleted > 0 || index.getState(STORE_FOLD_CLEANUP_KEY) === "1")
+    ) {
+      if (index.getState(STORE_LIFECYCLE_MARKS_KEY) !== "1") {
+        index.setState(STORE_LIFECYCLE_MARKS_KEY, "1");
+      }
+      const forgotten = dropForgotten(index, config, store, shards, true);
+      totals.removed += forgotten.removed;
+      totals.added += forgotten.added;
+      // A record this fold brought back with its body still pending is
+      // watched like every other pending body, so its blob's arrival
+      // triggers the next pass (the loop above ran before it existed).
+      // Watched as not looked at (`null`), never with a stat taken now: a
+      // blob that arrived after the revival read it as pending would
+      // otherwise read as already seen, and the record would stay pending.
+      for (const path of forgotten.pendingBlobs) totals.pendingBlobs.set(path, null);
+      settleFold(index, forgotten);
     }
   } finally {
     // Whatever was already written moves the revision, even when a later
@@ -478,10 +1016,81 @@ function syncShardsInPass(
  * shard is read from offset 0 there, so records an older binary skipped
  * for an unknown format version are picked up.
  */
-export function ingestStoreInto(index: Store, config: ResolvedSearchConfig): void {
+export function ingestStoreInto(
+  index: Store,
+  config: ResolvedSearchConfig,
+  onProgress?: (bytesDone: number, bytesTotal: number, records: number) => void,
+): void {
   const store = config.brainStore;
   if (store === null || store === undefined) return;
-  syncShards(index, config, store, new ShardScanner(store).scan());
+  const shards = buildOrder(new ShardScanner(store).scan());
+  const bytesTotal = shards.reduce((sum, s) => sum + s.size, 0);
+  // A search can read the staging index while it is built, so a record
+  // the store has already forgotten (a removed signal, preference or lane
+  // entry, an entity marked tombstoned) is never written into it: the
+  // forgetting folds run before the first document. One forgotten while
+  // the build runs is taken out at the end of the pass, as a catch-up
+  // takes it out of a live index.
+  const preScan = keepWriterLeasesFresh(WRITER_LEASE_BLOCKING_BUDGET_MS, () =>
+    forgottenInShards(store, shards),
+  );
+  // A pre-scan with a gap skips what it could read, and the fold is owed:
+  // the index the build makes carries that debt until a complete read.
+  if (!foldComplete(preScan)) oweFold(index);
+  const voided = preScan.ids;
+  // The shards finished before the current one, and the current one.
+  let finished = 0;
+  let current: ShardStat | null = null;
+  syncShards(
+    index,
+    config,
+    store,
+    shards,
+    (shard, bytesRead, added) => {
+      if (shard !== current) {
+        if (current !== null) finished += current.size;
+        current = shard;
+      }
+      onProgress?.(finished + Math.min(bytesRead, shard.size), bytesTotal, added);
+    },
+    voided,
+  );
+}
+
+/** Shards of the `log` stream go last in a rebuild ({@link buildOrder}). */
+function buildRank(shard: ShardStat): number {
+  return shard.stream === "log" ? 1 : 0;
+}
+
+/** `private` shards go first in a rebuild ({@link buildOrder}). */
+function partitionRank(shard: ShardStat): number {
+  return shard.partition === "private" ? 0 : 1;
+}
+
+/**
+ * The order a rebuild ingests shards in. A search can answer from the
+ * staging index while it is built, so what recall needs most goes first:
+ * every stream but `log` (signals, preferences, decisions, topics), then
+ * the log, newest month first.
+ *
+ * The first copy of a record id indexed wins (`ingestRecord` refuses a
+ * copy from the other partition), so every `private` shard goes before
+ * every `shared` one: an id found in both (an anomaly doctor reports; the
+ * two copies are one envelope, so only the partition and with it the
+ * visibility differ) is indexed from its private copy, as every catch-up
+ * does (it reads the shards in key order, `private/` first) and as every
+ * rebuild did before this order. Within one partition a record id has one
+ * text (records are immutable), so the order there changes nothing in the
+ * finished index.
+ */
+function buildOrder(shards: ReadonlyArray<ShardStat>): ShardStat[] {
+  return shards.toSorted(
+    (a, b) =>
+      partitionRank(a) - partitionRank(b) ||
+      buildRank(a) - buildRank(b) ||
+      posix.basename(b.rel).localeCompare(posix.basename(a.rel)) ||
+      a.key.localeCompare(b.key),
+  );
 }
 
 /** Catch the index of `config` up with its brain store; never throws. */
@@ -513,8 +1122,11 @@ export async function catchUpBrainStore(
       if (peek === null) return { skipped: "not-current", ...NOTHING };
       state.known = peek.known;
       state.pendingBlobs = peek.pendingBlobs;
+      state.cleanupOwed = peek.cleanupOwed;
     }
-    if (!blobMoved(state.pendingBlobs) && unchanged(state.known, shards)) {
+    // A forgetting fold an earlier pass owed and did not finish is run
+    // before any early return.
+    if (!state.cleanupOwed && !blobMoved(state.pendingBlobs) && unchanged(state.known, shards)) {
       return { skipped: null, ...NOTHING };
     }
     if (isWriterLockHeld(config.dbPath)) return { skipped: "locked", ...NOTHING };
@@ -523,6 +1135,7 @@ export async function catchUpBrainStore(
       const totals = syncShards(index, config, store, shards);
       state.known = knownFrom(readWatermarks(index.brainRecordsConnection()));
       state.pendingBlobs = totals.pendingBlobs;
+      state.cleanupOwed = index.getState(STORE_FOLD_CLEANUP_KEY) === "1";
       return {
         skipped: null,
         shardsRead: totals.shardsRead,

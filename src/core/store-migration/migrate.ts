@@ -39,11 +39,11 @@ import { dirname } from "node:path";
 import { resolveAgentName } from "../config.ts";
 import { resolveAppendShardId } from "../brain/ledger-shards.ts";
 import { readVaultIdentity, writeVaultIdentity } from "../brain/vault-identity.ts";
-import { readMigrationGate } from "../migration-gate.ts";
+import { readMigrationGate, recordMigrationGateProgress } from "../migration-gate.ts";
 import { appendRecord } from "../store/appender.ts";
 import { bindVaultToStore } from "../vault-adapter/vault-binding.ts";
 import { claimViewWriter, readViewWriter } from "../view/writer.ts";
-import { computeCut, cutHash, readPartition } from "../store/state-digest.ts";
+import { cutHash, readPartitionCut } from "../store/state-digest.ts";
 import { deviceSwitchedHere, recordSwitchMarker } from "../store/store-only.ts";
 import { openStore, type StoreHandle } from "../store/store-open.ts";
 import {
@@ -54,6 +54,7 @@ import {
 } from "../store/store-paths.ts";
 import type { StorePartition } from "../store/constants.ts";
 import {
+  archiveSyncCopies,
   archiveUnparseable,
   backupVaultMismatch,
   journalScopeFor,
@@ -62,7 +63,11 @@ import {
   takeMigrationSnapshot,
   type MigrationBackup,
 } from "./backup.ts";
-import { importBrainSettings, type BrainSettingsImport } from "./brain-settings.ts";
+import {
+  BrainSettingsUnreadableError,
+  importBrainSettings,
+  type BrainSettingsImport,
+} from "./brain-settings.ts";
 import { migrationCatalogue } from "./catalogue.ts";
 import {
   placeDeviceTokens,
@@ -80,10 +85,15 @@ import {
   type VerificationGap,
 } from "./convert.ts";
 import { planMigrationDryRun } from "./dry-run.ts";
+import { retainedSyncCopies, type SyncCopyReport } from "./sync-leftovers.ts";
+import { IncrementalReads, saveIncrementalReads } from "./incremental-reads.ts";
 import {
   clearRollbackRecord,
   describeUnseen,
-  loadJournal,
+  loadJournalAndUnmarked,
+  readFinalStoreView,
+  type UnseenShards,
+  type Journal,
   migrationDir,
   readMigrationState,
   unseenHeldShards,
@@ -115,6 +125,8 @@ import {
   releaseStoppedRunGate,
 } from "./quiesce.ts";
 import { sameVaultPath } from "./removal-marker.ts";
+import { MigrationScratch } from "./spill-map.ts";
+import { gcHint } from "../store/gc-hint.ts";
 
 /** The most passes the final delta pass may take before the run gives up. */
 export const MIGRATION_MAX_PASSES = 20;
@@ -201,6 +213,11 @@ export const MIGRATION_STEP = Object.freeze({
   gateClosed: "gate-closed",
   /** The snapshot and the backups are taken and verified. */
   backedUp: "backed-up",
+  /**
+   * The import is verified and every held shard read in full: the switch's
+   * steps follow (the settings import first).
+   */
+  verified: "verified",
   /** `migration-done` is recorded (the first machine only). */
   migrationDone: "migration-done",
   /** This device's `device-switched` is recorded. */
@@ -225,6 +242,20 @@ export interface MigrationOptions {
    * it because the wait only matters when writers are in flight.
    */
   readonly settleMs?: number;
+  /**
+   * How many items the import writes per batch (default
+   * `IMPORT_BATCH_ITEMS` in `import-batch.ts`). The CLI keeps the default; the crash tests
+   * use a small batch so a kill lands with part of a small vault imported.
+   */
+  readonly importBatchItems?: number;
+  /**
+   * How many entries a map with one entry per legacy item or store record
+   * (the journal, the items a pass saw, the store's checksums) holds in
+   * memory before it moves to the run's scratch file (default
+   * `SPILL_AT_ENTRIES` in `spill-map.ts`). The CLI keeps the default; tests
+   * set it low so a small vault runs the on-disk maps.
+   */
+  readonly spillAt?: number;
   readonly hooks?: MigrationHooks;
   /** How long a later machine waits for the first machine's cut, in ms (default 0). */
   readonly waitMs?: number;
@@ -243,6 +274,15 @@ export interface MigrationOptions {
    * the operator's to run.
    */
   readonly automatic?: boolean;
+  /**
+   * Each step the run records in its progress file (`migration-gate.ts`),
+   * with the import's counts once known: the automatic worker writes them
+   * to its log, `o2b update` to stderr. Called after every import batch.
+   */
+  readonly onProgress?: (
+    step: string,
+    counts?: { readonly journaled: number; readonly planned: number },
+  ) => void;
 }
 
 export interface MigrationResult {
@@ -278,6 +318,25 @@ export interface MigrationResult {
   readonly device_config: DeviceConfigWrite | null;
   /** The MCP token map copied to device config; null when unfinished. */
   readonly device_tokens: DeviceTokenPlacement | null;
+  /** What the sync tool's conflict copies and temp files became (`sync-leftovers.ts`). */
+  readonly sync_copies: SyncCopyReport;
+  /** The backup folder the kept conflict copies are in; null when none was kept. */
+  readonly sync_copies_archive: string | null;
+}
+
+/** Items a journal holds, each version once. */
+function journaledItems(journal: Journal): number {
+  return journal.size;
+}
+
+/** Items the dry run found on the surfaces that become records. */
+function plannedRecordItems(plan: ReturnType<typeof planMigrationDryRun>): number {
+  let n = 0;
+  for (const s of plan.surfaces) {
+    if (s.partitions !== null)
+      n += s.partitions.shared + s.partitions.private + s.partitions["private-when-held"];
+  }
+  return n;
 }
 
 export function openMigrationStore(vault: string, configPath?: string): StoreHandle {
@@ -333,7 +392,8 @@ function settingsRecord(
 function partitionCuts(store: StoreHandle): Partial<Record<StorePartition, PartitionCut>> {
   const cuts: Partial<Record<StorePartition, PartitionCut>> = {};
   for (const partition of store.partitions) {
-    const cut = computeCut(readPartition(partitionDir(store.root, partition)));
+    // Record by record: only each shard's count, last id and pending count.
+    const cut = readPartitionCut(partitionDir(store.root, partition));
     cuts[partition] = { cut, cut_hash: cutHash(cut) };
   }
   return cuts;
@@ -347,8 +407,8 @@ function partitionCuts(store: StoreHandle): Partial<Record<StorePartition, Parti
  * record in one could not be verified. So the run refuses before it
  * imports anything, and again before it switches.
  */
-function unseenRefusal(store: StoreHandle): string | null {
-  const named = describeUnseen(unseenHeldShards(store));
+function unseenRefusal(store: StoreHandle, unseen?: UnseenShards): string | null {
+  const named = describeUnseen(unseen ?? unseenHeldShards(store));
   return named === null
     ? null
     : `${named}; fix their permissions, let sync finish or repair the shard, then run the ` +
@@ -532,6 +592,13 @@ function beforeGate(vault: string, store: StoreHandle, options: MigrationOptions
   const previous = preflight(store, options);
   const plan = planMigrationDryRun(vault);
   if (!plan.ok) {
+    if (plan.unreadable_folders.length > 0) {
+      throw new MigrationRefusedError(
+        `${plan.unreadable_folders.length} legacy folder(s) could not be read ` +
+          `(${plan.unreadable_folders.slice(0, 10).join(", ")}), so what they hold has no ` +
+          "planned destination; fix their permissions and run `o2b brain migrate-store --dry-run`",
+      );
+    }
     const listed = plan.unmapped
       .slice(0, 10)
       .map((u) => u.path)
@@ -679,10 +746,32 @@ export function runMigration(vault: string, options: MigrationOptions = {}): Mig
   // it to its holder.
   let held = false;
   let failure: { readonly error: unknown } | null = null;
+  // How far the run is, its step and, once its import began, its counts:
+  // the one progress file (`migration-gate.ts`), read by the writers it
+  // refuses, the status block and the doctor. Written from the moment this
+  // run holds the gate, so a write refused in the first seconds of the run
+  // (the settle wait, the checks made again under the gate) names the step.
+  let step = "";
+  let counts: { journaled: number; planned: number } | undefined;
+  const progress = (text: string = step): void => {
+    step = text;
+    recordMigrationGateProgress(state.run_id, step, counts);
+    try {
+      options.onProgress?.(step, counts);
+    } catch {
+      // a report of the progress never stops the run
+    }
+  };
+  let scratch: MigrationScratch | null = null;
   options.hooks?.beforeGate?.();
   try {
-    quiesceLegacyWriters(vault, state.run_id, options.settleMs ?? MIGRATION_SETTLE_MS);
+    // Only once the gate is this run's: the progress file is one per
+    // machine, and a run refused at the gate must not replace the holder's.
+    quiesceLegacyWriters(vault, state.run_id, options.settleMs ?? MIGRATION_SETTLE_MS, () =>
+      progress("the gate is closed; waiting for writers in flight to settle"),
+    );
     held = true;
+    progress("the gate is closed; checking the legacy tree again before the backups");
     // Every fact the run decided on before it held the gate is read again:
     // another run may have switched this device, recorded or rolled back a
     // run, or brought a done record in the meantime.
@@ -708,6 +797,7 @@ export function runMigration(vault: string, options: MigrationOptions = {}): Mig
     // says it is a migration's, which is how the next run on this vault
     // recognises it (`stoppedUnswitchedRun`).
     options.hooks?.atStep?.(MIGRATION_STEP.gateTaken);
+    progress("taking the backups");
     save({});
     options.hooks?.atStep?.(MIGRATION_STEP.gateClosed);
     const catalogue = migrationCatalogue(vault);
@@ -717,6 +807,7 @@ export function runMigration(vault: string, options: MigrationOptions = {}): Mig
       save({ backed_up: true });
     }
     options.hooks?.atStep?.(MIGRATION_STEP.backedUp);
+    progress("backed up, importing the legacy tree");
     const local = backupStep(() => moveDeviceLocalState(vault, catalogue, dir));
     // Accepted skills are files agents read: they move to the vault's own
     // skills/ folder, never into the store (design D14, task 2.10).
@@ -727,7 +818,21 @@ export function runMigration(vault: string, options: MigrationOptions = {}): Mig
     }
 
     const scope = journalScopeFor(vault, store.device, dir);
-    const journal = loadJournal(dir, store, scope);
+    // The maps with an entry per legacy item or store record (the journal,
+    // the items a pass saw, the store's checksums) move to a temporary file
+    // in the migration folder once they grow, so the run's memory does not
+    // grow with the vault (`spill-map.ts`).
+    scratch = new MigrationScratch(
+      dir,
+      options.spillAt !== undefined ? { spillAt: options.spillAt } : {},
+    );
+    // One pass over the store, shard by shard, for the journal and the
+    // dual-written copies: the run never holds the store's records.
+    const { journal, unmarked } = loadJournalAndUnmarked(dir, store, scope, scratch);
+    const recordReads = new IncrementalReads(new Map(), false);
+    // How far the import is: rewritten after every batch it writes.
+    counts = { journaled: journaledItems(journal), planned: plannedRecordItems(plan) };
+    progress();
     const ctx = {
       vault,
       store,
@@ -736,17 +841,30 @@ export function runMigration(vault: string, options: MigrationOptions = {}): Mig
       dir,
       journal,
       scope,
-      pool: dualWritePool(store, journal, scope),
+      pool: dualWritePool(store, journal, scope, unmarked),
       ...(options.hooks ? { hooks: options.hooks } : {}),
+      ...(options.importBatchItems !== undefined ? { batchItems: options.importBatchItems } : {}),
+      // Recorded, never used to skip: the first import after the switch
+      // starts from what this migration's final pass read.
+      incremental: recordReads,
+      scratch,
+      onJournaled: (items: number): void => {
+        counts = { journaled: counts!.journaled + items, planned: counts!.planned };
+        progress();
+      },
     };
     let imported = 0;
     let passes = 0;
     // The legacy-file stamps taken before each pass: those of the final
     // (delta) pass become the automatic import's watermark at the switch.
     let stamps = legacyFileStamps(vault);
+    // Each pass reads the whole legacy tree: its garbage goes before the
+    // next phase (`gc-hint.ts`).
+    gcHint();
     let last = convertPass(ctx);
     for (passes = 1; ; passes++) {
       imported += last.imported;
+      progress(`importing: pass ${passes}, ${imported} item(s) imported so far`);
       if (last.imported === 0) break;
       if (passes >= MIGRATION_MAX_PASSES) {
         throw new Error(
@@ -754,6 +872,7 @@ export function runMigration(vault: string, options: MigrationOptions = {}): Mig
         );
       }
       stamps = legacyFileStamps(vault);
+      gcHint();
       last = convertPass(ctx);
     }
     if (options.refuseUnparseable === true && last.unparseable.length > 0) {
@@ -768,8 +887,16 @@ export function runMigration(vault: string, options: MigrationOptions = {}): Mig
       throw new MigrationRefusedError(`${reason}; this machine was not switched`);
     }
     const archive = archiveUnparseable(vault, dir, last.problems);
+    progress(`verifying ${imported} imported item(s)`);
+    // A conflict copy that is a second version of a record or a document
+    // is never merged: it is kept in the backup and named in the report.
+    const syncArchive = backupStep(() => archiveSyncCopies(vault, dir, last.syncCopies.kept));
     options.hooks?.beforeVerify?.();
-    const gaps = verifyImport(ctx, last.seen);
+    // One read of the store for the verification and the switch's check
+    // of unseen shards; the settings import reads its own stream later.
+    gcHint();
+    const final = readFinalStoreView(store, scratch);
+    const gaps = verifyImport(ctx, last.seen, final.sums);
     const base = {
       run_id: state.run_id,
       device: store.device,
@@ -786,6 +913,12 @@ export function runMigration(vault: string, options: MigrationOptions = {}): Mig
       vault_files: skills.placed,
       vault_files_kept: skills.kept,
       skipped_partitions: wait?.skipped ?? [],
+      // Only the copies the archive holds are named as kept.
+      sync_copies: retainedSyncCopies(
+        last.syncCopies,
+        syncArchive === null ? null : new Set(syncArchive.copies.map((c) => c.path)),
+      ),
+      sync_copies_archive: syncArchive?.dir ?? null,
     };
     if (gaps.length > 0) {
       save({ phase: "failed", reason: `${gaps.length} legacy item(s) are not in the store` });
@@ -800,15 +933,32 @@ export function runMigration(vault: string, options: MigrationOptions = {}): Mig
         device_tokens: null,
       };
     }
+    // Every item the final pass read is in the store: the first import of
+    // late writes after the switch reads only what changed since.
+    saveIncrementalReads(dir, vault, recordReads);
     // The switch is the step a later run cannot take back: every held
     // shard reads in full first, or the run fails and this machine stays
     // on the legacy layout.
-    const unseen = unseenRefusal(store);
+    const unseen = unseenRefusal(store, final.unseen);
     if (unseen !== null) {
       save({ phase: "failed", reason: unseen });
       throw new MigrationRefusedError(`${unseen}; this machine was not switched`);
     }
-    const settings = importBrainSettings(vault, store, agent);
+    progress("switching this machine to the brain store");
+    options.hooks?.atStep?.(MIGRATION_STEP.verified);
+    let settings: ReturnType<typeof importBrainSettings>;
+    try {
+      settings = importBrainSettings(vault, store, agent);
+    } catch (error) {
+      if (!(error instanceof BrainSettingsUnreadableError)) throw error;
+      // As an unreadable held shard before the switch: the run fails and
+      // this machine stays on the legacy layout.
+      const reason =
+        `${error.message}; fix their permissions, let sync finish or repair the shard, then ` +
+        "run the migration again";
+      save({ phase: "failed", reason });
+      throw new MigrationRefusedError(`${reason}; this machine was not switched`);
+    }
     // Device keys go to this machine's config and the token map beside it,
     // so neither falls back to a default once the vault's files stop
     // counting (D14 items 3 and 15).
@@ -866,6 +1016,7 @@ export function runMigration(vault: string, options: MigrationOptions = {}): Mig
     failure = { error };
     throw error;
   } finally {
+    scratch?.close();
     if (held) releaseGateAfter(vault, state.run_id, failure);
   }
 }

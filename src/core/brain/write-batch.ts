@@ -26,6 +26,7 @@
  * (temp file + rename), so no single target is ever left half-written.
  */
 
+import type { RecordOrigin } from "./record-origin.ts";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 
@@ -63,6 +64,7 @@ import { preferencePath, validateSlug } from "./paths.ts";
 import { refuseDocumentDeny, type WriteSubject } from "./write-disposition.ts";
 import { REVIEW_LANE } from "./write-gate.ts";
 import { assertVaultIdentityForWrite } from "./vault-identity.ts";
+import { VaultUnexaminableError } from "../vault-unexaminable.ts";
 import { writeBatchPrivacy } from "./write-batch-privacy.ts";
 import type { OperationPrivacy } from "../store/operation-privacy.ts";
 import { withOperationPrivacy } from "../store/operation-scope.ts";
@@ -409,6 +411,12 @@ interface PlannedOperation {
 /** Facts the kernel needs that are not part of any single operation. */
 export interface ApplyWriteBatchOptions {
   /**
+   * The project and session the batch's log lines were written in
+   * (`record-origin.ts`), from the caller's launch facts; an operation's
+   * own `origin` is ignored.
+   */
+  readonly origin?: RecordOrigin;
+  /**
    * Config file that names the writing agent, for the note-write record
    * (who-wrote-what, Task A). Absent falls back to the shared discovery;
    * a caller that knows which config it runs under passes it so the
@@ -494,7 +502,9 @@ export function applyWriteBatch(
   // invalid ID must surface before anything is written.
   const requestId = opts.requestId;
   const idempotency =
-    requestId === undefined ? undefined : consultBatchKey(vault, requestId, operations);
+    requestId === undefined
+      ? undefined
+      : consultBatchKey(vault, requestId, operations, opts.origin);
   if (idempotency?.retained !== undefined) return idempotency.retained;
 
   // A note target may appear at most once per batch: projecting each note
@@ -584,8 +594,18 @@ function consultBatchKey(
   vault: string,
   requestId: string,
   operations: ReadonlyArray<WriteOperation>,
+  origin: RecordOrigin | undefined,
 ): { readonly contentHash: string; readonly retained?: ReceiptedWriteBatchResult } {
-  const contentHash = computePayloadHash({ operations: [...operations] });
+  // The batch's project is stored on its log lines, so a retry from another
+  // project is a different write (a payload mismatch), as for a signal. A
+  // batch with no log line stores no project, and an absent project adds
+  // nothing to the hash: a batch recorded before records carried a project
+  // dedupes a retry from a directory that names none.
+  const stampsProject = operations.some((op) => op?.kind === "append_log_line");
+  const contentHash = computePayloadHash({
+    operations: [...operations],
+    project: stampsProject ? origin?.project : undefined,
+  });
   const existing = lookupKey(vault, requestId, WRITE_BATCH_KEY_NAMESPACE);
   if (existing === null) return { contentHash };
   if (existing.contentHash !== contentHash) {
@@ -664,7 +684,13 @@ function projectOperation(
         privacy,
       );
     case "append_log_line":
-      return projectAppendLogLine(vault, operation as AppendLogLineOperation, index, privacy);
+      return projectAppendLogLine(
+        vault,
+        operation as AppendLogLineOperation,
+        index,
+        privacy,
+        opts.origin,
+      );
     default:
       throw new WriteBatchError(
         "invalid_operation",
@@ -682,6 +708,10 @@ function envelopeError(err: unknown, index: number): WriteBatchError {
   if (err instanceof CreateNoteError) {
     return new WriteBatchError(err.code, index, `operation ${index}: ${err.message}`);
   }
+  // A vault that is gone (or cannot be examined) is not a fault of THIS
+  // operation: it is the machine's state, and it answers with its own
+  // named refusal (`vault_unreadable`) rather than as a bad operation.
+  if (err instanceof VaultUnexaminableError) throw err;
   return new WriteBatchError(
     "invalid_operation",
     index,
@@ -1276,6 +1306,7 @@ function projectAppendLogLine(
   op: AppendLogLineOperation,
   index: number,
   privacy: OperationPrivacy,
+  origin: RecordOrigin | undefined,
 ): PlannedOperation {
   const input = op.input;
   if (
@@ -1292,7 +1323,15 @@ function projectAppendLogLine(
   }
   return {
     commit: () => {
-      const res = appendBrainNote({ vault, ...input, storePrivate: privacy });
+      // The origin is the batch's (the server's launch facts), never one an
+      // operation names.
+      const { origin: _named, ...named } = input;
+      const res = appendBrainNote({
+        vault,
+        ...named,
+        storePrivate: privacy,
+        ...(origin !== undefined ? { origin } : {}),
+      });
       return { kind: "append_log_line", logged_at: res.logged_at, log_path: res.log_path };
     },
   };

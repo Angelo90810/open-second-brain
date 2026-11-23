@@ -35,6 +35,7 @@ import {
   redactForEgress,
 } from "../../../core/egress/guard.ts";
 import { brainVerbContext, fail, info, ok, okJson, parse, resolveBrainAgent } from "../helpers.ts";
+import { assertDestinationOutsideGatedVault } from "../../../core/migration-gate.ts";
 
 const USAGE =
   "usage: o2b brain knowledge-pack export --name <name> --select <sel>[,<sel>…] --out <dir> [--version <v>] [--force] [--json]\n" +
@@ -83,6 +84,8 @@ function exportPack(argv: string[]): number {
   if (name === undefined || out === undefined) {
     return fail("knowledge-pack export requires --name <name> and --out <dir>");
   }
+  // A destination the caller names is no way past a migration gate.
+  assertDestinationOutsideGatedVault(out);
   const select = (flags["select"] as string[] | undefined) ?? [];
 
   const selected = selectKnowledgePack(vault, select);
@@ -237,10 +240,18 @@ function uninstallPack(argv: string[]): number {
     return 0;
   }
   ok(`knowledge-pack uninstall${plan.confirmed ? "" : " (DRY RUN)"}: ${plan.name}`);
+  const refused = new Set(plan.refused);
+  const listed = plan.remove.length - refused.size;
   ok(
-    `  ${plan.remove.length} entr${plan.remove.length === 1 ? "y" : "ies"} ${plan.confirmed ? "removed" : "WOULD be removed"}:`,
+    `  ${listed} entr${listed === 1 ? "y" : "ies"} ${plan.confirmed ? "removed" : "WOULD be removed"}:`,
   );
-  for (const e of plan.remove) ok(`    - ${e.path} (${e.kind}, ${e.stamp})`);
+  for (const e of plan.remove) {
+    if (!refused.has(e.path)) ok(`    - ${e.path} (${e.kind}, ${e.stamp})`);
+  }
+  if (plan.refused.length > 0) {
+    info(`  ${plan.refused.length} entr${plan.refused.length === 1 ? "y" : "ies"} NOT removed:`);
+    for (const path of plan.refused) info(`    - ${path} (removal refused)`);
+  }
   if (plan.kept.length > 0) {
     info(`  ${plan.kept.length} entr${plan.kept.length === 1 ? "y" : "ies"} kept:`);
     for (const k of plan.kept) info(`    - ${k.entry.path} (${k.reason})`);

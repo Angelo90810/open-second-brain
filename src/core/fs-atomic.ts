@@ -58,7 +58,7 @@ export interface AtomicWriteOptions {
 const WINDOWS_TRANSIENT_RENAME_CODES: ReadonlySet<string> = new Set(["EPERM", "EACCES", "EBUSY"]);
 
 /** Total time {@link renameWithRetry} keeps retrying on Windows. */
-const WINDOWS_RENAME_RETRY_BUDGET_MS = 2_000;
+export const WINDOWS_RENAME_RETRY_BUDGET_MS = 2_000;
 
 /**
  * Block the calling thread for `ms` milliseconds.
@@ -113,7 +113,7 @@ function withWindowsSharingRetry(op: () => void, seams: RenameRetrySeams): void 
   }
   const sleep = seams.sleep ?? sleepSync;
   const now = seams.now ?? Date.now;
-  const deadline = now() + WINDOWS_RENAME_RETRY_BUDGET_MS;
+  const deadline = now() + (seams.budgetMs ?? WINDOWS_RENAME_RETRY_BUDGET_MS);
   let delay = 10;
   for (;;) {
     try {
@@ -136,6 +136,12 @@ export interface RenameRetrySeams {
   readonly unlink?: (path: string) => void;
   readonly sleep?: (ms: number) => void;
   readonly now?: () => number;
+  /**
+   * How long to keep retrying on Windows, instead of the default two
+   * seconds: for a rename that must not fail over a reader that holds the
+   * file for one query (the search index swap).
+   */
+  readonly budgetMs?: number;
 }
 
 /**
@@ -587,3 +593,48 @@ export function isAtomicWriteTemp(name: string): boolean {
 }
 
 const ATOMIC_TEMP_RE = /^\..+\.\d+\.\d+\.[0-9a-f]*\.tmp$/;
+
+/** The writer token between a target's name and `.tmp`: a pid, or a freshen claim token. */
+const WRITER_TEMP_TOKEN_RE = /\.(?:\d+|fr-[0-9a-f-]+)$/;
+
+/**
+ * The names of the file a temporary file of one of this product's
+ * writers is renamed onto, or none when `name` is no such temp file. The
+ * one place that knows those names:
+ *
+ *  - an atomic write of this module, `.<target>.<pid>.<ms>.<hex>.tmp`;
+ *  - a writer that stages beside its target, `<target>.tmp` (the
+ *    secret stores, the maintenance journal compaction),
+ *    `<target>.<pid>.tmp` (a lane page's archive copy) and
+ *    `<target>.fr-<uuid>.tmp` (the search freshen claim).
+ *
+ * Each such file is transient and holds no data of its own: the file it
+ * becomes is read once it is there. A caller treats it as its target
+ * would be treated only when something claims that target, so an unknown
+ * `.tmp` file stays unknown.
+ */
+export function writerTempOriginals(name: string): string[] {
+  if (ATOMIC_TEMP_RE.test(name)) {
+    return [name.slice(1).replace(/\.\d+\.\d+\.[0-9a-f]*\.tmp$/, "")];
+  }
+  if (!name.endsWith(".tmp") || name.length <= ".tmp".length) return [];
+  const target = name.slice(0, -".tmp".length);
+  const out = [target];
+  if (WRITER_TEMP_TOKEN_RE.test(target)) out.push(target.replace(WRITER_TEMP_TOKEN_RE, ""));
+  return out.filter((n) => n !== "");
+}
+
+/** The suffix of the sibling a lock writer creates beside the file it holds (`<target>.lock`). */
+export const LOCK_SIBLING_SUFFIX = ".lock";
+
+/**
+ * The name of the file a `<target>.lock` sibling would be the lock of
+ * (`sync-lockfile.ts`, the self-heal workers' claims, a metrics append),
+ * or null when `name` does not have that form. The name alone does not
+ * say the file is a lock: a person's `notes.md.lock` has it too
+ * (`brain/snapshot-transient.ts` asks for more).
+ */
+export function lockSiblingOriginal(name: string): string | null {
+  if (!name.endsWith(LOCK_SIBLING_SUFFIX) || name.length <= LOCK_SIBLING_SUFFIX.length) return null;
+  return name.slice(0, -LOCK_SIBLING_SUFFIX.length);
+}

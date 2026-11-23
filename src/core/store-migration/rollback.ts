@@ -49,6 +49,7 @@
  * the records the replay uses, before the restore.
  */
 
+import { pathPresent } from "../vault-unexaminable.ts";
 import {
   appendFileSync,
   cpSync,
@@ -65,11 +66,12 @@ import { BRAIN_ROOT_REL, BRAIN_SNAPSHOT_EXCLUDED_ENTRIES } from "../brain/path-c
 import { snapshotPath } from "../brain/paths.ts";
 import { extractSnapshotToTemp } from "../brain/snapshot.ts";
 import { readVaultIdentity } from "../brain/vault-identity.ts";
+import { withoutReferenceJudging } from "../store/reference-privacy.ts";
 import { appendRecord } from "../store/appender.ts";
 import { AUTHORITY_FIELD, LEDGER_ROW_KIND } from "../store/constants.ts";
-import { readPartition } from "../store/state-digest.ts";
-import { partitionDir } from "../store/store-paths.ts";
-import { compareRecords, type StoreRecord } from "../store/envelope.ts";
+import { type StoreRecord } from "../store/envelope.ts";
+import { parseHlc } from "../store/hlc.ts";
+import { gcHint } from "../store/gc-hint.ts";
 import { clearSwitchMarker, deviceSwitchedHere } from "../store/store-only.ts";
 import { unbindVaultFromStore } from "../vault-adapter/vault-binding.ts";
 import type { StoreHandle } from "../store/store-open.ts";
@@ -83,12 +85,21 @@ import {
 } from "./backup.ts";
 import { removeDeviceTokens } from "./device-config.ts";
 import { itemRecords, migrationCatalogue, recordDestination } from "./catalogue.ts";
-import { contentKey, itemKey, itemSum } from "./convert.ts";
-import { EXPORTED_KINDS, exportRecords, type RefusedRecord, type StartMark } from "./exporters.ts";
+import { contentKey, fileCopyVerdicts, itemKey, itemSum, recordsSignature } from "./convert.ts";
+import type { DualWriteRecord } from "../store/dual-write.ts";
+import {
+  EXPORTED_KINDS,
+  exportFoldsKind,
+  LANE_KINDS,
+  PREFERENCE_KINDS,
+  exportRecords,
+  type RefusedRecord,
+  type StartMark,
+} from "./exporters.ts";
 import {
   describeUnseen,
+  forEachHeldRecord,
   migrationDir,
-  readHeldRecords,
   readMigrationState,
   ROLLBACK_JOURNAL_FILE,
   ROLLBACK_STATE_FILE,
@@ -103,13 +114,17 @@ import {
   sameJournalVault,
   type JournalScope,
 } from "./journal-scope.ts";
-import { emptyTally, scanLocator } from "./legacy-scan.ts";
+import { emptyTally, readFileItem, scanCopyLines, scanLocator } from "./legacy-scan.ts";
+import { findSyncLeftovers, SYNC_COPY_RULE } from "./sync-leftovers.ts";
+import { MigrationScratch, type SpillMap } from "./spill-map.ts";
+import type { LegacyItem } from "./destinations.ts";
 import {
   DEVICE_UNSWITCHED_KIND,
   legacyTreeRemovedRecords,
   MIGRATION_STREAM,
   migratedMark,
 } from "./migration-records.ts";
+import { recordMigrationGateProgress } from "../migration-gate.ts";
 import { holdGateFor, releaseGateAfter } from "./quiesce.ts";
 import { readRemovalInProgress } from "./removal.ts";
 import { readRemovalMarker, sameVaultPath } from "./removal-marker.ts";
@@ -249,25 +264,155 @@ function restoreBrain(vault: string, runId: string, archiveCopy: string | null):
   }
 }
 
-/** What the restored tree already holds: item keys with checksums, and record contents. */
-function restoredIdentity(vault: string): { items: Set<string>; contents: Map<string, number> } {
-  const items = new Set<string>();
-  const contents = new Map<string, number>();
-  for (const entry of migrationCatalogue(vault)) {
+/** What the restored tree holds: its items, and how often each record content occurs. */
+interface RestoredIdentity {
+  /** `<item key>\u0000<checksum>` of every item. */
+  readonly items: SpillMap;
+  /** Record content key to how many times the tree holds it. */
+  readonly contents: SpillMap;
+}
+
+/**
+ * What the restored tree already holds: item keys with checksums, and
+ * record contents. Both have an entry per legacy item, so they move to
+ * the scratch's file once they grow.
+ */
+function restoredIdentity(vault: string, scratch: MigrationScratch): RestoredIdentity {
+  // Items are matched by key, checksum and record content alone: no
+  // partition is judged, so no reference is resolved.
+  return withoutReferenceJudging(() => restoredIdentityOf(vault, scratch));
+}
+
+function restoredIdentityOf(vault: string, scratch: MigrationScratch): RestoredIdentity {
+  const itemSet = scratch.map();
+  const items = { add: (key: string): void => itemSet.set(key, "") };
+  const contents = scratch.map();
+  const count = (records: ReadonlyArray<DualWriteRecord>): void => {
+    for (const record of records) {
+      const key = contentKey(record.kind, record.body);
+      contents.set(key, String(Number(contents.get(key) ?? "0") + 1));
+    }
+  };
+  const catalogue = migrationCatalogue(vault);
+  const leftovers = findSyncLeftovers(vault, catalogue);
+  // The record contents of every original a JSONL copy is a version of,
+  // so a copy's row is matched as the pass matched it (`convert.ts`).
+  const families = new Map<string, Set<string>>();
+  for (const copy of leftovers.copies) {
+    if (copy.rule === SYNC_COPY_RULE.rows) families.set(copy.original, new Set());
+  }
+  for (const entry of catalogue) {
     const destination = recordDestination(entry);
     if (destination === null) continue;
     const tally = emptyTally();
     for (const locator of entry.locators) {
       scanLocator(locator, tally, (item) => {
         items.add(`${itemKey(vault, item)}\u0000${itemSum(item)}`);
-        for (const record of itemRecords(vault, destination, item)) {
-          const key = contentKey(record.kind, record.body);
-          contents.set(key, (contents.get(key) ?? 0) + 1);
-        }
+        const records = itemRecords(vault, destination, item);
+        count(records);
+        families.get(item.path)?.add(recordsSignature(records));
       });
     }
   }
-  return { items, contents };
+  const fileVerdicts = fileCopyVerdicts(leftovers.copies);
+  // A record imported from a sync conflict copy is keyed by the copy
+  // (`convert.ts`): the restored copy holds it, so it is not written back
+  // into the original. A copy's row the original did not hold also counts
+  // as content the tree holds, so a dual-written record the pass matched to
+  // it is not written back either; a row the original holds counts once.
+  for (const copy of leftovers.copies) {
+    const keyed = (item: LegacyItem): void => {
+      items.add(`${itemKey(vault, { ...item, path: copy.path })}\u0000${itemSum(item)}`);
+    };
+    const destination = recordDestination(copy.entry);
+    if (copy.rule === SYNC_COPY_RULE.rows) {
+      const family = families.get(copy.original)!;
+      const mine: string[] = [];
+      scanCopyLines(copy.locator, copy.path, copy.original, emptyTally(), (item) => {
+        keyed(item);
+        if (destination === null) return;
+        let records: ReadonlyArray<DualWriteRecord>;
+        try {
+          records = itemRecords(vault, destination, item);
+        } catch {
+          return;
+        }
+        const signature = recordsSignature(records);
+        if (family.has(signature)) return;
+        mine.push(signature);
+        count(records);
+      });
+      for (const signature of mine) family.add(signature);
+    } else if (copy.rule === SYNC_COPY_RULE.file) {
+      try {
+        const item = readFileItem(copy.locator, copy.original, copy.path);
+        if (item !== null) keyed(item);
+      } catch {
+        // unreadable as its surface: it was kept, never imported
+      }
+      // Each occurrence the restored tree holds counts once. A copy whose
+      // original is gone, and that the pass took as the record, is that
+      // occurrence: its content counts, so a dual-written record the pass
+      // matched to it is not written back. A copy beside its original,
+      // identical or kept, is no occurrence of its own: the original counts.
+      const verdict = fileVerdicts.get(copy.path);
+      if (verdict?.kind === "only" && destination !== null) {
+        try {
+          count(itemRecords(vault, destination, verdict.item));
+        } catch {
+          // not the shape its surface writes: it was never imported
+        }
+      }
+    }
+  }
+  return { items: itemSet, contents };
+}
+
+/** What a rollback writes back, read from the store record by record. */
+interface ReplayPlan {
+  /**
+   * Records absent from the restored tree, in fold order, each with the
+   * ledger it sits in (`ledgers/<name>/...`, null outside `ledgers`). Read
+   * from the scratch, one at a time: there is one per record written
+   * after the switch.
+   */
+  absent(): IterableIterator<{ readonly record: StoreRecord; readonly ledger: string | null }>;
+  /**
+   * The held records the exporters' folds need: every signal and pinned
+   * context record, and the lane entry and preference records of the
+   * entries and preferences an absent record names (each fold reads an
+   * entry's or a preference's own records only).
+   */
+  readonly folded: StoreRecord[];
+}
+
+/**
+ * A key that sorts as `compareRecords` orders records (clock, then
+ * device, then id; device ids and ULIDs are ASCII, above the separator),
+ * then by `seq`, the record's place in the read: a stable sort, as the
+ * one over the whole store was.
+ */
+function foldOrderKey(record: StoreRecord, seq: number): string {
+  const clock = parseHlc(record.hlc)!;
+  return (
+    `${String(clock.physical).padStart(16, "0")}.${String(clock.counter).padStart(10, "0")}` +
+    `\u0001${record.device}\u0001${record.id}\u0001${String(seq).padStart(12, "0")}`
+  );
+}
+
+/** The entry or preference a lane entry or preference record belongs to, or null. */
+function foldEntityOf(record: StoreRecord): string | null {
+  if (LANE_KINDS.has(record.kind)) {
+    const { lane, entry } = record.body;
+    return typeof lane === "string" && typeof entry === "string"
+      ? `lane\u0000${lane}/${entry}`
+      : null;
+  }
+  if (PREFERENCE_KINDS.has(record.kind)) {
+    const id = record.body["preference"];
+    return typeof id === "string" ? `pref\u0000${id}` : null;
+  }
+  return null;
 }
 
 /**
@@ -281,46 +426,80 @@ function restoredIdentity(vault: string): { items: Set<string>; contents: Map<st
  * content either. An unmarked copy that names no vault keeps the content
  * match: it may be this vault's own copy, and writing it back would
  * duplicate the row the restored tree already holds.
+ *
+ * The store is read once, record by record, once every shard reads in
+ * full (see {@link refuseUnseen}). What has one entry per record (the
+ * absent records, the unmarked ones waiting for their content match, the
+ * lane entry and preference records the folds may need) goes to the
+ * scratch in fold order, so the rollback's memory does not grow with the
+ * records written after the switch. The unmarked records consume the
+ * tree's contents in fold order, as before.
  */
 function recordsToReplay(
   vault: string,
   scope: JournalScope,
-  all: ReadonlyArray<StoreRecord>,
-): StoreRecord[] {
-  const { items, contents } = restoredIdentity(vault);
-  const out: StoreRecord[] = [];
-  for (const record of [...all].toSorted(compareRecords)) {
+  store: StoreHandle,
+  scratch: MigrationScratch,
+  done: string,
+): ReplayPlan {
+  const { items, contents } = restoredIdentity(vault, scratch);
+  // Reading the restored tree left its garbage (`gc-hint.ts`).
+  gcHint();
+  const absent = scratch.map();
+  const unmarked = scratch.map();
+  const entities = scratch.map();
+  const folded: StoreRecord[] = [];
+  let seq = 0;
+  const unseen = forEachHeldRecord(store, (_partition, record, _pending, shard) => {
+    seq += 1;
+    const key = foldOrderKey(record, seq);
+    if (exportFoldsKind(record.kind)) {
+      const entity = foldEntityOf(record);
+      if (entity === null) folded.push(record);
+      else entities.set(key, JSON.stringify([entity, record]));
+    }
+    const ledger = shard.stream === "ledgers" ? (shard.rel.split("/")[1] ?? "unknown") : null;
+    const held = JSON.stringify([ledger, record]);
     const mark = migratedMark(record);
     if (mark !== null) {
       const own = sameJournalVault(markVault(scope, mark.vault, record), scope.vault);
-      if (!own || !items.has(`${mark.key}\u0000${mark.sum}`)) out.push(record);
-      continue;
+      if (!own || !items.has(`${mark.key}\u0000${mark.sum}`)) absent.set(key, held);
+      return;
     }
     if (copyNamesOtherVault(scope, record)) {
-      out.push(record);
-      continue;
+      absent.set(key, held);
+      return;
     }
-    const key = contentKey(record.kind, record.body);
-    const left = contents.get(key) ?? 0;
-    if (left > 0) contents.set(key, left - 1);
-    else out.push(record);
+    unmarked.set(key, held);
+  });
+  refuseUnseen(unseen, done);
+  for (const [key, held] of unmarked.sortedEntries()) {
+    const [, record] = JSON.parse(held) as [string | null, StoreRecord];
+    const content = contentKey(record.kind, record.body);
+    const left = Number(contents.get(content) ?? "0");
+    if (left > 0) contents.set(content, String(left - 1));
+    else absent.set(key, held);
   }
-  return out;
-}
-
-/** The ledger each held `ledgers` record sits in (`ledgers/<name>/...`), by record id. */
-function ledgerOfRecords(store: StoreHandle): Map<string, string> {
-  const out = new Map<string, string>();
-  for (const partition of store.partitions) {
-    for (const shard of readPartition(partitionDir(store.root, partition), {
-      onUnreadable: () => {},
-    })) {
-      if (shard.stream !== "ledgers") continue;
-      const ledger = shard.rel.split("/")[1] ?? "unknown";
-      for (const record of shard.all) out.set(record.id, ledger);
-    }
+  // The folds need only the entries and preferences an absent record names.
+  const named = new Set<string>();
+  for (const [, held] of absent.sortedEntries()) {
+    const [, record] = JSON.parse(held) as [string | null, StoreRecord];
+    const entity = foldEntityOf(record);
+    if (entity !== null) named.add(entity);
   }
-  return out;
+  for (const [, value] of entities.sortedEntries()) {
+    const [entity, record] = JSON.parse(value) as [string, StoreRecord];
+    if (named.has(entity)) folded.push(record);
+  }
+  return {
+    *absent() {
+      for (const [, held] of absent.sortedEntries()) {
+        const [ledger, record] = JSON.parse(held) as [string | null, StoreRecord];
+        yield { record, ledger };
+      }
+    },
+    folded,
+  };
 }
 
 /** Refuse while a held shard's records cannot all be seen, naming the shards. */
@@ -334,16 +513,11 @@ function refuseUnseen(unseen: UnseenShards, done: string): void {
   );
 }
 
-/** Every held record, once every shard reads in full (see {@link refuseUnseen}). */
-function completeRecords(store: StoreHandle, done: string): StoreRecord[] {
-  const read = readHeldRecords(store);
-  refuseUnseen(read.unseen, done);
-  return read.records;
-}
-
 export interface RollbackOptions {
   readonly agent: string;
   readonly hooks?: RollbackHooks;
+  /** Entries a per-item map holds in memory before it moves to disk (`MigrationOptions.spillAt`). */
+  readonly spillAt?: number;
 }
 
 /**
@@ -401,7 +575,7 @@ function rollbackChecks(vault: string, store: StoreHandle, dir: string): Rollbac
     readRemovalMarker(store, vault) !== null ||
     removedElsewhere ||
     (removing !== null && sameVaultPath(removing.vault, vault)) ||
-    !existsSync(join(vault, BRAIN_ROOT_REL))
+    !pathPresent(vault, join(vault, BRAIN_ROOT_REL))
   ) {
     throw new RollbackRefusedError(
       "the legacy tree has left the vault; a rollback is only possible until then",
@@ -461,7 +635,14 @@ export function rollbackMigration(
   const gateRun = `rollback-${checked.migration.run_id}`;
   options.hooks?.beforeGate?.();
   holdGateFor(vault, gateRun);
+  recordMigrationGateProgress(gateRun, "restoring the legacy tree from the migration snapshot");
   let failure: { readonly error: unknown } | null = null;
+  // The maps with an entry per legacy item (the restored tree's items and
+  // contents) move to a temporary file once they grow (`spill-map.ts`).
+  const scratch = new MigrationScratch(
+    dir,
+    options.spillAt !== undefined ? { spillAt: options.spillAt } : {},
+  );
   try {
     // Read again under the gate: what the rollback decided on may be
     // another run's by now. A different run state is another run's work.
@@ -475,7 +656,6 @@ export function rollbackMigration(
     const scope = journalScopeFor(vault, store.device, dir, vaultId);
     let state = readState(dir);
     let legacyTreeKept: string | null = null;
-    let all: StoreRecord[] | null = null;
     if (state === null || !state.restored) {
       // Late legacy writes first, as the removal does (design D11a): what a
       // machine on the old release wrote into this tree since the last
@@ -485,7 +665,9 @@ export function rollbackMigration(
       const late = importLateLegacyWrites(vault, store, options.agent, vaultId, {
         waitMs: GATED_IMPORT_WAIT_MS,
       });
-      all = completeRecords(store, "nothing was restored");
+      // Every held shard reads in full before anything is restored; the
+      // records are read once the tree is restored, record by record.
+      refuseUnseen(unseenHeldShards(store), "nothing was restored");
       legacyTreeKept = guardLateImport(vault, dir, late);
       const restored_files = restoreBrain(vault, backup.snapshot, snapshotCopyIn(backup));
       const restored_backups = restoreMigrationBackups(vault, backup);
@@ -495,13 +677,22 @@ export function rollbackMigration(
     }
 
     // A resumed rollback reads them now; the tree it restored waits.
-    all ??= completeRecords(store, "the restored tree waits for a resumed rollback");
-    const absent = recordsToReplay(vault, scope, all);
+    const plan = recordsToReplay(
+      vault,
+      scope,
+      store,
+      scratch,
+      "the restored tree waits for a resumed rollback",
+    );
     const replayed: string[] = [];
+    // Read back from the scratch in fold order, one record at a time.
+    function* exported(): IterableIterator<StoreRecord> {
+      for (const { record } of plan.absent()) if (EXPORTED_KINDS.has(record.kind)) yield record;
+    }
     const refused = exportRecords(
       vault,
       store.device,
-      { records: absent.filter((r) => EXPORTED_KINDS.has(r.kind)), all },
+      { records: exported(), all: plan.folded },
       {
         ...replayJournal(dir),
         onStart: (record, tail) => {
@@ -521,13 +712,12 @@ export function rollbackMigration(
     // Absent from the restored tree with no exporter: they stay in the store.
     const noLegacy: Record<string, number> = {};
     const ledgerKept: Record<string, number> = {};
-    const ledgers = ledgerOfRecords(store);
-    for (const record of absent) {
+    for (const { record, ledger } of plan.absent()) {
       if (EXPORTED_KINDS.has(record.kind)) continue;
       noLegacy[record.kind] = (noLegacy[record.kind] ?? 0) + 1;
       if (record.kind === LEDGER_ROW_KIND) {
-        const ledger = ledgers.get(record.id) ?? "unknown";
-        ledgerKept[ledger] = (ledgerKept[ledger] ?? 0) + 1;
+        const name = ledger ?? "unknown";
+        ledgerKept[name] = (ledgerKept[name] ?? 0) + 1;
       }
     }
 
@@ -568,6 +758,7 @@ export function rollbackMigration(
     failure = { error };
     throw error;
   } finally {
+    scratch.close();
     releaseGateAfter(vault, gateRun, failure);
   }
 }

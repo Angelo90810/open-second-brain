@@ -25,12 +25,15 @@
  * injection and the onboarding checklist) that share it.
  */
 
+import { pathPresent } from "../vault-unexaminable.ts";
 import { existsSync } from "node:fs";
+import { withGateJudge } from "../migration-gate.ts";
 import { join } from "node:path";
 
 import lockfile from "proper-lockfile";
 
 import { resolveSearchConfig } from "../search/index.ts";
+import { indexBuildDetails, readIndexBuild } from "../search/build-progress.ts";
 import { checkVaultWriteable } from "../doctor.ts";
 import { NEXT_COMMAND_KEY, nextCommandField, type NextCommandField } from "./next-step.ts";
 import { BRAIN_ROOT_REL } from "./paths.ts";
@@ -38,7 +41,9 @@ import { brainConfigUnreadableReport } from "./policy.ts";
 import { vaultMarkerAbsentNotice } from "./vault-identity.ts";
 import {
   AUTO_MIGRATION_LOCK_JUDGE,
+  AUTO_MIGRATION_MANUAL_COMMAND,
   readAutoMigrationFailure,
+  readLostAutoMigrationWorker,
   readAutoMigrationNotice,
   readAutoMigrationRunning,
   readAutoMigrationWaiting,
@@ -83,6 +88,12 @@ export interface RuntimeNoticeOptions {
    * which only a session start shows (and then clears, `active-context.ts`).
    */
   readonly oneTime?: boolean;
+  /**
+   * The configured vault's folder is not there, on a machine that has not
+   * switched: the brain is not a fresh installation, and the notice says
+   * so before anything else does.
+   */
+  readonly missing?: { readonly vault: string; readonly notice: string };
 }
 
 /**
@@ -95,11 +106,30 @@ export function collectRuntimeNotices(
   vault: string,
   opts: RuntimeNoticeOptions = {},
 ): RuntimeNotice[] {
+  // The notices never query a process identity (see `withGateJudge`).
+  return withGateJudge("cheap", () => collectRuntimeNoticesJudged(vault, opts));
+}
+
+function collectRuntimeNoticesJudged(vault: string, opts: RuntimeNoticeOptions): RuntimeNotice[] {
   const env = opts.env ?? process.env;
   const optOut = env["OPEN_SECOND_BRAIN_RUNTIME_NOTICES"]?.trim().toLowerCase();
   if (optOut === "false" || optOut === "0") return [];
 
   const notices: RuntimeNotice[] = [];
+
+  // The configured vault's folder is not there (an unmounted disk, a
+  // renamed folder), on a machine that has NOT switched. The brain is not
+  // a fresh installation: everything else this channel says about an
+  // empty vault would read as one, and the advice to initialise a new
+  // brain would start a second one beside the real one. So it is named
+  // first.
+  //
+  // The exit is the CONFIG: the operator mounts the disk or points the
+  // machine config at the vault, and `o2b status` is where the configured
+  // path is shown.
+  if (opts.missing !== undefined) {
+    notices.push(notice("vault_folder_missing", "warning", opts.missing.notice));
+  }
 
   // Vault writability: a read-only vault means every memory write will fail.
   //
@@ -140,7 +170,7 @@ export function collectRuntimeNotices(
   // sentence the guard already writes ("...if it is the intended vault")
   // is the honest form and a structural command would not be.
   try {
-    if (existsSync(join(vault, BRAIN_ROOT_REL))) {
+    if (pathPresent(vault, join(vault, BRAIN_ROOT_REL))) {
       const absent = vaultMarkerAbsentNotice(vault);
       if (absent !== null) {
         notices.push(notice("vault_marker_absent", "warning", `${absent.detail} (${absent.path})`));
@@ -190,19 +220,39 @@ export function collectRuntimeNotices(
     const dbPath = config.dbPath;
     const indexExists = existsSync(dbPath);
 
-    if (!indexExists) {
+    const build = readIndexBuild(dbPath);
+    if (!indexExists && build !== null) {
+      // A rebuild is building the first index (the first start after the
+      // brain moved into the brain store): a search answers from what it
+      // has indexed so far and says so. No registered command: the build
+      // finishes on its own, and a second one would queue behind it.
+      notices.push(
+        notice(
+          "search_index_building",
+          "info",
+          `Search index is being built (${indexBuildDetails(build)}); until it finishes, recall answers from what it has indexed so far.`,
+        ),
+      );
+    } else if (!indexExists) {
       // The read path self-heals: `openReadOrSelfHeal` catches
       // INDEX_MISSING, builds the index and retries, so recall does not
       // come back empty - it comes back late. The notice said the
       // opposite until no-dead-ends (task 3) corrected it; what the
       // command buys is paying that build now rather than on the first
       // query.
+      // An index of the brain store is never built inside a recall: the
+      // first one starts the background build a session start starts
+      // (`pipeline/store-open.ts`).
       notices.push(
         notice(
           "search_index_missing",
           "info",
-          "Search index is not built yet, so the first recall builds it before returning " +
-            "(that call pays the full index build).",
+          config.brainStore !== null && config.brainStore !== undefined
+            ? "Search index is not built yet: the first recall starts a background build and " +
+                "answers from what it has indexed so far (a small vault is built within seconds)."
+            : "Search index is not built yet: a recall while a background build runs answers " +
+                "from what it has indexed so far, and one with no build running builds it " +
+                "before returning (that call pays the full index build).",
         ),
       );
     } else if (reindexInProgress(dbPath)) {
@@ -213,7 +263,9 @@ export function collectRuntimeNotices(
         notice(
           "reindex_in_progress",
           "info",
-          "Search index is rebuilding; recent recall results may lag until it completes.",
+          build === null
+            ? "Search index is rebuilding; recent recall results may lag until it completes."
+            : `Search index is rebuilding (${indexBuildDetails(build)}); recent recall results may lag until it completes.`,
         ),
       );
     }
@@ -302,6 +354,22 @@ function storeMigrationNotice(
       stoppedGate: stoppedGateOf(g),
     });
     if (message !== null) return notice("store_migration_failed", "warning", message);
+  }
+  if (failure === null) {
+    // A worker an earlier start spawned that exited before it started:
+    // the next start records it; until then it is named here too.
+    const lost = readLostAutoMigrationWorker(vault, new Date(), {
+      judge: AUTO_MIGRATION_LOCK_JUDGE.cheap,
+    });
+    if (lost !== null) {
+      return notice(
+        "store_migration_failed",
+        "warning",
+        `The automatic store migration did not run: its worker (process ${lost.pid}) exited ` +
+          `before it started; o2b doctor names its error output and log. Run ` +
+          `${AUTO_MIGRATION_MANUAL_COMMAND} to run it yourself.`,
+      );
+    }
   }
   const waiting = readAutoMigrationWaiting(vault);
   if (waiting !== null) {

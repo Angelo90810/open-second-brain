@@ -12,7 +12,8 @@
  * proposal mentions it. The work lives in `core/topics/actions.ts`.
  */
 
-import { StoreWriteError } from "../../core/store/store-write.ts";
+import { writerSessionKey } from "../../core/agent-context/session-identity.ts";
+import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
 import {
   runTopicAction,
   TOPIC_ACTIONS,
@@ -21,7 +22,7 @@ import {
   type TopicActionInput,
 } from "../../core/topics/actions.ts";
 import { TOPIC_STATUSES } from "../../core/topics/constants.ts";
-import { TopicWriteError } from "../../core/topics/write.ts";
+import { topicRefusalCode, TopicWriteError } from "../../core/topics/write.ts";
 import { coerceStr, unknownOperationError } from "../coerce.ts";
 import { MCP_PREVIEW_BUDGET } from "../preview-budget.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
@@ -93,7 +94,7 @@ function inputOf(args: Record<string, unknown>, action: string): TopicActionInpu
     const value = optList(args, key);
     if (value !== undefined) input[key] = value;
   }
-  for (const key of ["removed", "private"]) {
+  for (const key of ["removed", "private", "held"]) {
     const value = optBool(args, key);
     if (value !== undefined) input[key] = value;
   }
@@ -101,6 +102,19 @@ function inputOf(args: Record<string, unknown>, action: string): TopicActionInpu
   const listScope = optString(args, "list_scope");
   if (listScope !== undefined) input["listScope"] = listScope;
   return input as unknown as TopicActionInput;
+}
+
+/**
+ * The session stamp of a local call: the session the host started this
+ * server for (`agent-context/session-identity.ts`). A call that came
+ * over a transport, or under a token, is not that session's and is not
+ * stamped.
+ */
+function sessionOf(ctx: ServerContext): string | undefined {
+  if (ctx.reach !== TRANSPORT_REACH.local || ctx.requestIdentity !== undefined) return undefined;
+  return (
+    writerSessionKey({ env: process.env, harness: ctx.ruleScope?.harness ?? null }) ?? undefined
+  );
 }
 
 /** The agent a record is written under: the token's agent, else the server's. */
@@ -120,18 +134,16 @@ function toolBrainTopic(
     return runTopicAction(inputOf(args, action), {
       ...(ctx.configPath !== null ? { configPath: ctx.configPath } : {}),
       ...(agentOf(ctx) !== undefined ? { agent: agentOf(ctx)! } : {}),
+      ...(sessionOf(ctx) !== undefined ? { session: sessionOf(ctx)! } : {}),
     });
   } catch (err) {
     if (err instanceof TopicActionError || err instanceof TopicWriteError) {
       throw new MCPError(INVALID_PARAMS, `${TOOL}: ${err.message}`, {
-        code: err instanceof TopicWriteError ? `topic_${err.reason}` : "topic_invalid",
+        code: topicRefusalCode(err instanceof TopicWriteError ? err.reason : "invalid"),
       });
     }
-    if (err instanceof StoreWriteError) {
-      throw new MCPError(INVALID_PARAMS, `${TOOL}: ${err.message}`, {
-        code: `store_${err.reason}`,
-      });
-    }
+    // A store write failure is classified by the server (`store_write_failed`
+    // with its reason and remedy), as for every other writer.
     throw err;
   }
 }
@@ -165,6 +177,11 @@ export const TOPIC_TOOLS: ReadonlyArray<ToolDefinition> = Object.freeze([
             "create: `project:<project>` or `personal` (default). A personal topic is private unless private is false.",
         },
         list_scope: { type: "string", description: "list: only topics of this scope." },
+        held: {
+          type: "boolean",
+          description:
+            "show: also list the notes, signals and decisions the topic holds (reads the store; slower on a large one).",
+        },
         status: {
           type: "string",
           enum: [...TOPIC_STATUSES],

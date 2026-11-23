@@ -23,6 +23,7 @@
  * failed or found a verification gap, 2 for a usage error.
  */
 
+import { describeIndexEstimate } from "../../../core/search/index-estimate.ts";
 import { PERMISSIONS_DOCUMENT_REL } from "../../../core/brain/permissions/document.ts";
 import {
   planMigrationDryRun,
@@ -34,15 +35,23 @@ import {
   type MigrationResult,
 } from "../../../core/store-migration/migrate.ts";
 import { migrateStore, type MigrateStoreOutcome } from "../../../core/store-migration/outcome.ts";
+import type { SyncCopyReport } from "../../../core/store-migration/sync-leftovers.ts";
 import {
   clearAutoMigrationState,
   readAutoMigrationRunning,
   describeAutoMigrationRunning,
   AUTO_MIGRATION_LOCK_JUDGE,
+  autoMigrationWorkerLogPath,
 } from "../../../core/store-migration/auto-state.ts";
+import { boundStderrToLog } from "../../../core/store-migration/worker-log.ts";
 import { runAutoStoreMigration } from "../../../core/store-migration/auto-worker.ts";
 import { brainVerbContext, failWith, parse, usageError, writeJson } from "../helpers.ts";
-import { runForceReleaseGate, runRemoveLegacy, runRollback } from "./migrate-store-forms.ts";
+import {
+  cohortLines,
+  runForceReleaseGate,
+  runRemoveLegacy,
+  runRollback,
+} from "./migrate-store-forms.ts";
 
 /** The usage error of two forms given together. */
 export const MIGRATE_STORE_ONE_FORM =
@@ -84,7 +93,7 @@ export async function cmdBrainMigrateStore(argv: string[]): Promise<number> {
   }
   // The gate is this machine's, not a vault's: no vault is needed.
   if (flags["force-release-gate"] === true) return runForceReleaseGate(flags["json"] === true);
-  const { vault, config } = brainVerbContext(flags);
+  const { vault, config } = brainVerbContext(flags, { vault: "files" });
   const json = flags["json"] === true;
   if (flags["rollback"] === true) return runRollback(vault, config, json);
   if (flags["remove-legacy"] === true) {
@@ -93,8 +102,21 @@ export async function cmdBrainMigrateStore(argv: string[]): Promise<number> {
   if (autoToken !== undefined) {
     // The automatic worker: never throws, records its own outcome, and
     // prints nothing (its streams are ignored). One exit for every way it
-    // can end.
-    runAutoStoreMigration(vault, { lockToken: autoToken, configPath: config });
+    // can end. Its stderr is the device-local worker log: kept to its tail
+    // within this run.
+    boundStderrToLog(process.stderr, autoMigrationWorkerLogPath(vault));
+    // The log says what the worker did, not only how it crashed: its start,
+    // each step with its time, and its outcome.
+    const began = performance.now();
+    workerLogLine(
+      `the automatic store migration worker (process ${process.pid}) starts for ${vault}`,
+    );
+    const outcome = runAutoStoreMigration(vault, {
+      lockToken: autoToken,
+      configPath: config,
+      progress: workerLogLine,
+    });
+    workerLogLine(describeAutoWorkerOutcome(outcome, performance.now() - began));
     return 0;
   }
   if (flags["dry-run"] !== true) {
@@ -190,7 +212,12 @@ export function renderOutcome(outcome: MigrateStoreOutcome): string {
   const lines = [
     `Device ${outcome.device} already switched to the brain store; imported late legacy writes.`,
     `imported: ${outcome.imported} item(s) in ${outcome.passes} pass(es)`,
-    `devices still on the legacy layout: ${outcome.legacy_devices.join(", ") || "none"}`,
+    `devices still on the legacy layout: ${
+      outcome.pending_evidence
+        .map((d) => `${d.device} (last evidence ${d.last_evidence?.slice(0, 10) ?? "none"})`)
+        .join(", ") || "none"
+    }`,
+    ...cohortLines(outcome),
   ];
   if (outcome.settings !== null) {
     lines.push(
@@ -235,6 +262,49 @@ export function renderOutcome(outcome: MigrateStoreOutcome): string {
   return lines.join("\n") + "\n";
 }
 
+/**
+ * The conflict-copy section of a dry run or a migration report: per
+ * surface, what its sync conflict copies became, then every copy kept and
+ * not imported, then the ignored sync temp files.
+ */
+export function renderSyncCopies(report: SyncCopyReport, archive: string | null): string[] {
+  const inFolders = report.in_folders ?? [];
+  const files = report.surfaces.reduce((sum, s) => sum + s.copies, 0) + inFolders.length;
+  const out = [
+    `Sync conflict copies: ${files} file(s); sync temp files ignored: ${report.temps_ignored}`,
+  ];
+  const goes: Record<string, string> = {
+    "device-local": "moved into device-local state with its folder",
+    backup: "kept in the backup with its folder",
+    "vault-files": "moved with its folder into the vault's own files (the skills/ folder)",
+    dropped: "dropped with its folder",
+  };
+  for (const c of inFolders) {
+    out.push(`  ${c.surface}: ${c.path} is in a folder taken whole, not imported: ${goes[c.goes]}`);
+  }
+  for (const s of report.surfaces) {
+    out.push(
+      `  ${s.surface}: ${s.copies} copy file(s): ${s.imported} item(s) imported as records, ` +
+        `${s.identical} identical (add nothing), ${s.kept} kept in the backup and not imported, ` +
+        `${s.dropped} dropped with their original`,
+    );
+  }
+  if (report.kept.length > 0) {
+    out.push(
+      archive === null
+        ? "  kept in the backup, not imported (versions you may want to look at):"
+        : `  kept in ${archive}, not imported (versions you may want to look at):`,
+    );
+    for (const k of report.kept)
+      out.push(`    ${k.path} (a version of ${k.original}): ${k.reason}`);
+  }
+  for (const gone of report.kept_gone ?? []) {
+    out.push(`  gone before the backup could keep it (removed by sync): ${gone}`);
+  }
+  for (const temp of report.temps) out.push(`  ignored temp file: ${temp}`);
+  return out;
+}
+
 /** The migration result as text. */
 export function renderMigration(result: MigrationResult): string {
   const out = [
@@ -255,13 +325,18 @@ export function renderMigration(result: MigrationResult): string {
   }
   out.push(
     `unparseable items kept in the backup: ${result.unparseable} (${result.unparseable_archive})`,
+    ...renderSyncCopies(result.sync_copies, result.sync_copies_archive),
   );
   if (result.gaps.length > 0) {
     out.push(`items not in the store (${result.gaps.length}); the legacy tree is untouched:`);
     for (const gap of result.gaps) out.push(`  ${gap.key}: ${gap.reason}`);
   } else {
     out.push(
-      `recorded migration-done ${result.migration_done} and device-switched ${result.device_switched}`,
+      // Only the first machine records the completion; a later machine
+      // records its own switch alone, so its completion record is none.
+      result.migration_done === null
+        ? `migration-done: none here, the first machine recorded it; recorded device-switched ${result.device_switched ?? "none"}`
+        : `recorded migration-done ${result.migration_done} and device-switched ${result.device_switched ?? "none"}`,
       `view writer: ${result.view_writer ?? "none"}`,
     );
     if (result.device_tokens !== null && result.device_tokens.status !== "none") {
@@ -337,6 +412,16 @@ export function renderDryRun(plan: MigrationDryRun): string {
   }
   out.push("");
 
+  const estimate = plan.search_index_estimate;
+  out.push(
+    `Search index after the switch (rebuilt from the store): ${describeIndexEstimate({
+      storeRecords: estimate.store_records,
+      documents: estimate.documents,
+      noteFiles: null,
+    })}`,
+    "",
+  );
+
   out.push(`Unparseable items: ${plan.totals.unparseable}`);
   for (const p of plan.unparseable) {
     out.push(`  ${p.path}${p.line === null ? "" : `:${p.line}`} (${p.surface}): ${p.reason}`);
@@ -346,13 +431,52 @@ export function renderDryRun(plan: MigrationDryRun): string {
   }
   out.push("");
 
+  out.push(...renderSyncCopies(plan.sync_copies, null), "");
+
   out.push(`Unmapped entries: ${plan.totals.unmapped}`);
   for (const u of plan.unmapped) out.push(`  ${u.path}${u.type === "directory" ? "/" : ""}`);
+  if (plan.unreadable_folders.length > 0) {
+    out.push(
+      `Unreadable folders: ${plan.unreadable_folders.length}`,
+      ...plan.unreadable_folders.map((f) => `  ${f}/`),
+    );
+  }
   out.push(
     "",
     plan.ok
       ? "Every legacy entry has a destination."
-      : "The migration cannot run until every unmapped entry has a destination.",
+      : plan.unreadable_folders.length > 0
+        ? "The migration cannot run until every legacy folder can be read: what an unreadable " +
+          "folder holds has no planned destination."
+        : "The migration cannot run until every unmapped entry has a destination.",
   );
   return out.join("\n") + "\n";
+}
+
+/** The worker log's last line: how the attempt ended, in how long, and what to run when it did not finish. */
+export function describeAutoWorkerOutcome(
+  run: ReturnType<typeof runAutoStoreMigration>,
+  elapsedMs: number,
+): string {
+  const seconds = Math.round(elapsedMs / 100) / 10;
+  const parts = [`outcome ${run.outcome} after ${seconds} s`];
+  if (run.imported !== null) parts.push(`${run.imported} item(s) imported`);
+  if (run.wait !== null) {
+    parts.push(
+      run.wait.reason ??
+        `waits for ${run.wait.missing.length} store shard(s) of ${run.wait.firstMachines.join(", ") || "another device"}`,
+    );
+  }
+  if (run.error !== null) parts.push(run.error);
+  if (run.manualCommand !== null) parts.push(`run \`${run.manualCommand}\` to run it yourself`);
+  return parts.join("; ");
+}
+
+/** One line of the worker log: the time, then what happened. Never throws. */
+function workerLogLine(text: string): void {
+  try {
+    process.stderr.write(`${new Date().toISOString()} ${text}\n`);
+  } catch {
+    // a log that cannot be written never stops the worker
+  }
 }

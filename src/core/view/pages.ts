@@ -18,7 +18,9 @@
  * What a page shows:
  *
  *  - about-me: confirmed preferences, grouped by their scope (the subject);
- *  - decisions: `decision-record` and `decision-resolved` log events, newest first;
+ *  - decisions: `decision-record` and `decision-resolved` log events, newest first,
+ *    each as "<title>: <choice>" (an older event without a title is named by
+ *    its decision page's);
  *  - history: per ISO week (UTC), day by day, the notes (`note` log events),
  *    decisions, and the rules confirmed that day.
  *
@@ -37,6 +39,8 @@ import { foldPreferences, type PreferenceState } from "../store/fold-preferences
 import { parseHlc } from "../store/hlc.ts";
 import { valueCarriesPrivateRegion } from "../store/private-region.ts";
 import { compareCodeUnits } from "../store/compare.ts";
+import { isDecisionEvent } from "../topics/held-decisions.ts";
+import { decisionEventTitle, type DecisionTitles } from "../topics/decision-titles.ts";
 import {
   VIEW_ABOUT_ME_PAGE,
   VIEW_DECISIONS_PAGE,
@@ -68,6 +72,28 @@ const NOTE_EVENT = "note";
 const HISTORY_VERDICT_KIND = "history-verdict";
 const DECISION_RECORD_EVENT = "decision-record";
 const DECISION_RESOLVED_EVENT = "decision-resolved";
+
+/** The log event types a page shows ({@link viewEntries}). */
+const VIEW_EVENT_TYPES: ReadonlySet<unknown> = new Set([
+  NOTE_EVENT,
+  DECISION_RECORD_EVENT,
+  DECISION_RESOLVED_EVENT,
+]);
+
+/**
+ * Whether the render needs `record`: every record but a log event no page
+ * shows. A migrated store's log is mostly events of other types (evidence,
+ * sessions, injections), and the render's read keeps only these, so it
+ * never holds the whole log.
+ */
+export function isViewInput(record: StoreRecord): boolean {
+  return (
+    record.kind !== LOG_EVENT_KIND ||
+    VIEW_EVENT_TYPES.has(record.body["event_type"]) ||
+    // Topic pages show a held decision's outcome (`topics/held-decisions.ts`).
+    isDecisionEvent(record)
+  );
+}
 
 /** The confirmed and retired statuses of a preference. */
 const CONFIRMED = "confirmed";
@@ -194,6 +220,30 @@ function textField(body: unknown, field: string): string | null {
 }
 
 /**
+ * The text of a decision entry: "<title>: <choice>", since the option
+ * chosen alone ("one markdown page") does not say what was decided. The
+ * title is the event's own `title` field; an event written before decision
+ * events carried one is named by the title of the decision page it links,
+ * a shared one (`topics/decision-titles.ts`), and reads as its choice only
+ * when no such page is held. A title that ends in its own punctuation (a
+ * question) gets no colon. Topic pages name a held decision by the same
+ * rule.
+ */
+function decisionEntryText(
+  payload: unknown,
+  choiceField: string,
+  titles: DecisionTitles,
+): string | null {
+  const choice = textField(payload, choiceField);
+  const fields =
+    typeof payload === "object" && payload !== null ? (payload as Record<string, unknown>) : {};
+  const named = decisionEventTitle(fields, titles, false);
+  const title = named === null || plainText(named) === "" ? null : plainText(named);
+  if (choice === null || title === null) return choice;
+  return /[?:!.]$/u.test(title) ? `${title} ${choice}` : `${title}: ${choice}`;
+}
+
+/**
  * The record that retired `pref`, when the user did (an edit of the
  * profile page, or a command): the winning `status` is `retired` and its
  * record has human authority. Retirements by an agent or by dream are not
@@ -232,6 +282,12 @@ function historyHiddenNotes(shared: ReadonlyArray<StoreRecord>): Set<string> {
 export function viewEntries(
   shared: ReadonlyArray<StoreRecord>,
   prefs: ReadonlyArray<PreferenceState>,
+  /**
+   * The decision page titles of the same read (`decision-titles.ts`, every
+   * shared version folded, none when the read missed a version): an older
+   * decision event is named by its page's title.
+   */
+  titles: DecisionTitles,
 ): ViewEntry[] {
   const entries: ViewEntry[] = [];
   const hiddenNotes = historyHiddenNotes(shared);
@@ -248,7 +304,11 @@ export function viewEntries(
         entries.push({ key, day, kind: "note", text, order: record, at });
       }
     } else if (type === DECISION_RECORD_EVENT || type === DECISION_RESOLVED_EVENT) {
-      const text = textField(payload, type === DECISION_RECORD_EVENT ? "chosen" : "choice");
+      const text = decisionEntryText(
+        payload,
+        type === DECISION_RECORD_EVENT ? "chosen" : "choice",
+        titles,
+      );
       if (text === null) continue;
       const review = textField(payload, "review_date") ?? undefined;
       entries.push({

@@ -20,9 +20,23 @@
  * injected) with a WHICH-to-read planner. Pure-stdlib, no new dependency.
  */
 
+import { storeRecordJudge } from "./brain-store/entity-filter.ts";
 import { Store } from "./store.ts";
 import { getGraphSnapshot } from "../brain/link-graph/graph-index.ts";
-import type { ResolvedSearchConfig } from "./types.ts";
+import { admitIndexRefs, resolvePoolFilters } from "./pipeline/pool-filters.ts";
+import type { ResolvedSearchConfig, SearchOptions } from "./types.ts";
+
+/**
+ * The caller-scope half of the search options the planner honours: the
+ * planner names indexed pages and previews their heads, so it withholds
+ * exactly what a search by the same caller withholds. Absent members
+ * resolve as they do for a search (no reach established is the
+ * narrowest reach, no visibility scope reaches untagged pages only).
+ */
+export type PlanReadFilters = Pick<
+  SearchOptions,
+  "transportReach" | "visibility" | "agentScope" | "scope"
+>;
 
 /** One entry in the should-read shortlist. */
 export interface ShouldReadEntry {
@@ -61,6 +75,14 @@ export interface GraphPrepassOptions {
   readonly degreeWeight?: number;
   /** Summary-preview length in characters for should_read mode (default 200). */
   readonly summaryChars?: number;
+  /** The caller's reach and scopes; see {@link PlanReadFilters}. */
+  readonly filters?: PlanReadFilters;
+  /**
+   * The vault the filters read page frontmatter from. {@link planRead}
+   * sets it from the config; without it a remote-reach plan withholds
+   * every page, because an unreadable reservation fails closed.
+   */
+  readonly vault?: string | null;
 }
 
 const WORD_RE = /[\p{L}\p{N}]{2,}/gu;
@@ -99,6 +121,22 @@ export function planReadShortlist(
 
   const snapshot = getGraphSnapshot(store);
   const titles = store.documentTitles();
+  // Only a page the caller may see is a seed, a hop target or an entry. It
+  // is asked per page the plan touches (a title match, a neighbour), not
+  // over the whole index: the filters read each page's frontmatter.
+  const filters = resolvePoolFilters({ query, ...opts.filters });
+  const filterCtx = { vault: opts.vault ?? null, store, frontmatterCache: new Map() };
+  const verdicts = new Map<number, boolean>();
+  const admitted = (id: number): boolean => {
+    const known = verdicts.get(id);
+    if (known !== undefined) return known;
+    const meta = titles.get(id);
+    const ok =
+      meta !== undefined &&
+      admitIndexRefs([{ documentId: id, path: meta.path }], filters, filterCtx).length === 1;
+    verdicts.set(id, ok);
+    return ok;
+  };
   const terms = queryTerms(query);
 
   const maxDegree = Math.max(1, ...[...snapshot.degree.values()], 1);
@@ -110,9 +148,17 @@ export function planReadShortlist(
   // merely BOOSTS a matched seed, it never seeds an unrelated note. This
   // keeps the pre-pass query-driven (no match -> no seeds -> empty plan)
   // and index-light (title is a `documents`-column read, no body scan).
+  // A store record the store rule hides (forgotten, marked tombstoned,
+  // staged) is no seed and no entry, also while the index still holds it
+  // (`brain-store/entity-filter.ts`).
+  const shown = storeRecordJudge(store);
   for (const [id, meta] of titles) {
     const titleFrac = termMatchFraction(meta.title, terms);
     if (titleFrac <= 0) continue;
+    // After the title match, so a query that matches no title asks the
+    // store nothing.
+    if (!shown(meta.path)) continue;
+    if (!admitted(id)) continue;
     const degree = snapshot.degree.get(id) ?? 0;
     const degreeNorm = (degree / maxDegree) * degreeWeight;
     const reasons = ["title"];
@@ -164,7 +210,7 @@ export function planReadShortlist(
       const decayed = sScore * hopDecay ** hop;
       for (const node of frontier) {
         for (const nb of snapshot.adjacency.get(node) ?? []) {
-          if (seen.has(nb)) continue;
+          if (seen.has(nb) || !admitted(nb)) continue;
           seen.add(nb);
           next.push(nb);
           const prev = best.get(nb);
@@ -180,6 +226,7 @@ export function planReadShortlist(
   const seedIdSet = new Set(seeds.map(([id]) => id));
   const ranked = [...best.entries()]
     .map(([id, v]) => ({ id, ...v }))
+    .filter((r) => shown(titles.get(r.id)?.path ?? ""))
     .toSorted((a, b) =>
       a.score !== b.score
         ? b.score - a.score
@@ -224,7 +271,7 @@ export async function planRead(
 ): Promise<GraphPrepassResult> {
   const store = await Store.open(config, { mode: "read", loadVec: false });
   try {
-    return planReadShortlist(store, query, opts);
+    return planReadShortlist(store, query, { ...opts, vault: config.vault });
   } finally {
     await store.close();
   }
