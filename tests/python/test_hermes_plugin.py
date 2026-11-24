@@ -296,7 +296,18 @@ class TemplateSourceOfTruthTests(unittest.TestCase):
         self.assertEqual(rendered, fixture)
 
     def test_hermes_template_prefers_per_target_over_common(self):
-        self.assertIn("Hermes turns are short", cfg.load_reminder_template())
+        per_target = (
+            (ROOT / "templates" / "identity-reminder.hermes.txt")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+        common = (
+            (ROOT / "templates" / "identity-reminder.txt")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+        self.assertNotEqual(per_target, common)
+        self.assertEqual(cfg.load_reminder_template().strip(), per_target)
 
 
 if __name__ == "__main__":
