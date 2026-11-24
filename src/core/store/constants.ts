@@ -35,6 +35,7 @@ export const STORE_STREAMS = Object.freeze([
   "settings",
   "digests",
   "dream-work",
+  "dream-replay",
 ] as const);
 export type StoreStream = (typeof STORE_STREAMS)[number];
 
@@ -218,12 +219,26 @@ export const SETTING_TOPIC_QUIET_DAYS = "topics.quiet_days";
  * turns the rule off.
  */
 export const SETTING_SILENT_DEVICE_DAYS = "migration.silent_device_days";
+/**
+ * Whether text a model wrote for dream is applied by the next pass
+ * (`auto`, the default) or waits for a person (`review`): change
+ * `dream-launched-agent`, design D7.
+ */
+export const SETTING_DREAM_APPLY_DRAFTS = "dream.apply_drafts";
+/**
+ * Whether a session on the dream owner's machine starts the day's pass by
+ * itself (`true`, the default) or never does (`false`): change
+ * `dream-session-trigger`, design D5.
+ */
+export const SETTING_DREAM_AUTO = "dream.auto";
 export const SETTING_KEYS = Object.freeze([
   SETTING_VIEW_LANGUAGE,
   SETTING_TOPIC_MIN_RECORDS,
   SETTING_TOPIC_MIN_SESSIONS,
   SETTING_TOPIC_QUIET_DAYS,
   SETTING_SILENT_DEVICE_DAYS,
+  SETTING_DREAM_APPLY_DRAFTS,
+  SETTING_DREAM_AUTO,
 ] as const);
 export type SettingKey = (typeof SETTING_KEYS)[number];
 

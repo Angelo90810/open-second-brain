@@ -38,6 +38,7 @@ import {
   DREAM_WORK_LEASE_KIND,
   DREAM_WORK_MAX_ATTEMPTS,
   DREAM_WORK_RETRY_KIND,
+  DREAM_WORK_APPROVE_KIND,
   type DreamWorkStateName,
 } from "./constants.ts";
 import {
@@ -54,6 +55,8 @@ import {
 /** What an operation declares for the fold: what a closed predecessor means. */
 export interface DreamWorkTraits {
   readonly closedPredecessor: "cancel" | "release";
+  /** A text operation: held for review when `dream.apply_drafts` is `review`. */
+  readonly text?: boolean;
 }
 
 export interface DreamWorkLease {
@@ -106,6 +109,8 @@ export interface DreamWorkItem {
   } | null;
   /** The reason of the last failed attempt. */
   readonly last_reason: string | null;
+  /** The reason of the last release, with the input it was given for. */
+  readonly last_release: { readonly reason: string; readonly input_hash: string } | null;
   /** Ids (after supersession) of what holds the item back. */
   readonly blocked_by: ReadonlyArray<string>;
   /** Predecessors (after supersession) that are not finished. */
@@ -140,6 +145,8 @@ export interface DreamWorkFoldInput {
   readonly operations?: (operation: string) => DreamWorkTraits | undefined;
   /** Partitions held by this device; absent means both for fixture folds. */
   readonly partitions?: ReadonlySet<StorePartition>;
+  /** The shared setting `dream.apply_drafts` (default `auto`). */
+  readonly applyDrafts?: "auto" | "review";
 }
 
 interface Building {
@@ -156,6 +163,8 @@ interface Building {
   attempts: number;
   retry_at: string | null;
   last_reason: string | null;
+  last_release: { reason: string; input_hash: string } | null;
+  approved: boolean;
 }
 
 const DEFAULT_TRAITS: DreamWorkTraits = { closedPredecessor: "cancel" };
@@ -218,6 +227,8 @@ export function foldDreamWork(input: DreamWorkFoldInput): DreamWorkState {
         attempts: 0,
         retry_at: null,
         last_reason: null,
+        last_release: null,
+        approved: false,
       });
       continue;
     }
@@ -298,6 +309,11 @@ function applyRecord(item: Building, record: StoreRecord): string | null {
         item.attempts += 1;
         item.retry_at = body.retry_at;
         item.last_reason = body.reason;
+      } else {
+        item.last_release = {
+          reason: body.reason,
+          input_hash: body.input_hash ?? item.body.input_hash,
+        };
       }
       return null;
     }
@@ -325,6 +341,11 @@ function applyRecord(item: Building, record: StoreRecord): string | null {
       item.closed = { reason: body.reason, note: body.note, successor: body.successor };
       return null;
     }
+    case DREAM_WORK_APPROVE_KIND:
+      if (item.closed !== null || item.applied !== null) return "the item is no longer open";
+      if (item.answer === null) return "no answer to approve";
+      item.approved = true;
+      return null;
     case DREAM_WORK_RETRY_KIND:
       if (item.closed !== null || item.applied !== null) return "the item is no longer open";
       item.attempts = 0;
@@ -335,10 +356,10 @@ function applyRecord(item: Building, record: StoreRecord): string | null {
   }
 }
 
-function stateOf(item: Building, now: number): DreamWorkStateName {
+function stateOf(item: Building, now: number, review: boolean): DreamWorkStateName {
   if (item.closed !== null) return "closed";
   if (item.applied !== null) return "finished";
-  if (item.answer !== null) return "accepted";
+  if (item.answer !== null) return review && !item.approved ? "awaiting-review" : "accepted";
   if (item.attempts >= DREAM_WORK_MAX_ATTEMPTS) return "parked";
   if (item.newest !== null && !item.ended && now < Date.parse(item.newest.expires_at)) {
     return "leased";
@@ -363,7 +384,11 @@ function finish(
   const traitsOf = (operation: string): DreamWorkTraits | undefined =>
     input.operations === undefined ? DEFAULT_TRAITS : input.operations(operation);
   const states = new Map<string, DreamWorkStateName>();
-  for (const item of items.values()) states.set(item.id, stateOf(item, input.now));
+  const review = input.applyDrafts === "review";
+  for (const item of items.values()) {
+    const text = traitsOf(item.body.operation)?.text === true;
+    states.set(item.id, stateOf(item, input.now, review && text));
+  }
 
   // Dependants that named a superseded id follow to its successor.
   const resolve = (id: string): string => {
@@ -480,6 +505,7 @@ function finish(
       applied: item.applied,
       closed: item.closed,
       last_reason: item.last_reason,
+      last_release: item.last_release,
       blocked_by: blocked,
       closed_predecessors: closedPredecessors,
       open_predecessors: openPredecessors,

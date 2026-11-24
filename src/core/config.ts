@@ -12,7 +12,7 @@ import { createHmac, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
-import { atomicWriteFileSync, sleepSync } from "./fs-atomic.ts";
+import { atomicWriteText, sleepSync } from "./fs-atomic.ts";
 import { isSecretReferenceValue, SecretReferenceError } from "./secret-ref.ts";
 import { APP_DIR_NAME, configBaseDir } from "./platform-dirs.ts";
 import { resolveActiveProfileVault } from "./brain/portability/profiles.ts";
@@ -346,8 +346,41 @@ export function setConfigValue(key: string, value: string, path?: string): strin
     Object.entries(data)
       .map(([k, v]) => `${k}: "${v}"`)
       .join("\n") + "\n";
-  atomicWriteFileSync(resolved, body);
+  atomicWriteText(resolved, body, { mode: configWriteMode(resolved, discovery.exists) });
   return resolved;
+}
+
+/**
+ * Persist a value that is JSON (the dream agent's command, a JSON array of
+ * strings) as one `key: value` line. JSON may hold double quotes and
+ * backslashes, which {@link setConfigValue} refuses: read back, the
+ * simple parser strips only the surrounding quotes, so the JSON text
+ * comes back as written. Line breaks are refused.
+ */
+export function setConfigJsonValue(key: string, value: unknown, path?: string): string {
+  const text = JSON.stringify(value);
+  if (/[\r\n]/.test(text)) {
+    throw new Error(`config value for ${JSON.stringify(key)} must fit on one line`);
+  }
+  const resolved = path ?? defaultConfigPath();
+  const discovery = discoverConfig(resolved);
+  const data = { ...discovery.data, [key]: text };
+  const body =
+    Object.entries(data)
+      .map(([k, v]) => `${k}: "${v}"`)
+      .join("\n") + "\n";
+  atomicWriteText(resolved, body, { mode: configWriteMode(resolved, discovery.exists) });
+  return resolved;
+}
+
+/** Preserve an existing machine config's permissions; new configs are owner-only. */
+function configWriteMode(path: string, exists: boolean): number {
+  if (!exists) return 0o600;
+  const stat = statConfigPath(path);
+  if (stat === undefined || !stat.isFile()) {
+    throw new ConfigReadError(path, "path changed while preparing a write");
+  }
+  return stat.mode & 0o7777;
 }
 
 export interface TimezoneValidationResult {
@@ -392,7 +425,10 @@ export function resolveTimezone(configPath?: string): string | null {
  * `vault` field in plugin config → `null`. Caller decides whether to
  * error out or accept a positional path.
  */
-export function resolveVault(configPath?: string, opts: { cwd?: string } = {}): string | null {
+export function resolveVault(
+  configPath?: string,
+  opts: { cwd?: string; discovery?: ConfigDiscovery } = {},
+): string | null {
   const env = process.env["VAULT_DIR"];
   if (env) return expandTilde(env);
   // Project pointer (Workspace Insight Suite, t_1375e69f): a pointer file
@@ -406,7 +442,8 @@ export function resolveVault(configPath?: string, opts: { cwd?: string } = {}): 
   if (pointerVault !== null) return expandTilde(pointerVault);
   // Multi-vault profiles (v0.22.0): an active named profile overrides the
   // bare `vault` key. With no profiles registry the result is unchanged.
-  const discovery = discoverConfig(configPath);
+  // A caller that already read the config passes it, so it is not read twice.
+  const discovery = opts.discovery ?? discoverConfig(configPath);
   const profileVault = resolveActiveProfileVault(discovery.path);
   if (profileVault) return expandTilde(profileVault);
   const cfg = discovery.data["vault"];

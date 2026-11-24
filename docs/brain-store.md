@@ -392,8 +392,9 @@ the role: an older binary does not know the gate.
 
 ### The dream work queue
 
-Some dream work needs a model: today the summary a fired rollup rung
-asks for. A live pass on the dream owner's machine records that work as
+Some dream work needs a model: the seven closed questions of dream, the
+summary a fired rollup rung asks for, and the title and goal of a new
+topic. A live pass on the dream owner's machine records that work as
 an item in the store's `dream-work` stream instead of dropping it, so it
 survives a crash, a restart and an owner transfer. An item built from
 private records stays in the `private` partition with everything later
@@ -409,16 +410,54 @@ item with its reason; `o2b dream owner` and doctor show the same
 counts. Work on one chain waits behind a stuck item, unrelated work
 does not.
 
-This version has nothing that answers queued work yet. Waiting means
-exactly that: the item is kept, it is never decided by a fixed rule in
-place of an answer, and no surface counts it as done; the pass summary
-reports it under `model_work` and doctor says so once
-(`dream-queue-no-executor`). A later release adds the executors that
-take and answer items. An item that fails its checks five times is
+Waiting means exactly that: the item is kept, it is never decided by a
+fixed rule in place of an answer, and no surface counts it as done; the
+pass summary reports it under `model_work`. The decision model chain and
+the dream agent answer items on the owner's machine before a live pass,
+and doctor says when neither can answer an operation
+(`dream-queue-no-executor`); who answers what is in
+[dream.md](dream.md#who-answers). An item that fails its checks five times is
 parked and named by doctor; `o2b dream queue retry <id>` offers it
 again and `o2b dream queue cancel <id> --reason <text>` closes it, both
 on the owner's machine. A brain with no dream owner, and one whose
 records still live in the legacy tree, has no queue.
+
+### The dream replay
+
+The dream pass works in windows of one UTC day and keeps what it
+covered in the store's `dream-replay` stream (`shared` partition), so
+another machine that becomes the dream owner continues where the last
+one stopped. A plan or an admission that names what a window read from
+private records goes to the `private` partition, as every other record
+derived from private content does; the coverage stays in `shared`. Per window it records the input boundary it admitted (a
+position per `events` and `log` shard), its plan with every effect
+frozen, and its coverage; the cross-topic allowance and the rollup
+baselines live there too, as records, instead of in files on one
+machine. A release of the owner role names the last window its machine
+covered, and the machine it goes to runs no window until that window
+and the shards it read have synced (`o2b dream owner` says it waits for
+sync). A machine that holds `private` also waits for the private part
+of every admission it holds. A forced takeover continues from the newest coverage it holds and
+says that the previous owner's last windows may not have arrived; when
+they do, the highest covered day counts and each effect counts once. A
+pass whose clock reads a day earlier than a window already admitted or
+covered evaluates nothing and says so (`dream-replay-clock-behind`)
+until the clock reaches that day.
+
+```bash
+o2b dream owner
+```
+
+shows, beside the owner and the queue, the replay: the sources the last
+admission read and any it could not read completely, the last covered
+window and how many are behind, and the windows whose model work still
+waits. Doctor names a source that stops the replay (`dream-replay-gap`),
+a replaced shard (`dream-replay-rebased`) and windows behind; when the
+replay's own records cannot be read completely here, the status and
+doctor say its windows are unknown, and the staged flow is refused. A brain
+whose records still live in the legacy tree runs its single pass as
+before and is never shown as covered; its first live pass after the move
+to the store is the inventory that starts the replay.
 
 ### Editing pages on a phone
 

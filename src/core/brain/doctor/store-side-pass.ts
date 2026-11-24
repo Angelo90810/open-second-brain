@@ -24,7 +24,10 @@ import { storeCheck } from "./store-check.ts";
 import { viewWriterCheck } from "./view-writer-check.ts";
 import { dreamOwnerCheck } from "./dream-owner-check.ts";
 import { dreamQueueCheck } from "./dream-queue-check.ts";
+import { dreamReplayCheck } from "./dream-replay-check.ts";
+import { dreamTriggerCheck } from "./dream-trigger-check.ts";
 import { topicPlanCheck } from "./topic-plan-check.ts";
+import { disciplineDoctorCheck, legacyDisciplineJobsCheck } from "./discipline-check.ts";
 
 /** The store-side checks, in the order the vault pass runs them. */
 export const STORE_SIDE_CHECKS: ReadonlyArray<StoreSideDoctorCheck> = Object.freeze([
@@ -32,11 +35,15 @@ export const STORE_SIDE_CHECKS: ReadonlyArray<StoreSideDoctorCheck> = Object.fre
   viewWriterCheck,
   dreamOwnerCheck,
   dreamQueueCheck,
+  dreamReplayCheck,
+  dreamTriggerCheck,
   deviceStateCheck,
   adoptConflictsCheck,
   laneIdMisfiledCheck,
   legacyLocalFilesCheck,
   topicPlanCheck,
+  disciplineDoctorCheck,
+  legacyDisciplineJobsCheck,
 ]);
 
 /**

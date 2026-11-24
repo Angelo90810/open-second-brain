@@ -2589,7 +2589,7 @@ var init_format_wikilink = __esm(() => {
 });
 
 // src/core/store/constants.ts
-var STORE_FORMAT_VERSION = 1, STORE_FORMAT_FILE = "FORMAT.md", STORE_IDENTITY_FILE = "store.json", STORE_PARTITIONS, STORE_STREAMS, LEDGER_STREAM = "ledgers", STORE_BLOBS_DIR = "blobs", STORE_SHARD_EXT = "jsonl", ENVELOPE_FIELDS, BLOB_REF_KEY = "$blob", BLOB_REF_BYTES_KEY = "bytes", COMPACTED_KIND = "compacted", STORE_RECORD_KINDS, STORE_LINE_CAP_BYTES, STORE_BODY_MAX_DEPTH = 64, STORE_BLOB_MAX_BYTES, STORE_ROOT_CONFIG_KEY = "store_root", STORE_ROOT_ENV = "OPEN_SECOND_BRAIN_STORE_ROOT", STORE_DEFAULT_DIR = "store", STORE_STATE_DIR = "stores", STORE_LOCKS_DIR = "locks", STORE_CLOCK_DIR = "clock", SEEN_SHARDS_FILE = "seen-shards.json", AUTHORITY_FIELD = "authority", VAULT_ID_FIELD = "vault_id", AUTHORITIES, PREFERENCE_SET_KIND = "preference-set", PREFERENCE_REMOVE_KIND = "preference-remove", PREFERENCE_EVIDENCE_KIND = "preference-evidence", PINNED_SET_KIND = "pinned-set", PINNED_CLEAR_KIND = "pinned-clear", SETTING_SET_KIND = "setting-set", SETTING_UNSET_KIND = "setting-unset", SETTING_ENTRY_KIND = "setting-entry", DEVICE_RETIRE_KIND = "device-retire", STATE_DIGEST_KIND = "state-digest", FOLD_RECORD_KINDS, EVIDENCE_RESULTS, PREFERENCE_COUNTER_FIELDS, SETTING_VIEW_LANGUAGE = "view.language", SETTING_TOPIC_MIN_RECORDS = "topics.new_min_records", SETTING_TOPIC_MIN_SESSIONS = "topics.new_min_sessions", SETTING_TOPIC_QUIET_DAYS = "topics.quiet_days", SETTING_SILENT_DEVICE_DAYS = "migration.silent_device_days", SETTING_KEYS, STATE_DIGEST_FOLDS, STATE_DIGEST_REQUIRED_FOLDS, DAY_MS, STORE_DUAL_WRITE_CONFIG_KEY = "store_dual_write", STORE_DUAL_WRITE_ENV = "OPEN_SECOND_BRAIN_STORE_DUAL_WRITE", SIGNAL_KIND = "signal", LOG_EVENT_KIND = "log-event", LEDGER_ROW_KIND = "ledger-row", DUAL_WRITE_RECORD_KINDS, DUAL_WRITE_STATUS_FILE = "dual-write.json", STORE_TMP_DIR = "tmp", BLOB_TEMP_PREFIX = ".tmp-";
+var STORE_FORMAT_VERSION = 1, STORE_FORMAT_FILE = "FORMAT.md", STORE_IDENTITY_FILE = "store.json", STORE_PARTITIONS, STORE_STREAMS, LEDGER_STREAM = "ledgers", STORE_BLOBS_DIR = "blobs", STORE_SHARD_EXT = "jsonl", ENVELOPE_FIELDS, BLOB_REF_KEY = "$blob", BLOB_REF_BYTES_KEY = "bytes", COMPACTED_KIND = "compacted", STORE_RECORD_KINDS, STORE_LINE_CAP_BYTES, STORE_BODY_MAX_DEPTH = 64, STORE_BLOB_MAX_BYTES, STORE_ROOT_CONFIG_KEY = "store_root", STORE_ROOT_ENV = "OPEN_SECOND_BRAIN_STORE_ROOT", STORE_DEFAULT_DIR = "store", STORE_STATE_DIR = "stores", STORE_LOCKS_DIR = "locks", STORE_CLOCK_DIR = "clock", SEEN_SHARDS_FILE = "seen-shards.json", AUTHORITY_FIELD = "authority", VAULT_ID_FIELD = "vault_id", AUTHORITIES, PREFERENCE_SET_KIND = "preference-set", PREFERENCE_REMOVE_KIND = "preference-remove", PREFERENCE_EVIDENCE_KIND = "preference-evidence", PINNED_SET_KIND = "pinned-set", PINNED_CLEAR_KIND = "pinned-clear", SETTING_SET_KIND = "setting-set", SETTING_UNSET_KIND = "setting-unset", SETTING_ENTRY_KIND = "setting-entry", DEVICE_RETIRE_KIND = "device-retire", STATE_DIGEST_KIND = "state-digest", FOLD_RECORD_KINDS, EVIDENCE_RESULTS, PREFERENCE_COUNTER_FIELDS, SETTING_VIEW_LANGUAGE = "view.language", SETTING_TOPIC_MIN_RECORDS = "topics.new_min_records", SETTING_TOPIC_MIN_SESSIONS = "topics.new_min_sessions", SETTING_TOPIC_QUIET_DAYS = "topics.quiet_days", SETTING_SILENT_DEVICE_DAYS = "migration.silent_device_days", SETTING_DREAM_APPLY_DRAFTS = "dream.apply_drafts", SETTING_DREAM_AUTO = "dream.auto", SETTING_KEYS, STATE_DIGEST_FOLDS, STATE_DIGEST_REQUIRED_FOLDS, DAY_MS, STORE_DUAL_WRITE_CONFIG_KEY = "store_dual_write", STORE_DUAL_WRITE_ENV = "OPEN_SECOND_BRAIN_STORE_DUAL_WRITE", SIGNAL_KIND = "signal", LOG_EVENT_KIND = "log-event", LEDGER_ROW_KIND = "ledger-row", DUAL_WRITE_RECORD_KINDS, DUAL_WRITE_STATUS_FILE = "dual-write.json", STORE_TMP_DIR = "tmp", BLOB_TEMP_PREFIX = ".tmp-";
 var init_constants = __esm(() => {
   STORE_PARTITIONS = Object.freeze(["shared", "private"]);
   STORE_STREAMS = Object.freeze([
@@ -2599,7 +2599,8 @@ var init_constants = __esm(() => {
     "topics",
     "settings",
     "digests",
-    "dream-work"
+    "dream-work",
+    "dream-replay"
   ]);
   ENVELOPE_FIELDS = Object.freeze([
     "v",
@@ -2640,7 +2641,9 @@ var init_constants = __esm(() => {
     SETTING_TOPIC_MIN_RECORDS,
     SETTING_TOPIC_MIN_SESSIONS,
     SETTING_TOPIC_QUIET_DAYS,
-    SETTING_SILENT_DEVICE_DAYS
+    SETTING_SILENT_DEVICE_DAYS,
+    SETTING_DREAM_APPLY_DRAFTS,
+    SETTING_DREAM_AUTO
   ]);
   STATE_DIGEST_FOLDS = Object.freeze([
     "preferences",
@@ -2779,6 +2782,7 @@ __export(exports_config, {
   resolveTriggerCooldownDays: () => resolveTriggerCooldownDays,
   resolveVault: () => resolveVault,
   resolveWikiLinkFormat: () => resolveWikiLinkFormat,
+  setConfigJsonValue: () => setConfigJsonValue,
   setConfigValue: () => setConfigValue,
   validateTimezoneName: () => validateTimezoneName,
   vaultStoreReference: () => vaultStoreReference
@@ -2882,8 +2886,31 @@ function setConfigValue(key, value, path) {
   const body = Object.entries(data).map(([k, v]) => `${k}: "${v}"`).join(`
 `) + `
 `;
-  atomicWriteFileSync(resolved, body);
+  atomicWriteText(resolved, body, { mode: configWriteMode(resolved, discovery.exists) });
   return resolved;
+}
+function setConfigJsonValue(key, value, path) {
+  const text = JSON.stringify(value);
+  if (/[\r\n]/.test(text)) {
+    throw new Error(`config value for ${JSON.stringify(key)} must fit on one line`);
+  }
+  const resolved = path ?? defaultConfigPath();
+  const discovery = discoverConfig(resolved);
+  const data = { ...discovery.data, [key]: text };
+  const body = Object.entries(data).map(([k, v]) => `${k}: "${v}"`).join(`
+`) + `
+`;
+  atomicWriteText(resolved, body, { mode: configWriteMode(resolved, discovery.exists) });
+  return resolved;
+}
+function configWriteMode(path, exists) {
+  if (!exists)
+    return 384;
+  const stat = statConfigPath(path);
+  if (stat === undefined || !stat.isFile()) {
+    throw new ConfigReadError(path, "path changed while preparing a write");
+  }
+  return stat.mode & 4095;
 }
 function validateTimezoneName(name) {
   try {
@@ -2909,7 +2936,7 @@ function resolveVault(configPath, opts = {}) {
   const pointerVault = resolvePointerVault(opts.cwd ?? process.cwd());
   if (pointerVault !== null)
     return expandTilde(pointerVault);
-  const discovery = discoverConfig(configPath);
+  const discovery = opts.discovery ?? discoverConfig(configPath);
   const profileVault = resolveActiveProfileVault(discovery.path);
   if (profileVault)
     return expandTilde(profileVault);
@@ -5771,6 +5798,16 @@ var init_fold_settings = __esm(() => {
       valid: silenceDays,
       expected: `an integer from 0 (off) to ${SILENT_DEVICE_DAYS_MAX}`,
       fallback: 30
+    },
+    [SETTING_DREAM_APPLY_DRAFTS]: {
+      valid: (value) => value === "auto" || value === "review",
+      expected: "auto or review",
+      fallback: "auto"
+    },
+    [SETTING_DREAM_AUTO]: {
+      valid: (value) => typeof value === "boolean",
+      expected: "true or false",
+      fallback: true
     }
   });
 });
@@ -6360,7 +6397,8 @@ function scanShard(path, options, onRecord) {
     };
   }
   try {
-    const size = fstatSync6(fd).size;
+    const fileSize = fstatSync6(fd).size;
+    const size = options.until === undefined ? fileSize : Math.min(fileSize, options.until);
     if (start > size) {
       diagnostics.push({
         kind: "offset-past-end",
@@ -6999,10 +7037,15 @@ function sameStamp(a, b) {
 function appendStampOf(stat) {
   return { size: Number(stat.size), mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
 }
-function scanKeeping(path, partitionRoot, offset, keep, checkpoint) {
+function scanKeeping(path, partitionRoot, offset, keep, checkpoint, until) {
   const records = [];
   let anyPending = 0;
-  const scan = scanShard(path, { partitionRoot, ...offset > 0 ? { offset } : {} }, (r) => {
+  const options = {
+    partitionRoot,
+    ...offset > 0 ? { offset } : {},
+    ...until !== undefined ? { until } : {}
+  };
+  const scan = scanShard(path, options, (r) => {
     if (checkpoint !== undefined) {
       try {
         checkpoint();
@@ -7134,10 +7177,13 @@ function readStreamRecords(root, partition, ref, options = {}) {
       continue;
     if (options.month !== undefined && !options.month(monthOf2(shard.rel)))
       continue;
+    const until = options.until?.get(shard.rel);
+    if (options.until !== undefined && until === undefined)
+      continue;
     options.checkpoint?.();
     let read;
     try {
-      read = options.tails === undefined ? scanKeeping(shard.path, partitionRoot, 0, options.keep, options.checkpoint) : readShardWithTails(shard.path, shard.rel, partitionRoot, options.tails, options.keep, options.checkpoint);
+      read = options.tails === undefined || until !== undefined ? scanKeeping(shard.path, partitionRoot, 0, options.keep, options.checkpoint, until) : readShardWithTails(shard.path, shard.rel, partitionRoot, options.tails, options.keep, options.checkpoint);
     } catch (err) {
       if (err instanceof StreamReadInterrupted)
         throw err.cause;
@@ -7166,7 +7212,7 @@ function readStreamRecords(root, partition, ref, options = {}) {
       }
     }
   }
-  if (options.tails !== undefined && options.device === undefined && options.month === undefined) {
+  if (options.tails !== undefined && options.device === undefined && options.month === undefined && options.until === undefined) {
     const listed = new Set(shards.map((shard) => shard.rel));
     for (const rel of options.tails.keys())
       if (!listed.has(rel))
@@ -9131,6 +9177,126 @@ var init_caller_reach = __esm(() => {
   storage = new AsyncLocalStorage2;
 });
 
+// src/core/store/read/read-view.ts
+function activeStoreReadView() {
+  return active;
+}
+function isInputRecord(record) {
+  if (record.kind === SIGNAL_KIND || record.kind === PREFERENCE_EVIDENCE_KIND)
+    return true;
+  return record.kind === LOG_EVENT_KIND && record.body["event_type"] === APPLY_EVIDENCE_EVENT;
+}
+function eventTimeOf(record) {
+  if (record.kind === SIGNAL_KIND) {
+    const frontmatter = record.body["frontmatter"];
+    const created = frontmatter !== null && typeof frontmatter === "object" ? frontmatter["created_at"] : undefined;
+    return typeof created === "string" && Number.isFinite(Date.parse(created)) ? created : null;
+  }
+  if (record.kind === LOG_EVENT_KIND) {
+    const timestamp = record.body["timestamp"];
+    return typeof timestamp === "string" && Number.isFinite(Date.parse(timestamp)) ? timestamp : null;
+  }
+  if (record.kind === PREFERENCE_EVIDENCE_KIND) {
+    const at = record.body[EVIDENCE_AT_FIELD];
+    if (typeof at === "string" && Number.isFinite(Date.parse(at)))
+      return at;
+    const clock = parseHlc(record.hlc);
+    return clock === null ? null : new Date(clock.physical).toISOString();
+  }
+  return null;
+}
+function effectiveTimeOf(view, record) {
+  return view.effective.get(record.id) ?? eventTimeOf(record);
+}
+function visibleInView(view, record) {
+  const at = effectiveTimeOf(view, record);
+  return at === null || Date.parse(at) <= view.instant.getTime();
+}
+function boundaryOf(view, partition, stream) {
+  const out = new Map;
+  for (const p of view.boundary) {
+    if (p.partition === partition && p.stream === stream)
+      out.set(p.shard, p.offset);
+  }
+  return out;
+}
+var APPLY_EVIDENCE_EVENT = "apply-evidence", EVIDENCE_AT_FIELD = "at", active = null;
+var init_read_view = __esm(() => {
+  init_constants();
+  init_hlc();
+});
+
+// src/core/store/read/viewed-read.ts
+function belowOnce(key, token, read) {
+  if (key === undefined)
+    return read();
+  if (belowCache?.token !== token)
+    belowCache = { token, reads: new Map };
+  const cached = belowCache.reads.get(key);
+  if (cached !== undefined)
+    return cached;
+  const fresh = read();
+  if (fresh.unreadable.length === 0 && !fresh.skippedPending)
+    belowCache.reads.set(key, fresh);
+  return fresh;
+}
+function readStreamViewed(root, partition, ref, view, options = {}) {
+  const keep = options.keep ?? (() => true);
+  const folder = ref.ledger !== undefined ? `${ref.stream}/${ref.ledger}` : ref.stream;
+  const below = belowOnce(options.cacheKey === undefined ? undefined : `${root}
+${partition}
+${folder}
+${options.cacheKey}`, view.token, () => readStreamRecords(root, partition, ref, {
+    until: boundaryOf(view, partition, folder),
+    keep: (record) => keep(record) && (!isInputRecord(record) || visibleInView(view, record)),
+    ...options.month !== undefined ? { month: options.month } : {},
+    ...options.checkpoint !== undefined ? { checkpoint: options.checkpoint } : {}
+  }));
+  const records = [...below.records];
+  const unreadable = [...below.unreadable];
+  const seen = new Set(below.records.map((record) => record.id));
+  const partitionRoot = partitionDir(root, partition);
+  const offsets = boundaryOf(view, partition, folder);
+  let shards;
+  try {
+    shards = listShards(partitionRoot, ref);
+  } catch {
+    shards = [];
+    unreadable.push(folder);
+  }
+  for (const shard of shards) {
+    if (options.month !== undefined && !options.month(monthOfShard(shard.rel)))
+      continue;
+    const offset = offsets.get(shard.rel) ?? 0;
+    try {
+      const scan = scanShard(shard.path, { partitionRoot, ...offset > 0 ? { offset } : {} }, (r) => {
+        if (r.bodyState === "pending")
+          return;
+        if (!keep(r.record) || isInputRecord(r.record) || seen.has(r.record.id))
+          return;
+        seen.add(r.record.id);
+        records.push(r.record);
+      });
+      if (shardScanGap(scan) !== null)
+        unreadable.push(shard.rel);
+    } catch {
+      unreadable.push(shard.rel);
+    }
+  }
+  return { ...below, records, unreadable: [...new Set(unreadable)] };
+}
+function monthOfShard(rel) {
+  return rel.slice(rel.lastIndexOf("/") + 1).slice(0, 7);
+}
+var belowCache = null;
+var init_viewed_read = __esm(() => {
+  init_read_view();
+  init_reader();
+  init_shard_list();
+  init_store_paths();
+  init_stream_read();
+});
+
 // src/core/store/read/store-entities.ts
 import { lstatSync as lstatSync8, statSync as statSync14 } from "node:fs";
 function sharedCountersOf(history, privateIds) {
@@ -9199,7 +9365,7 @@ function signalIsPrivate(record, partition) {
   const frontmatter = record.body["frontmatter"];
   return typeof frontmatter === "object" && frontmatter !== null && !Array.isArray(frontmatter) && isPrivateFrontmatter(frontmatter);
 }
-function build(store, checkpoint) {
+function build(store, checkpoint, until, view) {
   const all = [];
   const unreadable = [];
   const pinned = new Map;
@@ -9207,8 +9373,12 @@ function build(store, checkpoint) {
   const pendingBlobs = [];
   let pendingSignalLifecycle = 0;
   for (const partition of store.partitions) {
-    const read = readStreamRecords(store.root, partition, EVENTS, {
-      tails: tailsOf(store, partition),
+    const read = view !== undefined ? readStreamViewed(store.root, partition, EVENTS, view, {
+      keep: isEntityRecord,
+      cacheKey: "entities",
+      ...checkpoint !== undefined ? { checkpoint } : {}
+    }) : readStreamRecords(store.root, partition, EVENTS, {
+      ...until === undefined ? { tails: tailsOf(store, partition) } : { until: until.get(partition) ?? new Map },
       keep: isEntityRecord,
       ...checkpoint !== undefined ? { checkpoint } : {}
     });
@@ -9260,10 +9430,28 @@ function build(store, checkpoint) {
     unreadable,
     skippedPending,
     pendingBlobs,
-    pendingSignalLifecycle
+    pendingSignalLifecycle,
+    ...view !== undefined ? { signalTimes: signalTimesOf(signalFold.signals, view) } : {}
   };
 }
+function signalTimesOf(signals, view) {
+  const out = new Map;
+  for (const [id, entry] of signals) {
+    const first = entry.history.find((record) => record.kind === SIGNAL_KIND);
+    if (first === undefined)
+      continue;
+    const at = effectiveTimeOf(view, first);
+    if (at !== null && at !== eventTimeOf(first))
+      out.set(id, at);
+  }
+  return out;
+}
 function readEntitiesOf(store, options = {}) {
+  if (options.until !== undefined)
+    return build(store, options.checkpoint, options.until);
+  const view = activeStoreReadView();
+  if (view !== null)
+    return viewedEntities(store, view, options.checkpoint);
   const cached = cache.get(store.root);
   const cachedLines = cached === undefined ? null : pendingBlobStampLines(store.root, cached.entities.pendingBlobs);
   const shardStamp = fingerprintOf(store);
@@ -9280,6 +9468,19 @@ ${blobLines}`, entities });
     cache.delete(store.root);
   return entities;
 }
+function viewedEntities(store, view, checkpoint) {
+  const key = `${view.token}
+${fingerprintOf(store)}`;
+  const cached = viewedCache.get(store.root);
+  if (cached !== undefined && cached.key === key)
+    return cached.entities;
+  const entities = build(store, checkpoint, undefined, view);
+  if (entities.unreadable.length === 0 && !entities.skippedPending) {
+    viewedCache.set(store.root, { key, entities });
+  } else
+    viewedCache.delete(store.root);
+  return entities;
+}
 function configuredStore(configPath) {
   try {
     return inspectStore(resolveConfiguredStoreRoot(configPath).root);
@@ -9287,11 +9488,11 @@ function configuredStore(configPath) {
     return null;
   }
 }
-function readStoreEntities(configPath) {
+function readStoreEntities(configPath, options = {}) {
   const store = configuredStore(configPath);
-  return store === null ? null : readEntitiesOf(store);
+  return store === null ? null : readEntitiesOf(store, options);
 }
-var cache, tailsByRoot, EVENTS, ENTITY_KINDS;
+var cache, tailsByRoot, EVENTS, ENTITY_KINDS, viewedCache;
 var init_store_entities = __esm(() => {
   init_fs_identity();
   init_constants();
@@ -9304,6 +9505,8 @@ var init_store_entities = __esm(() => {
   init_store_open();
   init_store_paths();
   init_stream_read();
+  init_read_view();
+  init_viewed_read();
   init_own_appends();
   init_shard_quarantine();
   cache = new Map;
@@ -9319,6 +9522,7 @@ var init_store_entities = __esm(() => {
     PINNED_SET_KIND,
     PINNED_CLEAR_KIND
   ]);
+  viewedCache = new Map;
 });
 
 // src/core/store/store-privacy.ts
@@ -9487,14 +9691,16 @@ var init_memory_ids = __esm(() => {
 // src/core/brain/artifact-ref-resolve.ts
 import { isAbsolute as isAbsolute4, join as join26 } from "node:path";
 import { existsSync as existsSync9, statSync as statSync15 } from "node:fs";
-function artifactRefScope(vault, fromStore) {
+function artifactRefScope(vault, fromStore, configPath) {
   let store = fromStore;
   let dirs;
   let entities;
   return {
-    fromStore: () => store ??= memoryFromStore(vault),
+    fromStore: () => store ??= memoryFromStore(vault, configPath),
     dirs: () => dirs ??= brainDirs(vault),
-    entities: () => (entities ??= { value: memoryEntities({ vault }) }).value
+    entities: () => (entities ??= {
+      value: memoryEntities({ vault, ...configPath !== undefined ? { configPath } : {} })
+    }).value
   };
 }
 function unbracket(ref) {
@@ -9624,9 +9830,9 @@ function namesAPage(ref) {
   const trimmed = ref.trim();
   return ANCHORED_WIKILINK_RE.test(trimmed) || trimmed.endsWith(PAGE_EXTENSION);
 }
-function preferenceIdIsPrivate(vault, id, fromStore = vault === null || judgesFromStore(vault), scope) {
+function preferenceIdIsPrivate(vault, id, fromStore, scope, configPath) {
   if (fromStore || vault === null)
-    return storePreferenceIdIsPrivate(id);
+    return storePreferenceIdIsPrivate(id, configPath);
   let paths;
   try {
     const slug = stripBrainIdPrefix(id);
@@ -9649,34 +9855,39 @@ function preferenceIdOfPath(ref) {
     return;
   return extractId(target.slice(slash + 1));
 }
-function logRefsNamePrivatePage(vault, refs, guessed) {
+function logRefsNamePrivatePage(vault, refs, guessed, configPath) {
   if (judgingOff)
     return false;
   if (batch === null) {
-    return refsNamePrivatePage(vault, refs, guessed, vault === null || judgesFromStore(vault));
+    return refsNamePrivatePage(vault, refs, guessed, vault === null || judgesFromStore(vault, configPath), undefined, configPath);
   }
-  const fromStore = batchFromStore(batch, vault);
-  return refsNamePrivatePage(vault, refs, guessed, fromStore, batchScope(batch, vault, fromStore));
+  const fromStore = batchFromStore(batch, vault, configPath);
+  return refsNamePrivatePage(vault, refs, guessed, fromStore, batchScope(batch, vault, fromStore, configPath), configPath);
 }
-function batchFromStore(b, vault) {
-  let fromStore = b.fromStore.get(vault);
+function privacyContextKey(vault, configPath) {
+  return JSON.stringify([vault, configPath]);
+}
+function batchFromStore(b, vault, configPath) {
+  const key = privacyContextKey(vault, configPath);
+  let fromStore = b.fromStore.get(key);
   if (fromStore === undefined) {
-    fromStore = vault === null || judgesFromStore(vault);
-    b.fromStore.set(vault, fromStore);
+    fromStore = vault === null || judgesFromStore(vault, configPath);
+    b.fromStore.set(key, fromStore);
   }
   return fromStore;
 }
-function batchScope(b, vault, fromStore) {
+function batchScope(b, vault, fromStore, configPath) {
   if (vault === null)
     return;
-  let scope = b.scopes.get(vault);
+  const key = privacyContextKey(vault, configPath);
+  let scope = b.scopes.get(key);
   if (scope === undefined) {
-    scope = artifactRefScope(vault, fromStore);
-    b.scopes.set(vault, scope);
+    scope = artifactRefScope(vault, fromStore, configPath);
+    b.scopes.set(key, scope);
   }
   return scope;
 }
-function refsNamePrivatePage(vault, refs, guessed, fromStore, scope) {
+function refsNamePrivatePage(vault, refs, guessed, fromStore, scope, configPath) {
   let guessSpared = guessed === undefined;
   for (const ref of refs) {
     if (ref === undefined || ref === "")
@@ -9685,18 +9896,18 @@ function refsNamePrivatePage(vault, refs, guessed, fromStore, scope) {
     if (isGuess)
       guessSpared = true;
     const id = extractId(ref) ?? (fromStore ? preferenceIdOfPath(ref) : undefined);
-    if (id !== undefined && !isGuess && preferenceIdIsPrivate(vault, id, fromStore, scope)) {
+    if (id !== undefined && !isGuess && preferenceIdIsPrivate(vault, id, fromStore, scope, configPath)) {
       return true;
     }
     if (fromStore) {
       const signal = signalIdOf(ref);
       if (signal !== undefined) {
-        if (storeSignalIdIsPrivate(signal))
+        if (storeSignalIdIsPrivate(signal, configPath))
           return true;
         continue;
       }
       if (id !== undefined) {
-        if (isGuess && storePreferenceIdIsKnownPrivate(id))
+        if (isGuess && storePreferenceIdIsKnownPrivate(id, configPath))
           return true;
         continue;
       }
@@ -9706,7 +9917,7 @@ function refsNamePrivatePage(vault, refs, guessed, fromStore, scope) {
         return true;
       continue;
     }
-    const rel = resolveArtifactRef(vault, ref, scope ?? artifactRefScope(vault, fromStore));
+    const rel = resolveArtifactRef(vault, ref, scope ?? artifactRefScope(vault, fromStore, configPath));
     if (rel === null)
       continue;
     const abs = resolve16(vault, rel);

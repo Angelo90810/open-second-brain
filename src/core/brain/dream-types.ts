@@ -164,6 +164,31 @@ export interface DreamRunSummary {
     readonly produced: number;
     readonly waiting: number;
     readonly applied: number;
+    /** Closed-question answers applied that decided nothing (below their threshold). */
+    readonly abstained: number;
+    /** Requests the decision model was asked before the pass, per closed operation. */
+    readonly asked?: Readonly<Record<string, number>>;
+  };
+  /**
+   * Where the closed questions of topic planning are judged (change
+   * `dream-closed-questions`): `here` on the dream owner's device,
+   * `elsewhere` on another device, `unbound` on a brain with no owner
+   * (nothing is decided). Absent where topic planning did not run.
+   */
+  readonly judgment?: "here" | "elsewhere" | "unbound";
+  /**
+   * The windows of a live pass on a brain served from the store (change
+   * `dream-replay`): how many this pass evaluated and covered, the newest
+   * covered day after it, how many are still behind, and the window it
+   * stopped at (a gap, the budget). Absent on every other pass.
+   */
+  readonly windows?: {
+    readonly evaluated: number;
+    readonly covered: string | null;
+    readonly behind: number;
+    readonly open: string | null;
+    /** The pass ran no window: the release that made this device the owner has not synced. */
+    readonly outcome?: "waiting-for-sync";
   };
   /**
    * Sub-operations the dream pass attempted but could not fully
@@ -276,6 +301,24 @@ export interface DreamGateOverrides {
   readonly heal_enrich?: boolean;
 }
 
+/** What the front door of a live pass did with the closed questions. */
+export interface ClosedQuestionsRun {
+  /** Items produced. */
+  readonly produced: number;
+  /** Subjects production did not reach before the deadline. */
+  readonly left: number;
+  /** Requests sent to the decision model, per closed operation. */
+  readonly asked: Readonly<Record<string, number>>;
+  /** Items answered in enforce. */
+  readonly answered: number;
+  /** The launched agent's part (change `dream-launched-agent`): whether a session ran, or why not. */
+  readonly agent?: {
+    readonly status: "ran" | "skipped";
+    readonly reason?: string;
+    readonly answered: number;
+  };
+}
+
 export interface DreamOptions {
   /**
    * The machine config whose brain store the topic planning and the view
@@ -283,13 +326,12 @@ export interface DreamOptions {
    */
   readonly configPath?: string;
   /**
-   * Model verdicts computed before the pass (design D10, D20) by an
-   * asynchronous front door that awaited `prepareTopicVerdicts`;
-   * `planTopics` applies them only where their subject still matches the
-   * fold read under the planning lock. Absent (sync callers, dry runs,
-   * previews): the deterministic plan.
+   * What the asynchronous front door (`decide-auto.ts`) produced and asked
+   * before the pass (change `dream-closed-questions`, design D1), carried
+   * into the summary's `model_work`. Absent (sync callers, dry runs,
+   * previews, another device): nothing was produced or asked.
    */
-  readonly topicVerdicts?: import("../topics/verdicts.ts").TopicVerdicts;
+  readonly closedQuestions?: ClosedQuestionsRun;
   /** Wall clock for the run. Defaults to `new Date()`. */
   readonly now?: Date;
   /** When true, compute the plan but make no writes. */

@@ -52,12 +52,56 @@ export interface DoctorExitExclusion {
 }
 
 const EXCLUSIONS: ReadonlyArray<DoctorExitExclusion> = [
+  {
+    code: "discipline-alert",
+    reason:
+      "the daily discipline report is an advisory finding; run the report command named in the " +
+      "finding to read its details, and doctor keeps this out of its warning and error exit streams",
+  },
+  {
+    code: "discipline-info",
+    reason:
+      "the daily discipline report is an advisory finding; run the report command named in the " +
+      "finding to read its details, and doctor keeps this out of its warning and error exit streams",
+  },
+  {
+    code: "discipline-legacy-jobs",
+    reason:
+      "these are old scheduled jobs in Hermes state; remove each id with the Hermes command named " +
+      "in the finding because Open Second Brain no longer manages or edits that scheduler file",
+  },
+  // --- The dream replay (change dream-replay) ------------------------------
+  {
+    code: "dream-replay-behind",
+    reason:
+      "missed dream windows are replayed by the next live pass on the owner's device; it is " +
+      "the pass the brain already runs, not a repair, and it may need several passes under its budget",
+  },
+  {
+    code: "dream-replay-waiting-sync",
+    reason:
+      "this device waits for the previous dream owner's records to arrive by sync; nothing on " +
+      "this machine can bring them, and the next pass after they arrive continues",
+  },
+  {
+    code: "dream-replay-unrecoverable",
+    reason:
+      "the signals were archived before the replay existed; they are counted for the record " +
+      "and there is nothing to run that would reopen them",
+  },
+  {
+    code: "dream-replay-policy-changed",
+    reason:
+      "windows were evaluated under settings that have changed since; their outcomes stand, " +
+      "and nothing re-evaluates a covered window",
+  },
   // --- The dream work queue (change dream-work-queue) --------------------
   {
     code: "dream-queue-no-executor",
     reason:
-      "queued dream work waits for an executor this version does not have; there is nothing to " +
-      "run until a release that answers it is installed, and the work is kept meanwhile",
+      "queued dream work waits for an executor: for a closed question the remedy is a setting " +
+      "(a decision model and its use in enforce), for other work a release that answers it; " +
+      "neither is one command, and the work is kept meanwhile",
   },
   {
     code: "dream-queue-unknown-operation",

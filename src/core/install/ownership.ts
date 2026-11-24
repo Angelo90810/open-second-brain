@@ -329,21 +329,6 @@ export const OUT_OF_VAULT_STATE: ReadonlyArray<OutOfVaultState> = Object.freeze(
     ],
   },
   {
-    id: "hermes_discipline_jobs",
-    label: "Hermes cron jobs for the discipline report",
-    location:
-      "~/.hermes/cron/jobs.json of the user running the verb, or the file OSB_HERMES_JOBS names",
-    carries_memory: false,
-    created_by:
-      "`o2b discipline install`, which adds or updates the daily or the weekly job of each vault in that file, so a vault can own two entries",
-    removed_by:
-      "`o2b discipline uninstall`, which removes this tool's jobs and leaves every other job in the file alone",
-    note:
-      "The jobs file belongs to Hermes; this tool edits only the entries whose ids it derives from the " +
-      "vault path. Each job names the vault, the report script and the delivery target, not memory content.",
-    sources: ["src/cli/discipline-install.ts"],
-  },
-  {
     id: "bench_run_artifacts",
     label: "benchmark run artifacts",
     location: ".open-second-brain/bench-runs, resolved against the working directory",
@@ -371,6 +356,25 @@ export const OUT_OF_VAULT_STATE: ReadonlyArray<OutOfVaultState> = Object.freeze(
       "vault text - and it is validated against the installed spec on every read, so deleting one " +
       "merely puts that use back in shadow until the eval promotes it again.",
     sources: ["src/core/decision-model/eval/mark.ts", "src/core/platform-dirs.ts"],
+  },
+  {
+    id: "dream_trigger_records",
+    label: "dream day records",
+    location: WINDOWS
+      ? `(${describeBaseDir("state", "win32")})\\open-second-brain\\dream-trigger\\<key>.json`
+      : "${XDG_STATE_HOME:-~/.local/state}/open-second-brain/dream-trigger/<key>.json",
+    carries_memory: false,
+    created_by:
+      "a session start, an MCP server's first call of a day, or the end of a live dream pass on this machine",
+    removed_by:
+      "deleting the file yourself; the next session start reads the brain again and writes a new one",
+    note:
+      "One small record per configured store root (the key is a hash of that root): whether today's " +
+      "dream pass closed the day, the last run and its outcome, the retry time, and what this machine " +
+      "last read about the dream owner. A claim file beside it exists only while a dream worker the " +
+      "trigger started runs. It carries days, times, counts, device and agent names and the names of " +
+      "waiting work - never vault text.",
+    sources: ["src/core/brain/dream-trigger/record.ts"],
   },
   {
     id: "decision_model_thresholds",
@@ -474,6 +478,34 @@ export const OUT_OF_VAULT_STATE: ReadonlyArray<OutOfVaultState> = Object.freeze(
  * belongs in {@link OUT_OF_VAULT_STATE} instead, no matter how small.
  */
 export const OUT_OF_VAULT_SWEEP_EXCLUSIONS: ReadonlyMap<string, string> = new Map([
+  [
+    "scripts/pack-manifest.ts",
+    "a maintainer and CI script: it unpacks a release tarball into a temp-rooted scratch " +
+      "directory to check its file list and removes that directory; it never runs on a user's " +
+      "machine as part of the product",
+  ],
+  [
+    "scripts/registry-smoke.ts",
+    "a release workflow script: it installs the published package into one temp-rooted scratch " +
+      "directory with a scratch home and removes it by its exact path; it is not part of the " +
+      "installed product's runtime",
+  ],
+  [
+    "scripts/scratch-environment.ts",
+    "it only BUILDS the environment that points a child process at a caller-supplied scratch " +
+      "root (home, XDG and Bun directories inside it) for the smoke script and the packed " +
+      "install tests; it writes nothing itself and names no real per-user location",
+  ],
+  [
+    "src/core/discipline/legacy-jobs.ts",
+    "it resolves the old job-file location only to read and identify entries left by a removed " +
+      "installer; it changes no Hermes scheduler state and writes no path outside the vault",
+  ],
+  [
+    "src/core/install/integrations.ts",
+    "it resolves the Hermes plugin directory only to test whether the adapter is installed; it " +
+      "reads no plugin files and creates or changes no path outside the vault",
+  ],
   [
     "src/core/install/payload.ts",
     "it computes the default config path only to COMPARE it with the configured one, so a host " +

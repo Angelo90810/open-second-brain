@@ -2,23 +2,28 @@
  * Topic planning (design D9; spec `topics` "Automatic grouping during
  * dream", "Merges and splits are proposed", "Topic status lifecycle";
  * task 3.4): the pure decision of what the dream pass does with the
- * records no topic holds yet. No I/O and no model call: the same fold and
- * candidates give the same plan on every machine, and the deterministic
- * fallbacks of design D10 are the whole rule here.
+ * records no topic holds yet. No I/O and no model call: the same fold,
+ * candidates and answers give the same plan on every machine. A closed
+ * question is decided only by an answer; the plan lists what it still
+ * asks.
  *
- *  - **Route.** An unassigned record of a project goes to the active
- *    topic of that project whose head (title, description, goal and item
- *    texts) shares the most subject words with it: at least two words and
- *    a fifth of the record's, the earlier topic on a tie. A route the user
- *    took back (`blockedRoutes`) is never taken again. A record with no
- *    project goes only to a personal topic.
- *  - **Create.** The records of one project that no topic holds and none
- *    ever held (`touched`) are grouped by shared subject words; a group of
- *    at least `minRecords` records from at least `minSessions` sessions
- *    becomes a topic, titled by its most frequent words, its goal drafted
- *    from its first record, and every record of it assigned. Records with
- *    no project never make a topic on their own; a personal topic is made
- *    on request.
+ *  - **Route.** An unassigned record of a project is routed only by a
+ *    model's answer (change `dream-closed-questions`): the active topics of
+ *    its scope whose head (title, description, goal and item texts) shares
+ *    the most subject words with it - at least two words and a fifth of the
+ *    record's - are the options of its routing question (`asks.routes`),
+ *    and until an answer names one of them the record stays as it is. A
+ *    route the user took back (`blockedRoutes`) is never offered.
+ *  - **Create.** The records of one project that no topic holds, none ever
+ *    held (`touched`) and no routing question waits for are grouped by
+ *    shared subject words; a group of at least `minRecords` records from
+ *    at least `minSessions` sessions is asked about (`asks.groups`) and
+ *    becomes a topic only with an approval and a wording (the title and
+ *    goal the launched agent wrote, `asks.wordings` while it waits; the
+ *    title drafted from its most frequent words is only part of the
+ *    approval question). Records with no
+ *    project never make a topic on their own; a personal topic is made on
+ *    request.
  *  - **Propose.** Two active topics of one scope whose heads share half
  *    their words are proposed for a merge; a topic whose records fall into
  *    two groups that would each make a topic is proposed for a split.
@@ -43,8 +48,6 @@ const MIN_ROUTE_SHARE = 0.2;
 const MERGE_JACCARD = 0.5;
 /** Words in a drafted title. */
 const TITLE_WORDS = 3;
-/** Longest drafted goal, in characters. */
-const GOAL_MAX = 200;
 
 export interface PlanSettings {
   readonly minRecords: number;
@@ -70,6 +73,8 @@ export interface PlannedCreate {
   readonly sessions: number;
   /** Set when the model was asked about this group and let it through (`topic_new`): the create record carries it. */
   readonly verdict?: TopicVerdictBody;
+  /** Who wrote the title and goal (the launched agent's wording answer). */
+  readonly author?: { readonly agent: string; readonly model: string; readonly item: string };
 }
 
 export interface MergeProposal {
@@ -77,6 +82,8 @@ export interface MergeProposal {
   readonly score: number;
   /** Set when the model judged this pair (`topic_same`, design D10): a Jaccard proposal it called `different` is listed last; a pair it called `same` is added. Never applied. */
   readonly verdict?: TopicVerdictBody;
+  /** What the model judged the pair, with {@link verdict}. */
+  readonly judged?: string;
 }
 
 export interface SplitProposal {
@@ -119,8 +126,31 @@ export interface ProjectShortfall {
    * a topic fits, never grouped again.
    */
   readonly heldBack: number;
-  /** Groups of the project that qualified and a decision model vetoed this pass (`topic_new`). */
+  /** Groups of the project that qualified and a decision model vetoed (`topic_new`). */
   readonly vetoed: number;
+  /** Groups of the project that qualified and wait for an answer (`topic_new`). */
+  readonly asked: number;
+}
+
+/** A closed question the plan cannot decide without an answer. */
+export interface PlanAsks {
+  /** Unassigned records and the topics their routing question offers, best first. */
+  readonly routes: ReadonlyArray<{
+    readonly record: string;
+    readonly topics: ReadonlyArray<string>;
+  }>;
+  /** Qualifying groups that wait for an approval or a veto. */
+  readonly groups: ReadonlyArray<PlanAskedGroup>;
+  /** Approved groups that wait for the wording of their topic (`topic-wording`). */
+  readonly wordings: ReadonlyArray<PlanAskedGroup>;
+}
+
+export interface PlanAskedGroup {
+  readonly key: string;
+  readonly members: ReadonlyArray<string>;
+  readonly title: string;
+  readonly scope: string;
+  readonly private: boolean;
 }
 
 export interface TopicPlan extends TopicReview {
@@ -129,6 +159,8 @@ export interface TopicPlan extends TopicReview {
   readonly splits: ReadonlyArray<SplitProposal>;
   /** The projects with records no topic holds that got no topic this pass, most free records first. */
   readonly shortfalls: ReadonlyArray<ProjectShortfall>;
+  /** What the plan asks and cannot decide without an answer. */
+  readonly asks: PlanAsks;
 }
 
 const isActive = (t: TopicState): boolean => t.mergedInto === null && t.status === "active";
@@ -197,32 +229,13 @@ export function rankedRouteTopics(fold: TopicFold, candidate: TopicCandidate): s
     .map((entry) => entry.id);
 }
 
-function bestTopic(
-  fold: TopicFold,
-  candidate: TopicCandidate,
-  topics: ReadonlyArray<{ topic: TopicState; tokens: Set<string>; all: Set<string> }>,
-): string | null {
-  const words = subjectTokens(candidate.text);
-  if (words.size === 0) return null;
-  let best: { id: string; score: number } | null = null;
-  for (const { topic, tokens, all } of topics) {
-    if (topic.scope !== scopeOf(candidate)) continue;
-    if (fold.blockedRoutes.has(routeKey(candidate.id, topic.id))) continue;
-    // Such a route is written to `private`: private words may decide it.
-    const n = shared(words, candidate.private || topic.private ? all : tokens);
-    if (n < MIN_SHARED || n / words.size < MIN_ROUTE_SHARE) continue;
-    if (best === null || n > best.score) best = { id: topic.id, score: n };
-  }
-  return best?.id ?? null;
-}
-
-interface Group {
+export interface Group {
   readonly members: TopicCandidate[];
   readonly words: Map<string, number>;
 }
 
 /** Greedy grouping by shared subject words, in record order: deterministic. */
-function groups(candidates: ReadonlyArray<TopicCandidate>): Group[] {
+export function groups(candidates: ReadonlyArray<TopicCandidate>): Group[] {
   const out: Group[] = [];
   for (const candidate of candidates) {
     const words = subjectTokens(candidate.text);
@@ -270,7 +283,8 @@ function closestGroup(
   return { records: best.records, sessions: best.sessions, kinds };
 }
 
-function qualifies(group: Group, settings: PlanSettings): boolean {
+/** Whether a group has the records and sessions a topic needs. */
+export function qualifies(group: Group, settings: PlanSettings): boolean {
   return (
     group.members.length >= settings.minRecords &&
     new Set(group.members.map((m) => m.session)).size >= settings.minSessions
@@ -362,11 +376,6 @@ function clampUnits(text: string, max: number): string {
   return text.slice(0, end);
 }
 
-function draftGoal(group: Group): string {
-  const text = group.members[0]!.text.replaceAll(/\s+/g, " ").trim();
-  return [...text].length <= GOAL_MAX ? text : `${[...text].slice(0, GOAL_MAX - 3).join("")}...`;
-}
-
 const byRecordOrder = (a: TopicCandidate, b: TopicCandidate): number =>
   a.at - b.at || compareCodeUnits(a.id, b.id);
 
@@ -436,8 +445,9 @@ function applySameVerdicts(
     const entry = judged.get(keyOf(merge.topics));
     // The decide pass keeps only verdicts at or above the stored `same_min`.
     if (entry !== undefined) {
-      if (entry.option === "same") kept.push({ ...merge, verdict: entry.verdict });
-      else annotated.push({ ...merge, verdict: entry.verdict });
+      if (entry.option === "same") {
+        kept.push({ ...merge, verdict: entry.verdict, judged: entry.option });
+      } else annotated.push({ ...merge, verdict: entry.verdict, judged: entry.option });
       continue;
     }
     kept.push(merge);
@@ -457,13 +467,23 @@ function applySameVerdicts(
     const key = keyOf([entry.a, entry.b]);
     const present = (m: MergeProposal): boolean => keyOf(m.topics) === key;
     if (kept.some(present) || added.some(present) || annotated.some(present)) continue;
-    added.push({ topics: [entry.a, entry.b], score: 0, verdict: entry.verdict });
+    added.push({ topics: [entry.a, entry.b], score: 0, verdict: entry.verdict, judged: "same" });
   }
   return [...kept, ...added, ...annotated];
 }
 
-/** Merge proposals and quiet-topic prompts: what the brief and digest ask the user. */
-export function reviewTopics(fold: TopicFold, nowMs: number, quietDays: number): TopicReview {
+/**
+ * Merge proposals and quiet-topic prompts: what the brief and digest ask
+ * the user. `hints` are the standing `topic-same` answers (read from the
+ * dream work queue): a `same` adds or confirms a pair, a `different`
+ * annotates one and lists it last.
+ */
+export function reviewTopics(
+  fold: TopicFold,
+  nowMs: number,
+  quietDays: number,
+  hints?: TopicVerdicts["sameTopics"],
+): TopicReview {
   const active = [...fold.topics.values()]
     .filter(isActive)
     .toSorted((a, b) => compareCodeUnits(a.id, b.id));
@@ -486,17 +506,17 @@ export function reviewTopics(fold: TopicFold, nowMs: number, quietDays: number):
   const quiet = active
     .map((t) => ({ topic: t.id, days: Math.floor((nowMs - t.updatedAt) / DAY_MS) }))
     .filter((q) => q.days >= quietDays);
-  return { merges, quiet };
+  return { merges: applySameVerdicts(fold, merges, hints), quiet };
 }
 
 /**
- * The plan for `candidates` against `fold`. `verdicts` (design D10,
- * D20) refines the deterministic result: a verdict is applied only when
- * its subject still matches this fold - the record is still unassigned,
- * the topic still exists and is active, the route is not blocked, the
- * group has exactly the same members - and a verdict that no longer
- * matches is ignored, the deterministic rule applying. With `verdicts`
- * absent the plan is exactly the deterministic one.
+ * The plan for `candidates` against `fold`. `verdicts` are the answers
+ * planning holds (accepted ones and standing ones, design D2): a verdict
+ * is applied only when its subject still matches this fold - the record
+ * is still unassigned, the topic still exists and is active, the route is
+ * not blocked, the group has exactly the same members. Without a verdict
+ * a routing question or a qualifying group waits: it is listed in `asks`
+ * and nothing is decided for it.
  */
 export function planTopics(
   fold: TopicFold,
@@ -509,16 +529,19 @@ export function planTopics(
   const active = [...fold.topics.values()]
     .filter(isActive)
     .toSorted((a, b) => a.createdAt - b.createdAt || compareCodeUnits(a.id, b.id))
-    .map((topic) => ({ topic, tokens: headTokens(topic, false), all: headTokens(topic, true) }));
+    .map((topic) => ({ topic }));
   const routes: PlannedRoute[] = [];
+  const askedRoutes: Array<{ record: string; topics: string[] }> = [];
+  const askedGroups: PlanAskedGroup[] = [];
+  const awaitingWording: PlanAskedGroup[] = [];
   const free: TopicCandidate[] = [];
   const heldBack = new Map<string, number>();
   for (const candidate of ordered) {
     if (holder(fold, candidate) !== null) continue;
     // The model's route (D10): a verdict that no longer matches this
     // fold - the record assigned meanwhile, the topic merged, closed or
-    // of another scope, the route blocked - is ignored here and the
-    // deterministic `bestTopic` decides.
+    // of another scope, the route blocked - is ignored here, and the
+    // record waits for an answer about the topics it has now.
     const routeVerdict = verdicts?.routes.get(candidate.id);
     let topic: string | null = null;
     let verdict: TopicVerdictBody | undefined;
@@ -541,7 +564,14 @@ export function planTopics(
         }
       }
     }
-    if (topic === null && !modelNone) topic = bestTopic(fold, candidate, active);
+    if (topic === null && !modelNone) {
+      const options = rankedRouteTopics(fold, candidate);
+      if (options.length > 0) {
+        // A routing question waits: the record stays as it is.
+        askedRoutes.push({ record: candidate.id, topics: options });
+        continue;
+      }
+    }
     if (topic !== null) {
       const target = fold.topics.get(topic)!;
       routes.push({
@@ -568,11 +598,12 @@ export function planTopics(
     const made = groups(own);
     let createdHere = 0;
     let vetoed = 0;
+    let asked = 0;
     for (const group of made) {
       if (!qualifies(group, settings)) continue;
-      // `topic_new` (D10): a model veto skips the creation this pass
-      // only - the group is held in memory, the next pass asks again -
-      // and an approval rides the create record as its verdict. The
+      // `topic_new`: a group becomes a topic only with an approval, which
+      // rides the create record as its verdict; a veto holds while the
+      // group keeps its members, and a group with no answer waits. The
       // count and session thresholds hold either way: the model can
       // never create a group that does not qualify.
       const key = topicGroupKey(group.members.map((m) => m.id));
@@ -581,15 +612,42 @@ export function planTopics(
         vetoed += 1;
         continue;
       }
+      if (verdictEntry === undefined) {
+        asked += 1;
+        askedGroups.push({
+          key,
+          members: group.members.map((m) => m.id),
+          title: draftTitle(group),
+          scope: `${TOPIC_PROJECT_SCOPE_PREFIX}${project}`,
+          private: group.members.some((m) => m.private),
+        });
+        continue;
+      }
+      // The title and goal are the launched agent's (change
+      // `dream-launched-agent`, design D6): an approved group with no
+      // wording yet waits; no rule names it.
+      const wording = verdicts?.wordings.get(key);
+      if (wording === undefined) {
+        asked += 1;
+        awaitingWording.push({
+          key,
+          members: group.members.map((m) => m.id),
+          title: draftTitle(group),
+          scope: `${TOPIC_PROJECT_SCOPE_PREFIX}${project}`,
+          private: group.members.some((m) => m.private),
+        });
+        continue;
+      }
       createdHere += 1;
       creates.push({
-        title: draftTitle(group),
-        goal: draftGoal(group),
+        title: wording.title,
+        goal: wording.goal,
         scope: `${TOPIC_PROJECT_SCOPE_PREFIX}${project}`,
         private: group.members.some((m) => m.private),
         members: group.members.map((m) => m.id),
         sessions: new Set(group.members.map((m) => m.session)).size,
-        ...(verdictEntry !== undefined ? { verdict: verdictEntry.verdict } : {}),
+        verdict: verdictEntry.verdict,
+        author: { agent: wording.agent, model: wording.model, item: wording.item },
       });
     }
     if (createdHere === 0) {
@@ -599,6 +657,7 @@ export function planTopics(
         closest: closestGroup(made, settings),
         heldBack: heldBack.get(project) ?? 0,
         vetoed,
+        asked,
       });
     }
   }
@@ -621,5 +680,6 @@ export function planTopics(
     ),
     merges: applySameVerdicts(fold, [...review.merges], verdicts?.sameTopics),
     quiet: review.quiet,
+    asks: { routes: askedRoutes, groups: askedGroups, wordings: awaitingWording },
   };
 }

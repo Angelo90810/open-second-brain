@@ -528,9 +528,7 @@ export const CLI_CENSUS: Readonly<Record<string, CliRow>> = Object.freeze({
   "decision-model thresholds fit": o("dmState"),
   "decision-model thresholds list": r,
   "decision-model thresholds set": o("dmState"),
-  "discipline install": u("host"),
   "discipline report": r,
-  "discipline uninstall": u("host"),
   doctor: r,
   "export-config": o("outPath"),
   help: r,
@@ -642,9 +640,16 @@ export const CLI_CENSUS: Readonly<Record<string, CliRow>> = Object.freeze({
   status: r,
   "store device list": r,
   "store device retire": o("store"),
+  "dream agent check": o("deviceState"),
+  "dream agent set": o("config"),
+  "dream agent show": r,
   "dream owner": o("store"),
+  "dream queue approve": o("store"),
   "dream queue cancel": o("store"),
+  "dream queue reject": o("store"),
   "dream queue retry": o("store"),
+  "dream run": w(V, ["dream", "run"]),
+  "dream status": r,
   "store init": o("store"),
   "store partition leave": o("store"),
   "store path": r,
@@ -893,6 +898,12 @@ export const WORKER_CENSUS: Readonly<Record<string, WorkerRow>> = Object.freeze(
   "automatic store migration worker log": { kind: "outside", reason: "deviceState" },
   "lost automatic migration worker record": { kind: "outside", reason: "deviceState" },
   "dependency bootstrap of a self-spawn": { kind: "outside", reason: "checkout" },
+  // The dream agent's session (change dream-launched-agent): it writes only
+  // through the dream-executor server, which writes the store's queue.
+  "dream agent session": { kind: "outside", reason: "store" },
+  // The dream worker the day check starts (change dream-session-trigger):
+  // a whole live pass, the same code as the dream verb in the foreground.
+  "dream worker (dream run --claim)": { kind: "same-as", entry: "cli:dream run" },
 });
 
 /**
@@ -931,7 +942,18 @@ export const WORKER_SPAWN_SITES: Readonly<Record<string, SpawnSite>> = Object.fr
     calls: 4,
     starts: ["automatic store migration worker log", "dependency bootstrap of a self-spawn"],
   },
+  // The dream day check starts the dream worker (change dream-session-trigger).
+  "src/core/brain/dream-trigger/due.ts": {
+    calls: 1,
+    starts: ["dream worker (dream run --claim)"],
+  },
   "src/core/search/freshen.ts": { calls: 1, starts: ["freshen-on-read search index"] },
+  // Starts the dream agent's session in a process group of its own, awaited
+  // and ended at its deadline (change dream-launched-agent).
+  "src/core/process/run-program.ts": {
+    calls: 1,
+    starts: ["dream agent session"],
+  },
   "src/core/search/store/writer-lock.ts": {
     calls: 1,
     starts: ["search writer-lock heartbeat thread"],

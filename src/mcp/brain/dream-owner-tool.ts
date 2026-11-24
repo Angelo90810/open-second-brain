@@ -18,6 +18,8 @@
  * made earlier does not block it.
  */
 
+import { forgetDreamOwnerCheck } from "../../core/brain/dream-trigger/forget.ts";
+import { replayStatus, replayStatusJson } from "../../core/brain/dream-replay/status-view.ts";
 import { TRANSPORT_REACH } from "../../core/graph/transport-reach.ts";
 import { openDreamOwnerStore } from "../../core/brain/dream-owner/gate.ts";
 import { releaseDreamOwner, takeDreamOwner } from "../../core/brain/dream-owner/owner.ts";
@@ -26,7 +28,12 @@ import {
   describeDreamOwnerStatus,
   dreamOwnerStatus,
 } from "../../core/brain/dream-owner/status.ts";
-import { queueStatus, queueSummaryJson } from "../../core/brain/dream-queue/status-view.ts";
+import {
+  queueStatus,
+  dreamAgentStatus,
+  queueSummaryJson,
+  waitingByOperation,
+} from "../../core/brain/dream-queue/status-view.ts";
 import { coerceStr, unknownOperationError } from "../coerce.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import {
@@ -74,7 +81,16 @@ async function toolBrainDreamOwner(
       declared_primary_agent: status.declaredPrimaryAgent,
       summary: describeDreamOwnerStatus(status).join(" "),
       // Below local reach the private partition's work is withheld.
-      queue: queueSummaryJson(queueStatus(vault, { ...configOpt, withholdPrivate: !local })),
+      queue: ((queue) => queueSummaryJson(queue, waitingByOperation(queue, configOpt)))(
+        queueStatus(vault, { ...configOpt, withholdPrivate: !local }),
+      ),
+      replay: replayStatusJson(
+        replayStatus(vault, {
+          ...configOpt,
+          queue: queueStatus(vault, { ...configOpt, withholdPrivate: !local }),
+        }),
+      ),
+      agent: dreamAgentStatus(ctx.configPath ?? undefined),
     };
   }
 
@@ -102,6 +118,7 @@ async function toolBrainDreamOwner(
         { owner: result.owner },
       );
     }
+    forgetDreamOwnerCheck(ctx.configPath ?? undefined);
     return { operation, status: "released", device: store.device };
   }
 
@@ -116,6 +133,8 @@ async function toolBrainDreamOwner(
     );
   }
   const result = takeDreamOwner(store, agent, { ...writer, force: false });
+  // The day check of this machine looks at the role again today.
+  forgetDreamOwnerCheck(ctx.configPath ?? undefined);
   return {
     operation,
     status: result.status,

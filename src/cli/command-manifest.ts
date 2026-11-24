@@ -1470,7 +1470,53 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
               flag("config", "string"),
               flag("json", "boolean"),
             ]),
+            command("approve", "Approve a text answer held for review (the dream owner's device)", [
+              flag("vault", "string"),
+              flag("config", "string"),
+              flag("json", "boolean"),
+            ]),
+            command("reject", "Reject a text answer held for review (the dream owner's device)", [
+              flag("reason", "string"),
+              flag("vault", "string"),
+              flag("config", "string"),
+              flag("json", "boolean"),
+            ]),
           ],
+        ),
+        command(
+          "agent",
+          "Show, set or check the command that starts the dream agent on this machine",
+          [flag("config", "string"), flag("json", "boolean")],
+          [
+            command("show", "Show the dream agent command, its verification and the last run", [
+              flag("config", "string"),
+              flag("json", "boolean"),
+            ]),
+            command("set", "Set the dream agent command (a preset name or a JSON array)", [
+              flag("fallback", "string-array"),
+              flag("config", "string"),
+            ]),
+            command("check", "Verify the dream agent command with a real short session", [
+              flag("command", "string"),
+              flag("config", "string"),
+              flag("json", "boolean"),
+            ]),
+          ],
+        ),
+        command(
+          "run",
+          "Run a whole live dream pass on the dream owner's device and record the day",
+          [
+            flag("claim", "string"),
+            flag("vault", "string"),
+            flag("config", "string"),
+            flag("json", "boolean"),
+          ],
+        ),
+        command(
+          "status",
+          "Show the state of the dream day: automatic dream, the owner, the last run, the retry time",
+          [flag("vault", "string"), flag("config", "string"), flag("json", "boolean")],
         ),
       ],
     ),
@@ -1573,11 +1619,7 @@ export const CLI_COMMAND_MANIFEST: CliRootManifest = Object.freeze({
       "discipline",
       "Daily logging discipline verbs",
       [],
-      [
-        command("report", "Render discipline report"),
-        command("install", "Install discipline cron"),
-        command("uninstall", "Remove discipline cron"),
-      ],
+      [command("report", "Render discipline report")],
     ),
     command(
       "partner",

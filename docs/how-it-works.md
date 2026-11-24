@@ -2,25 +2,73 @@
 
 A working guide for engineers and agents to the mechanics of the
 observing memory layer. Read this when you want to understand what the
-system does, not what to configure.
+system does, not what to configure. Installation is in
+[`install.md`](../install.md); the capability overview is in
+[`features.md`](features.md).
 
 ## Mental model
 
-Open Second Brain accumulates **preferences** and learns from real
-usage. Three responsibilities:
+Open Second Brain carries what agents learn into future sessions. Four
+responsibilities:
 
-- **Capture.** Agents and humans drop taste signals into `Brain/inbox/`.
-- **Accretion.** A deterministic `dream` pass turns repeat signals into
-  rules.
-- **Application.** Agents record whether they applied or violated each
-  rule when producing durable artifacts.
+1. **Capture.** Agents and people record taste signals, notes, decisions
+   and evidence through the MCP tools, the hooks, the CLI and `@osb`
+   markers. Every record names the agent that wrote it.
+2. **Keep.** Records go to the **brain store**: append-only files outside
+   the vault, in a `shared` and a `private` partition. A sync tool you
+   choose can carry the partitions to other machines; Open Second Brain
+   does not sync them itself ([`brain-store.md`](brain-store.md)).
+3. **Consolidate.** The **dream** pass turns repeated signals into rules,
+   confirms, quarantines and retires rules by their evidence, and keeps
+   topics. It runs on one installation, the dream owner, and starts by
+   itself at the first session of the day on that machine
+   ([`dream.md`](dream.md)).
+4. **Deliver.** The next session starts with a digest of the confirmed
+   rules, with scope and confidence, recent retirements, the heads of the
+   project's live topics and the pinned context. Search and the context
+   tools answer the rest on demand.
 
-The LLM lives outside the system: agents use it to detect signals in
-conversation and to apply rules during work. The system uses counters,
-thresholds, and atomic file operations — no LLM inside the algorithm,
-no surprise, no hallucinated memory.
+People read and correct the brain through the **human view**: plain
+Markdown pages one machine renders into a folder you choose. Editing a
+rule there records a human correction, and human records win over what an
+agent or a model recorded.
+
+Counting, thresholds and state changes in dream are deterministic: the
+same inputs give the same result. Work that needs judgment or wording (a
+closed question such as "which topic does this record belong to", the
+summary of a period, the title of a new topic) is never decided by a fixed
+rule. It waits in the dream work queue until a decision model or your own
+agent answers it, and every answer is recorded with its author.
+
+```mermaid
+flowchart LR
+    Agent["Agent session"] -->|brain_feedback, notes, evidence| Store[("Brain store<br/>shared + private")]
+    Store --> Dream["Dream pass<br/>on the dream owner's machine"]
+    Dream -->|closed questions, wording| Queue["Dream work queue"]
+    Queue -->|answers with their author| Dream
+    Queue -.-> Exec["Decision model (optional)<br/>or your dream agent"]
+    Exec -.-> Queue
+    Dream -->|rules, topics| Store
+    Store -->|session-start digest| Agent
+    Store --> View["Human view<br/>plain Markdown pages"]
+    View -->|your edits become human records| Store
+```
+
+The learning loop of one rule: signals become an unconfirmed rule,
+applied evidence confirms it, the digest carries it into later sessions,
+and violated, outdated or missing evidence quarantines or retires it. The
+states are in [A preference's lifecycle](#a-preferences-lifecycle) below.
 
 ## Vault layout
+
+A machine set up with 2.0 keeps its brain in the brain store, outside the
+vault: the vault holds your notes and, if you choose, the folder of the
+human view. The tree below is the **legacy layout** of a vault from 1.x
+that has not moved to the store yet. Its names (`Brain/inbox/`,
+`Brain/preferences/`, `Brain/log/`) are still how this guide refers to
+the record kinds; after the move the same records are streams of the
+store, and the automatic migration moves an existing tree
+([`brain-store.md`](brain-store.md#automatic-migration)).
 
 The agent owns one top-level directory for its own artefacts: `Brain/`.
 Everything it generates unprompted lives there. The one surface that
@@ -153,7 +201,7 @@ sequenceDiagram
 
     Note over Vault: days pass and two more matching signals arrive on the same topic
 
-    Note over Core: scheduled dream pass (cron or manual)
+    Note over Core: dream pass at the first session of the day on the dream owner's machine
     Core->>Vault: scan inbox, preferences, log
     Core->>Core: group signals by topic
     Core->>Vault: createSnapshot to .snapshots/dream-run.tar.zst
@@ -234,7 +282,17 @@ A vault shared across hosts has one dream owner: one agent installation on one d
 
 ## The dream pass in detail
 
-A live dream pass runs on the dream owner's device only (see "Dream owner" below); a dry run runs anywhere. A single dream invocation is a deterministic pipeline:
+A live dream pass runs on the dream owner's device only (see "Dream owner" below); a dry run runs anywhere.
+
+### Windows: one pass after any silence
+
+On a brain served from the brain store a live pass works in **windows** of one UTC day. It evaluates every day from the one after the last covered day through today, oldest first: a past day at its last millisecond, today at the real moment of the run. Every rule that reads the present (the contradiction window, expiry, the archive rule, trial deadlines, staleness and chain decay, confidence freshness, the guardrail's minimum age, the cross-topic allowance per day) reads the window's instant and day, and each window sees what the previous one left. So a machine that was off for three weeks ends where three weeks of daily passes would have ended: three matching signals on the first day of the silence are promoted on the day they met the threshold instead of being archived unconsidered, and a trial whose deadline passed in the silence retires on its deadline's day. A pass with no gap has one window, today's, and behaves as before.
+
+A window's **inputs** are the signal captures and the applications of a rule below its boundary (the shard positions its admission froze) whose time is not after its instant; everything else (preferences, signal moves, retirements, settings) is read as it is now, so a rule a person retired during the silence is retired in every replayed window. A record that reaches the machine after its day was covered is **late**: it counts from the window that first sees it and reopens nothing (two signals already archived stay archived; a late application in time for a trial already retired is recorded as a reconciliation in the window's audit event and the digest, and the rule stays retired). A record dated ahead of the moment of admission is judged at that moment, as before.
+
+Each window writes, in the `dream-replay` stream: its **admission** (the boundary and the late and clamped records), its **plan** (every effect with an effect id built from the window and the effect's subject, and the payloads frozen), the effects, its **audit** events (each carrying its window and effect id; none is written twice), then its **coverage**. A crash, a stop or a spent budget (`dream.replay_budget_ms`, one minute by default) leaves the window open, and the next pass finishes the same plan instead of planning it again. A source that cannot be read completely (a blob still syncing, a corrupt line) stops the replay at its window; after three days the window goes on without it and its records come in late once it reads. The first pass on an existing brain inventories its retained signals and starts at the oldest that can still change an outcome; the archived signals that may have missed a promotion are counted once. The heal enrichment, the digests, the topic pass and the view pass run once, after the last window.
+
+Within one window the pass is a deterministic pipeline:
 
 ```mermaid
 flowchart TD
@@ -448,7 +506,7 @@ flowchart LR
     Pin[o2b brain pin / unpin] -- regenerate --> Active
     Active -- "SessionStart hook<br/>(startup | resume | clear | compact)" --> ClaudeStart["Claude Code / Codex<br/>session start + after /compact"]
     Active -- "osb://preferences/active" --> MCPHost["MCP host (Hermes, others)"]
-    Active -- "brain_context tool" --> PullRT["Cursor / Aider / raw API<br/>(no SessionStart hook)"]
+    Active -- "brain_context tool" --> PullRT["Aider / raw API<br/>(no SessionStart hook)"]
     Pinned[Brain/pinned.md] -- "brain_context tool" --> PullRT
 ```
 
@@ -632,8 +690,7 @@ flowchart LR
   capability so clients know to enumerate them.
 - **`brain_context` MCP tool** (v0.10.10) lives in the always-loaded
   writer-scope MCP server. Runtimes that lack a `SessionStart` hook
-  _and_ do not auto-load MCP resources (Cursor, Aider, raw Claude
-  API) can fetch the same `active.md` body, pinned current-task context,
+  _and_ do not auto-load MCP resources (Aider, raw Claude API) can fetch the same `active.md` body, pinned current-task context,
   and active-preference counts with a single tool call. The standing-rules
   block leads that content too, and rides an optional `standing_rules`
   key (path, content, truncated) omitted when the file is absent.
@@ -751,7 +808,7 @@ are mirrored in MCP; destructive operations are CLI-only by design.
 | Record application         | `o2b brain apply-evidence`                                              | `brain_apply_evidence` | appends log event; `result ∈ {applied, violated, outdated}`; artifact supports `[[file:120-145]]` ranges                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | Record milestone           | `o2b brain note <text>`                                                 | `brain_note`           | appends one `note` log event to `Brain/log/<today>.md` plus the JSONL sidecar. Multi-line collapses to one line. CLI mirror exists for cron / shell.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | Pin current-task context   | — (use MCP)                                                             | `brain_pinned_context` | writes/appends/clears `Brain/pinned.md`; transient context, not a learned preference                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| Pull active context        | — (use MCP)                                                             | `brain_context`        | read-only; returns `Brain/active.md` body, pinned context + counts. Always-loaded on the writer MCP server so runtimes without a `SessionStart` hook (Cursor, Aider, raw Claude API) can fetch it at session start.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Pull active context        | — (use MCP)                                                             | `brain_context`        | read-only; returns `Brain/active.md` body, pinned context + counts. Always-loaded on the writer MCP server so runtimes without a `SessionStart` hook (Aider, raw Claude API) can fetch it at session start.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | Render summary             | `o2b brain digest [--window Nd]`                                        | `brain_digest`         | read-only; includes `top_applied`, `top_referenced`, and `agent_summary` sections                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Pre-dream intent review    | `o2b brain intent-review`                                               | `brain_intent_review`  | read-only; classifies active signal clusters as ready, needing evidence, or conflicted before the next `dream`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Lifecycle retention review | `o2b brain retention`                                                   | `brain_retention`      | read-only; recommends keep / improve / park / prune for retired preferences and processed signals; no artifact is deleted or moved                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -763,7 +820,7 @@ are mirrored in MCP; destructive operations are CLI-only by design.
 | Preference edit-history    | `o2b brain history <slug>`                                              | — (CLI-only)           | read-only; one entry per content mutation (principle / scope / status before -> after)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | Full-text search           | `o2b search "<query>"`                                                  | `brain_search`         | FTS5 + optional semantic; write-classified MCP tool (persists access and opt-in reinforce/telemetry ledgers under `Brain/search/`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Manage search index        | `o2b search index \| reindex \| status \| check`                        | — (CLI-only)           | builds / inspects `<vault>/.open-second-brain/brain.sqlite`. `search check` ends with a `recommendations:` block on missing pieces (key, sqlite-vec, first reindex)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| Cron template for reindex  | `o2b search reindex --cron-template [--interval N]`                     | — (CLI-only)           | prints a watchdog script, native crontab line, and `hermes cron create` recipe to stdout (writes nothing)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Cron template for reindex  | `o2b search reindex --cron-template [--interval N]`                     | CLI-only               | prints a watchdog script and crontab recipe to stdout; `--format systemd` prints a systemd timer recipe (writes nothing)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | Operational snapshot       | `o2b status`                                                            | `second_brain_status`  | read-only; `brain.*` + `search.*` blocks                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | Retire manually            | `o2b brain reject`                                                      | — (CLI-only)           | requires `--reason "<text>"`; subsequent signals on the same topic are suppressed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Merge near-duplicate prefs | `o2b brain merge <keep> <drop>`                                         | — (CLI-only)           | folds `evidenced_by` and counters into `keep`; `drop` retires with reason `merged-into`; surfaced as candidates in `brain_digest`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -775,7 +832,7 @@ are mirrored in MCP; destructive operations are CLI-only by design.
 | Export a transcript corpus | `o2b brain export --format transcripts-jsonl --transcripts <file\|dir>` | — (CLI-only)           | since v1.50.0: one JSON object per line, one per CONVERSATION, built from recorded session logs. Reads no vault. Messages carry role, text and the NAMES of the tools a turn called, never the tool inputs. `--runtime` filters by adapter; `--since`/`--until` select whole conversations by their start. Guarded record by record; a secret-shaped identifier refuses the whole export and writes nothing. Full contract in [`cli-reference.md`](cli-reference.md).                                                                                                                                                                                                                                                     |
 | Force-directed explorer    | `o2b brain explorer [--port \| --export]`                               | — (CLI-only)           | live HTTP on `127.0.0.1` (default `:7777`) or single-file HTML at `<path>`; renders preferences + retired as a graph; zero backend. Keyboard-accessible `<ul role="listbox">` mirror of visible nodes (ArrowUp/Down/Home/End/Enter/Escape); layout + filter state persisted to `localStorage` under `osb-explorer-layout:<vault_basename>`; "Reset layout" button clears the key.                                                                                                                                                                                                                                                                                                                                         |
 | Import Claude memory       | `o2b brain import-claude-memory`                                        | — (CLI-only)           | imports `metadata.type=feedback` entries from a Claude Code memory directory into `Brain/preferences/`. `--dry-run` prints a per-file plan; `--apply --yes` takes an `import-claude-memory-<ts>` snapshot before writing. Sidecar manifest `Brain/.imports/claude-memory.json` keys idempotency on body sha256. `UPDATE` preserves the eight evidence-related frontmatter fields. `CONFLICT` (existing pref outside the manifest) lands the safe writes and exits 2.                                                                                                                                                                                                                                                      |
-| Daily discipline report    | `o2b discipline {report\|install\|uninstall}`                           | — (CLI-only)           | renders a deterministic Telegram MarkdownV2 block comparing per-agent brain-events vs runtime-agnostic activity (git/mtime/vault delta) plus a complexity-to-thinking ratio. `install` writes a Hermes cron entry (`--telegram-target` required; `--weekly` installs a Monday digest; `uninstall --weekly` removes only the weekly job). `alert` fires when taste events (`feedback`+`apply_evidence`) are zero while activity is non-zero, or when structural churn grows much faster than recorded thinking.                                                                                                                                                                                                            |
+| Daily discipline report    | `o2b discipline report`                                                 | — (CLI-only)           | renders a deterministic plain Markdown report comparing per-agent brain-events vs runtime-agnostic activity (git/mtime/vault delta) plus a complexity-to-thinking ratio; doctor reports the daily verdict as advice. `alert` fires when taste events (`feedback`+`apply_evidence`) are zero while activity is non-zero, or when structural churn grows much faster than recorded thinking. The 1.x installer is removed; doctor names the Hermes jobs it left. |
 
 Operations that change the **protected set** (`pin`, `unpin`,
 `reject`, `rollback`) and the **index lifecycle** (`search index`,
@@ -1133,11 +1190,43 @@ warning for another agent:
 Set / clear the declaration via `o2b brain set-primary <name>` or
 `o2b brain set-primary --clear`; on a brain with an owner, `set-primary
 <name>` changes the owner's agent on the owner's device and refuses
-elsewhere. A vault initialised with `o2b brain init --primary-agent
-<name>` writes the value into the fresh `_brain.yaml`. A brain whose
+elsewhere. A legacy vault initialised with `o2b brain init
+--primary-agent <name>` writes the value into the fresh `_brain.yaml`; a
+machine switched to the store refuses the flag. A brain whose
 records still live in the legacy `Brain/` tree has no owner: the role is
 enforced once the brain moves to the store. The full multi-device
 walkthrough is in [`docs/cross-project-pointer.md`](./cross-project-pointer.md).
+
+### Closed questions and topic planning
+
+Dream asks seven closed questions: which topic a record belongs to,
+whether a group deserves a topic, whether two topics are one, what kind
+of event a held record is, whether a question was answered, whether a
+milestone is done, and whether a note belongs in the weekly history. Each
+is an item of the dream work queue (the `dream-work` stream), one per
+subject. Before a live pass on the owner's device the front door that the
+CLI verb, the MCP tool and the maintenance lane await produces an item
+for eligible subjects, oldest first, with no age limit or fixed per-pass
+cap; production stops at the pass deadline, so eligible subjects may remain
+without queue items until a later pass. The decision model chain then
+answers ready items, one per request, within
+`dream.model_budget_ms`. A dry run and a preview produce nothing and ask
+nothing.
+
+Topic planning runs at the tail of the pass on the dream owner's device
+(on a brain with no owner bound, on the view writer's, where it decides
+nothing). It reads the queue's fold under the planning lock and applies
+the accepted answers through the writes it has always made (routes,
+approved topics, derived items, proposals, history verdicts), with the
+answering provider and model as author, and marks each item applied with
+the records it wrote, or as abstained when the answer decided nothing. A
+veto, a `none` route and a same-topic hint stay on their finished items
+and hold in every later pass. No fixed rule answers in place of a model:
+with no answer a record stays unassigned and a qualifying group is not
+created. Another device plans nothing and its pass summary says that
+judgment runs elsewhere. Doctor and `o2b dream queue` say per question how
+many items wait and why. The device-local asked file of earlier versions
+is no longer read.
 
 ## Hygiene: sanitisation and lints
 
@@ -1236,7 +1325,7 @@ graph LR
     Codex -- "codex mcp add" --> Stdio
     GrokBuild["Grok Build"] -- "config.toml [mcp_servers]" --> Stdio
     OpenClaw -- "native JS plugin" --> InProc["in-process tools"]
-    Stdio --> Vault[(Brain/ on disk)]
+    Stdio --> Vault[(Brain store and vault)]
     InProc --> Vault
 ```
 
@@ -2216,13 +2305,15 @@ import and batch writes) are not covered in this phase.
 
 These are invariants of the system, not configuration to enable.
 
-- **Filesystem-first.** Every Brain artifact is a Markdown file with
-  YAML frontmatter. `cp -r Brain/` is a complete backup; `tar -czf`
-  is a portable bundle.
+- **Filesystem-first.** The brain store is a folder of append-only
+  files with a documented format (`FORMAT.md` at the root of every
+  store); a legacy `Brain/` tree is Markdown with YAML frontmatter.
+  Either can be copied as a backup, and `o2b brain bank-export` writes a
+  one-file bundle.
 - **Deterministic.** The dream pass is a pure function of (signals,
-  preferences, retired, log, configuration, current time). Given
-  identical inputs and a fixed `--now`, two runs produce byte-identical
-  output.
+  preferences, retired, log, configuration, the window's time and the
+  recorded answers of the dream work queue). Given identical inputs and
+  a fixed `--now`, two runs produce byte-identical output.
 - **Idempotent.** Re-running dream without new input or expired
   timestamps is a no-op. Safe to schedule at any frequency.
 - **Atomic per-file writes.** Every mutation goes through
@@ -2248,10 +2339,12 @@ These are invariants of the system, not configuration to enable.
   untrusted spans in a provenance-carrying delimiter instead of filtering
   them by a word list. The pre-compress pack (`brain_pre_compress_pack`)
   does not apply the delimiter yet and uses the guard only.
-- **No LLM inside the algorithm.** Semantic merging of similar but
-  differently-slugged topics is left to external agents who can call
-  the CLI / MCP surface directly — the dream pass itself only does
-  counting and atomic file moves.
+- **No fixed rule in place of a model.** Counting, thresholds and moves
+  are deterministic. A question that needs judgment, and text that needs
+  wording, wait in the dream work queue until the decision model or the
+  dream agent answers; the answer is recorded with the agent and model
+  that gave it, and model-written text is a draft that can be held for
+  review (`dream.apply_drafts`). See [`dream.md`](dream.md).
 
 ## Sample lifecycle of one preference
 
@@ -2305,15 +2398,22 @@ the active-rule attention budget is freed.
 
 ## How a new vault gets bootstrapped
 
+On a fresh machine, `o2b setup` (or `o2b init`) creates the brain store,
+binds the vault to it when one is named, makes this machine the view
+writer, and makes this installation the dream owner when its agent name is
+known:
+
 ```mermaid
 flowchart LR
-    User[operator] --> Init([o2b brain init])
-    Init --> Skel["Create Brain/inbox, preferences, retired, log, .snapshots"]
-    Init --> Yaml[Render Brain/_brain.yaml with defaults]
-    Init --> Manual[Render Brain/_BRAIN.md operating manual]
+    User[operator] --> Setup([o2b setup or o2b init])
+    Setup --> Store["Create the brain store<br/>shared + private partitions"]
+    Setup --> Bind["Bind the vault to the store<br/>when one is named"]
+    Setup --> Roles["View writer and dream owner<br/>for this installation"]
 ```
 
-`Brain/_brain.yaml` defaults are sensible for most uses; tune them in
+`o2b brain init` creates the legacy `Brain/` tree only on a machine that
+has not switched to the store; on a switched machine it writes the store
+and refuses `--primary-agent`. On such a legacy tree, `Brain/_brain.yaml` defaults are sensible for most uses; tune them in
 place when real usage reveals different timing. `Brain/_BRAIN.md` is
 the per-vault contract for agents — agents read it at the top of any
 session that interacts with this vault, and `o2b brain init --force`
@@ -2321,6 +2421,12 @@ re-renders it from the current template.
 
 ## Where to go next
 
+- **`docs/dream.md`** — the dream owner, how dream starts by itself,
+  the work queue, the dream agent, drafts and catch-up after missed days.
+- **`docs/brain-store.md`** — the store, syncing it between machines,
+  the human view and the migration of a legacy tree.
+- **`docs/features.md`** — what Open Second Brain can do, with links to
+  each reference.
 - **`docs/observability.md`** — the observability contract: every
   log and continuity event kind, the always-on vs opt-in matrix,
   correlation IDs, payload safety, fail-open rules, and the

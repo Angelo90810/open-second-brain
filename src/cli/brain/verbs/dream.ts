@@ -49,6 +49,13 @@ import {
   type DreamRetriageEntry,
 } from "../../../core/brain/dream-stage.ts";
 import { assertDreamOwner, DreamNotOwnerError } from "../../../core/brain/dream-owner/gate.ts";
+import { DreamReplayBehindError } from "../../../core/brain/dream-replay/behind.ts";
+import {
+  holdDreamRunClaim,
+  recordDreamOutcome,
+  type RecordDreamOutcomeOptions,
+} from "../../../core/brain/dream-trigger/outcome.ts";
+import { isLockContention } from "../../../core/store/local-lock.ts";
 import {
   createSafeguard,
   OPERATION,
@@ -56,8 +63,8 @@ import {
   SafeguardTimeoutError,
 } from "../../../core/brain/safeguard.ts";
 import {
-  prepareTopicVerdicts,
-  type PrepareTopicVerdictsOptions,
+  prepareClosedQuestions,
+  type PrepareClosedQuestionsOptions,
 } from "../../../core/topics/decide-auto.ts";
 import { nextCommandField } from "../../../core/brain/next-step.ts";
 import { emitNextStep } from "../../advisory-rail.ts";
@@ -147,6 +154,20 @@ export async function cmdBrainDream(argv: string[]): Promise<number> {
     // The dream owner gate (design D2): a live path on a device that is
     // not the owner exits 1 with one `error:` line naming the owner and
     // the transfer command, and wrote nothing.
+    if (exc instanceof DreamReplayBehindError) {
+      // A staged action while missed windows wait for a live replay.
+      if (argv.includes("--json")) {
+        okJson({
+          ok: false,
+          code: exc.code,
+          days: exc.days,
+          ...(exc.open !== null ? { open: exc.open } : {}),
+          message: exc.message,
+        });
+        return 1;
+      }
+      return fail(exc.message);
+    }
     if (!(exc instanceof DreamNotOwnerError)) throw exc;
     if (argv.includes("--json")) {
       okJson({
@@ -503,7 +524,7 @@ async function brainDream(argv: string[]): Promise<number> {
       return 0;
     }
   } catch (exc) {
-    if (exc instanceof DreamNotOwnerError) throw exc;
+    if (exc instanceof DreamNotOwnerError || exc instanceof DreamReplayBehindError) throw exc;
     // A bundle this verb understood and declined is a refusal, not an
     // operational failure: exit 2, with the bare reason beside the
     // sentence so a machine caller can branch on it.
@@ -582,37 +603,71 @@ async function brainDream(argv: string[]): Promise<number> {
         })
       : undefined;
   const sink = observation?.sink ?? steps;
-  // The model verdicts are decided before the pass (design D10, D20):
-  // only a live pass decides; a dry run gets the deterministic result.
+  // The closed questions are produced and asked before the pass
+  // (change `dream-closed-questions`, design D1): only a live pass does
+  // it; a dry run produces nothing and asks nothing.
   const dryRun = Boolean(flags["dry-run"]);
   // The same config and run date the pass below plans with.
-  const decideOptions: PrepareTopicVerdictsOptions = {
+  const decideOptions: PrepareClosedQuestionsOptions = {
     ...(config !== undefined ? { configPath: config } : {}),
     ...(now !== null ? { runAt: now } : {}),
+    ...(agent ? { agent } : {}),
   };
-  // The owner gate runs before the verdicts, so no model is asked for a
-  // pass that will be refused; `dream()` asks again for its own callers.
+  // The owner gate runs first, so no model is asked for a pass that will
+  // be refused; `dream()` asks again for its own callers.
+  // The wall clock the day record is kept on (change
+  // `dream-session-trigger`, design D4): the day a live pass closes is the
+  // day it started in.
+  const startedAt = new Date();
   if (!dryRun) assertDreamOwner(vault, { live: true, ...configOpt });
-  const topicVerdicts = dryRun ? undefined : await prepareTopicVerdicts(decideOptions);
+  // The trigger's claim for the whole live run (front door, pass and
+  // outcome), so a session's day check does not start a second one; a
+  // claim another run holds refuses this run before its front door, as
+  // the pass lock refuses a second pass.
+  let releaseRunClaim = (): void => {};
+  if (!dryRun) {
+    try {
+      releaseRunClaim = holdDreamRunClaim(config);
+    } catch (exc) {
+      if (!isLockContention(exc)) throw exc;
+      return fail(`dream failed: ${describeErrorChain(exc)}`);
+    }
+  }
   let summary;
   try {
-    summary = dream(vault, {
-      ...(now !== null ? { now } : {}),
-      dryRun,
-      ...(topicVerdicts !== undefined ? { topicVerdicts } : {}),
-      ...(agent ? { agentName: agent } : {}),
-      safeguard: guard(),
-      ...(sink !== undefined ? { onProgress: sink } : {}),
-      ...(gates !== null ? { gates } : {}),
-      ...(config !== undefined ? { configPath: config } : {}),
-    });
-  } catch (exc) {
-    if (exc instanceof DreamNotOwnerError) throw exc;
-    if (exc instanceof SafeguardTimeoutError && asJson) {
-      okJson({ ok: false, timed_out: true, message: exc.message });
-      return 1;
+    const closedQuestions = dryRun ? undefined : await prepareClosedQuestions(vault, decideOptions);
+    const outcome = (result: RecordDreamOutcomeOptions["result"]): void => {
+      if (dryRun) return;
+      recordDreamOutcome(vault, {
+        ...(config !== undefined ? { configPath: config } : {}),
+        startedAt,
+        result,
+        by: "cli",
+      });
+    };
+    try {
+      summary = dream(vault, {
+        ...(now !== null ? { now } : {}),
+        dryRun,
+        ...(closedQuestions !== undefined ? { closedQuestions } : {}),
+        ...(agent ? { agentName: agent } : {}),
+        safeguard: guard(),
+        ...(sink !== undefined ? { onProgress: sink } : {}),
+        ...(gates !== null ? { gates } : {}),
+        ...(config !== undefined ? { configPath: config } : {}),
+      });
+    } catch (exc) {
+      outcome({ threw: exc });
+      if (exc instanceof DreamNotOwnerError) throw exc;
+      if (exc instanceof SafeguardTimeoutError && asJson) {
+        okJson({ ok: false, timed_out: true, message: exc.message });
+        return 1;
+      }
+      return fail(`dream failed: ${describeErrorChain(exc)}`);
     }
-    return fail(`dream failed: ${describeErrorChain(exc)}`);
+    outcome({ returned: true });
+  } finally {
+    releaseRunClaim();
   }
   for (const w of summary.warnings ?? []) {
     process.stderr.write(`warning: ${w.code}: ${w.message}\n`);
@@ -649,10 +704,17 @@ async function brainDream(argv: string[]): Promise<number> {
   if (summary.view !== undefined) ok(`view: ${summary.view.summary}`);
   const work = summary.model_work;
   if (work !== undefined) {
+    const asked = Object.values(work.asked ?? {}).reduce((n, k) => n + k, 0);
     ok(
-      `model_work: ${work.produced} produced, ${work.waiting} waiting, ${work.applied} applied` +
-        (work.waiting > 0 ? " (nothing answers queued work in this version)" : ""),
+      `model_work: ${work.produced} produced, ${asked} asked, ${work.waiting} waiting, ` +
+        `${work.applied} applied, ${work.abstained} abstained` +
+        (work.waiting > 0 ? " (the dream work queue says why they wait)" : ""),
     );
+  }
+  if (summary.judgment === "elsewhere") {
+    ok("judgment: topic judgment runs on the dream owner's device");
+  } else if (summary.judgment === "unbound") {
+    ok("judgment: no dream owner is bound, so no closed question is decided");
   }
   return 0;
 }

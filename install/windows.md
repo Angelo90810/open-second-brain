@@ -3,7 +3,7 @@
 Open Second Brain runs natively on Windows 10 and 11 (x64). WSL is a Linux
 host and follows the Linux instructions instead; this page is for agents that
 run on Windows itself - Hermes Agent's desktop app or `install.ps1` build,
-Claude Code's native `claude.exe`, opencode, Cursor and the other MCP hosts.
+Claude Code's native `claude.exe`, opencode and the other MCP hosts.
 
 ## 1. Prerequisites
 
@@ -21,6 +21,11 @@ Git is needed only to clone the repository. Hermes Agent ships its own Git
 for Windows; Claude Code's hooks need Git for Windows installed (see below).
 
 ## 2. Get the code and publish the CLI
+
+The registry package works on Windows too: `bun add -g open-second-brain`
+provides `o2b`, `o2b-mcp` and `o2b-hook`, and `o2b setup --target <host>
+... --apply --yes` connects a host (see [`install.md`](../install.md)). The
+clone below is the alternative; do not use both on one machine.
 
 ```powershell
 git clone https://github.com/itechmeat/open-second-brain $env:USERPROFILE\projects\open-second-brain
@@ -40,8 +45,10 @@ terminal afterwards. Claude Code's native installer already puts it on PATH.
 
 ```powershell
 o2b init --vault C:\Users\you\Vault --agent-name "<runtime>-<host>-agent" --timezone Europe/Belgrade
-o2b brain init --vault C:\Users\you\Vault
 ```
+
+This creates the brain store and binds the vault to it; a separate
+`o2b brain init` is not needed.
 
 `~\Vault` is accepted as well as `~/Vault`.
 
@@ -74,7 +81,7 @@ carries the host.
   Windows Claude Code falls back to PowerShell, the hook commands fail to
   parse there and are skipped (exit 1, non-blocking) - the MCP tools still
   work. Install Git for Windows to get the hooks.
-- **opencode, Cursor, Gemini CLI, Copilot CLI, kiro, Codex** -
+- **opencode, Gemini CLI, Copilot CLI, kiro, Codex** -
   `o2b install --target <name> --apply --yes` writes the MCP entry as
   `cmd /d /c o2b mcp ...`, the `cmd /c <name>` form several hosts document
   for `npx` on Windows (`/d` skips cmd's AutoRun, whose output would corrupt

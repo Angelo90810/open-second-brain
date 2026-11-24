@@ -13,6 +13,7 @@ import { isAuthority } from "../../store/fold.ts";
 import {
   DREAM_WORK_ANSWER_KIND,
   DREAM_WORK_APPLIED_KIND,
+  DREAM_WORK_APPROVE_KIND,
   DREAM_WORK_ATTEMPT_KIND,
   DREAM_WORK_CLOSED_KIND,
   DREAM_WORK_ITEM_KIND,
@@ -81,6 +82,8 @@ export interface DreamWorkAttemptBody {
   readonly outcome: DreamWorkAttemptOutcome;
   readonly reason: string;
   readonly retry_at: string | null;
+  /** A release with a reason: the input it was given for (the item's own). */
+  readonly input_hash?: string;
 }
 
 export interface DreamWorkAppliedBody {
@@ -247,6 +250,12 @@ export function dreamWorkBodyRejection(kind: string, body: Record<string, unknow
       if (body["retry_at"] !== null && !isoTime(body["retry_at"])) {
         return "retry_at must be a time or null";
       }
+      if (
+        body["input_hash"] !== undefined &&
+        (typeof body["input_hash"] !== "string" || !HEX64.test(body["input_hash"]))
+      ) {
+        return "input_hash must be a hash";
+      }
       return null;
     case DREAM_WORK_APPLIED_KIND:
       if (!nonEmpty(body["item"])) return "missing item";
@@ -273,6 +282,10 @@ export function dreamWorkBodyRejection(kind: string, body: Record<string, unknow
       if (!isAuthority(body["authority"]) || body["authority"] !== "human") {
         return "a retry is made by a person (authority human)";
       }
+      return null;
+    case DREAM_WORK_APPROVE_KIND:
+      if (!nonEmpty(body["item"])) return "missing item";
+      if (body["authority"] !== "human") return "an approval is made by a person (authority human)";
       return null;
     default:
       return `not a dream work kind: ${kind}`;

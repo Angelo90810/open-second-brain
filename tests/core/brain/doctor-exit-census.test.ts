@@ -160,6 +160,9 @@ const NON_LITERAL_CODE_SITES: Readonly<Record<string, string>> = Object.freeze({
     "*_CODE scan above already reads. The function exists so the choice between them is made in " +
     "one named place rather than by concatenating a prefix onto a suffix, which is what made " +
     "those four codes unreadable from this module's source at all.",
+  code:
+    "selects between the alert and info constants declared by discipline-check.ts; both constants " +
+    "are read by the census and each has its own written no-exit reason",
 });
 
 /**
@@ -187,13 +190,24 @@ const DOCTOR_REGISTERED_CODES: ReadonlyArray<string> = [
   "contradictory-preferences",
   "dangling-workrun",
   "deny-consulted-lanes",
+  "dream-agent-failed",
+  "dream-agent-unset",
+  "dream-agent-unverified",
+  "dream-auto-off",
+  "dream-day-open",
+  "dream-drafts-waiting",
   "dream-owner-agent-differs",
   "dream-owner-elsewhere",
   "dream-owner-pending",
   "dream-owner-unbound",
+  "dream-questions-waiting",
   "dream-queue-backlog",
   "dream-queue-parked",
   "dream-queue-rejected",
+  "dream-replay-gap",
+  "dream-replay-rebased",
+  "dream-work-unanswerable",
+  "dream-worker-lost",
   "duplicate-preferences",
   "embedding-model-sunset-announced",
   "embeddings-backlog",

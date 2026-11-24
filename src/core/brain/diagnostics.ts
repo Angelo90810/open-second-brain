@@ -241,6 +241,75 @@ export const DIAGNOSTIC_SIGNALS: ReadonlyMap<string, DiagnosticSignal> = new Map
         nextCommand: "o2b dream queue",
         autoRepairable: false,
       },
+      // The dream replay (change dream-replay, design D10).
+      {
+        code: "dream-replay-gap",
+        issueClass: "a dream window waits for a source that cannot be read completely",
+        nextCommand: "o2b dream owner",
+        autoRepairable: false,
+      },
+      {
+        code: "dream-replay-rebased",
+        issueClass: "a dream window was admitted after shards were replaced or rewritten",
+        nextCommand: "o2b dream owner",
+        autoRepairable: false,
+      },
+      {
+        code: "dream-questions-waiting",
+        issueClass: "closed questions of dream wait for an answer",
+        nextCommand: "o2b dream queue",
+        autoRepairable: false,
+      },
+      // The launched agent (change dream-launched-agent, design D8).
+      {
+        code: "dream-agent-unset",
+        issueClass: "work waits that only the dream agent may do and none is set",
+        nextCommand: "o2b dream agent set",
+        autoRepairable: false,
+      },
+      {
+        code: "dream-agent-unverified",
+        issueClass: "the dream agent command was never verified",
+        nextCommand: "o2b dream agent check",
+        autoRepairable: false,
+      },
+      {
+        code: "dream-agent-failed",
+        issueClass: "the last dream agent run failed",
+        nextCommand: "o2b dream agent check",
+        autoRepairable: false,
+      },
+      {
+        code: "dream-drafts-waiting",
+        issueClass: "text answers of the dream agent await review",
+        nextCommand: "o2b dream queue",
+        autoRepairable: false,
+      },
+      // The dream day (change dream-session-trigger, design D7).
+      {
+        code: "dream-auto-off",
+        issueClass: "automatic dream is off, so no session starts a dream pass",
+        nextCommand: "o2b dream status",
+        autoRepairable: false,
+      },
+      {
+        code: "dream-day-open",
+        issueClass: "the dream day has stayed open for more than one day",
+        nextCommand: "o2b dream status",
+        autoRepairable: false,
+      },
+      {
+        code: "dream-worker-lost",
+        issueClass: "the dream worker ended without recording an outcome",
+        nextCommand: "o2b dream status",
+        autoRepairable: false,
+      },
+      {
+        code: "dream-work-unanswerable",
+        issueClass: "dream work waits that nothing on this machine answers",
+        nextCommand: "o2b dream queue",
+        autoRepairable: false,
+      },
       {
         code: "dream-queue-rejected",
         issueClass: "the dream work queue holds records that break its rules",

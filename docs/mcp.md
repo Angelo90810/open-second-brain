@@ -1,8 +1,9 @@
 # MCP tool server
 
 The optional Model Context Protocol (MCP) server exposes Open Second Brain's
-deterministic operations as tools that Hermes Agent (or any other MCP client)
-can route through its tool registry.
+operations as tools that any MCP client can route through its tool
+registry. Every supported host gets the same tools; only the wiring differs
+([`install.md`](../install.md#supported-clients)).
 
 The server is **optional**: the `o2b` CLI remains the supported baseline. Nothing
 in Open Second Brain depends on the MCP server being running.
@@ -1009,7 +1010,7 @@ Optional flags:
 - `--writer-only` — alias for `--scope writer`.
 - `--tool-profile full|writer|catalog|recall|minimal` — a named scope-plus-window bundle (see "Tool-surface profiles" below).
 - `--host-target <runtime>` — name the runtime that launched this server, so the capability report can cite that host's published tool ceiling. Install adapters write it into the registration they generate; an unrecognised value exits `2` naming the known ids. It also stands in for `--harness` when that option is absent, and changes nothing else.
-- `--harness <id>` — name the harness this server runs under (since v1.70.0), from a closed list: `aider`, `claude-code`, `codex`, `copilot-cli`, `cursor`, `gemini-cli`, `generic`, `grok`, `hermes`, `kiro`, `openclaw`, `opencode`, `pi`. It selects which `Brain/standing-rules/harness/<id>.md` file `brain_context` renders (see "Scoped operator rules" in [`how-it-works.md`](how-it-works.md)); the Claude Code plugin passes `--harness claude-code` and the Hermes plugin `--harness hermes`. An unrecognised value exits `2` naming the accepted ids. No tool argument names the harness.
+- `--harness <id>` — name the harness this server runs under (since v1.70.0), from the closed list under "Tool ceilings, `--host-target`, and the tool-profile ladder" in [`cli-reference.md`](cli-reference.md). It selects which `Brain/standing-rules/harness/<id>.md` file `brain_context` renders (see "Scoped operator rules" in [`how-it-works.md`](how-it-works.md)); the Claude Code plugin passes `--harness claude-code` and the Hermes plugin `--harness hermes`. An unrecognised value exits `2` naming the accepted ids. No tool argument names the harness.
 - `--probe` — start an in-process handshake and print whether the server can advertise tools, then exit.
 - `--transport stdio|http` — choose stdio (default) or Streamable HTTP.
 - `--host HOST` — HTTP bind host (default `127.0.0.1`).
@@ -1290,9 +1291,9 @@ A server started by hand, or by a registration written before
 flag and the `o2b install --target <runtime> --apply` that regenerates a
 registration carrying it. That is an UNCHECKED ceiling, not an absent one.
 
-Today exactly one runtime declares a limit — Cursor, 40 tools across every
-enabled MCP server — which is why the generated Cursor registration selects
-the `catalog` profile. No runtime is `unbounded`; the member exists so a
+Today exactly one runtime declares a limit, 40 tools across every enabled
+MCP server, which is why the registration generated for that runtime
+selects the `catalog` profile. No runtime is `unbounded`; the member exists so a
 host that publishes "no limit" is not recorded as unchecked. The full
 resolution ladder for the profile that ends up in a registration is
 documented under "Tool ceilings, `--host-target`, and the tool-profile
@@ -1328,6 +1329,49 @@ Call `tool_hydrate` with no arguments for the compact catalog (name,
 one-line description, group), then with `names: [...]` for the full
 input/output schemas of exactly the tools you need - unknown names are
 reported per-name without failing the batch.
+
+### The dream executor profile
+
+`o2b mcp --tool-profile dream-executor` is the server of a dream session:
+the short session the dream worker starts with the user's own agent to
+answer work of the dream queue (see [dream.md](dream.md)). It is exact:
+
+1. `tools/list` holds three tools and nothing else, not even
+   `second_brain_capabilities`: `dream_work_take {}` (one ready item with
+   its question, payload, bounded evidence and answer shape, or
+   `{ item: null, reason }`), `dream_work_answer { id, generation, value |
+   text, model, confidence? }` (the queue's answer rules; the agent
+   recorded is the worker's name for the command it started, the model is
+   what the session states) and `dream_work_finish {}` (releases every
+   lease the session still holds).
+2. `resources/list`, `resources/templates/list` and `prompts/list` answer
+   empty lists, `resources/read` is refused, and `initialize` advertises
+   tools only, with the session's fixed task as its instructions.
+3. It starts only for a live run: the worker writes a device-local run
+   record and hands the session's server the run id
+   (`OPEN_SECOND_BRAIN_DREAM_RUN`) and a token
+   (`OPEN_SECOND_BRAIN_DREAM_TOKEN`). Without a matching, unexpired run of
+   the current dream owner the server exits `2`, and every call is checked
+   again: a refused call writes nothing.
+4. It is not a value of `mcp_tool_profile` and not an install profile:
+   that key names it as an unknown profile and `o2b mcp` refuses to start.
+
+### Dream at session entry
+
+The server runs the dream day check (see
+[dream.md](dream.md#how-dream-starts)) at `initialize` and at the first
+tool call of a new UTC day, so a host without a session start hook still
+starts the day's dream pass on the dream owner's machine, and a server
+that lives for days checks again each day. On a closed day the check reads
+one small device-local record and returns; when a pass is due it starts
+one detached worker and the call does not wait for it. A server started
+inside a dream session (`OPEN_SECOND_BRAIN_DREAM_RUN` set) runs no check.
+
+When a dream digest is pending, the `initialize` instructions announce
+it: "A dream digest is available: read osb://digest/latest or call
+brain_brief with view=digest." This is how a host without a session start
+hook learns of it; hosts with a session start hook also show the digest
+once at session start.
 
 ## Skill surface (since v0.37.0)
 

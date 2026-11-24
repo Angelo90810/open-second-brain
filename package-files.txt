@@ -1,6 +1,6 @@
 # Open Second Brain packed file manifest
-# Maximum packed size: 6947934 bytes
-# Maximum unpacked size: 23590516 bytes
+# Maximum packed size: 7075715 bytes
+# Maximum unpacked size: 24024417 bytes
 .claude-plugin/marketplace.json
 .claude-plugin/plugin.json
 .codex-plugin/plugin.json
@@ -8,7 +8,6 @@ LICENSE
 README.md
 __init__.py
 bin/_launch.js
-bin/o2b-discipline-report
 bin/o2b-hook.js
 bin/o2b-mcp.js
 bin/o2b.js
@@ -85,7 +84,6 @@ schemas/brain/retention-review.schema.json
 schemas/brain/search-query.schema.json
 scripts/_bun-precheck.sh
 scripts/_macos-sqlite.sh
-scripts/discipline-report.ts
 scripts/o2b
 scripts/o2b-aider
 scripts/o2b-aider.cmd
@@ -286,10 +284,12 @@ src/cli/completions.ts
 src/cli/cron-recipe.ts
 src/cli/decision-model.ts
 src/cli/deps-bootstrap.ts
-src/cli/discipline-install.ts
 src/cli/discipline.ts
+src/cli/dream/agent.ts
 src/cli/dream/owner.ts
 src/cli/dream/queue.ts
+src/cli/dream/run.ts
+src/cli/dream/status.ts
 src/cli/help-render.ts
 src/cli/helpers.ts
 src/cli/install-cli-windows.ts
@@ -474,6 +474,7 @@ src/core/brain/diagnostics.ts
 src/core/brain/diarization.ts
 src/core/brain/digest-agent-summary.ts
 src/core/brain/digest-analysis.ts
+src/core/brain/digest-brief.ts
 src/core/brain/digest-collect.ts
 src/core/brain/digest-types.ts
 src/core/brain/digest.ts
@@ -495,8 +496,11 @@ src/core/brain/doctor/config-checks.ts
 src/core/brain/doctor/delivery-provenance-check.ts
 src/core/brain/doctor/device-retire-check.ts
 src/core/brain/doctor/device-state-check.ts
+src/core/brain/doctor/discipline-check.ts
 src/core/brain/doctor/dream-owner-check.ts
 src/core/brain/doctor/dream-queue-check.ts
+src/core/brain/doctor/dream-replay-check.ts
+src/core/brain/doctor/dream-trigger-check.ts
 src/core/brain/doctor/embedding-sunset-check.ts
 src/core/brain/doctor/embeddings-health-check.ts
 src/core/brain/doctor/entity-alias-verdicts.ts
@@ -557,15 +561,36 @@ src/core/brain/dream-plan-cross-topic.ts
 src/core/brain/dream-plan-retires.ts
 src/core/brain/dream-plan-topics.ts
 src/core/brain/dream-plan.ts
+src/core/brain/dream-queue/agent-check.ts
+src/core/brain/dream-queue/agent-config.ts
+src/core/brain/dream-queue/agent-executor.ts
+src/core/brain/dream-queue/agent-presets.ts
+src/core/brain/dream-queue/agent-verified.ts
 src/core/brain/dream-queue/constants.ts
+src/core/brain/dream-queue/decision-executor.ts
+src/core/brain/dream-queue/dream-session.ts
 src/core/brain/dream-queue/fold.ts
 src/core/brain/dream-queue/operations.ts
 src/core/brain/dream-queue/pass.ts
 src/core/brain/dream-queue/queue.ts
 src/core/brain/dream-queue/records.ts
 src/core/brain/dream-queue/rollup-work.ts
+src/core/brain/dream-queue/run-record.ts
 src/core/brain/dream-queue/status-view.ts
 src/core/brain/dream-refresh.ts
+src/core/brain/dream-replay/admission.ts
+src/core/brain/dream-replay/behind.ts
+src/core/brain/dream-replay/bootstrap.ts
+src/core/brain/dream-replay/fold.ts
+src/core/brain/dream-replay/ledgers.ts
+src/core/brain/dream-replay/loop.ts
+src/core/brain/dream-replay/pass.ts
+src/core/brain/dream-replay/plan.ts
+src/core/brain/dream-replay/privacy.ts
+src/core/brain/dream-replay/reconcile.ts
+src/core/brain/dream-replay/records.ts
+src/core/brain/dream-replay/status-view.ts
+src/core/brain/dream-replay/transfer.ts
 src/core/brain/dream-replay/window.ts
 src/core/brain/dream-report.ts
 src/core/brain/dream-rollup.ts
@@ -574,6 +599,16 @@ src/core/brain/dream-stage.ts
 src/core/brain/dream-step.ts
 src/core/brain/dream-summary.ts
 src/core/brain/dream-tail.ts
+src/core/brain/dream-trigger/auto.ts
+src/core/brain/dream-trigger/check.ts
+src/core/brain/dream-trigger/claim.ts
+src/core/brain/dream-trigger/constants.ts
+src/core/brain/dream-trigger/due.ts
+src/core/brain/dream-trigger/forget.ts
+src/core/brain/dream-trigger/line.ts
+src/core/brain/dream-trigger/outcome.ts
+src/core/brain/dream-trigger/record.ts
+src/core/brain/dream-trigger/status.ts
 src/core/brain/dream-types.ts
 src/core/brain/dream-workrun.ts
 src/core/brain/dream.ts
@@ -979,6 +1014,7 @@ src/core/brain/sessions/checkpoint.ts
 src/core/brain/sessions/claude.ts
 src/core/brain/sessions/codex.ts
 src/core/brain/sessions/discover.ts
+src/core/brain/sessions/dream-transcript.ts
 src/core/brain/sessions/grok.ts
 src/core/brain/sessions/hermes.ts
 src/core/brain/sessions/import.ts
@@ -1166,10 +1202,10 @@ src/core/discipline/activity-git.ts
 src/core/discipline/activity-mtime.ts
 src/core/discipline/complexity.ts
 src/core/discipline/decision.ts
+src/core/discipline/legacy-jobs.ts
 src/core/discipline/log-counts.ts
 src/core/discipline/render.ts
 src/core/discipline/report.ts
-src/core/discipline/telegram.ts
 src/core/discipline/transcripts/claude-code.ts
 src/core/discipline/transcripts/codex.ts
 src/core/discipline/transcripts/cursor.ts
@@ -1224,6 +1260,7 @@ src/core/install/host-kinds.ts
 src/core/install/host-probe.ts
 src/core/install/identity.ts
 src/core/install/instruction-block.ts
+src/core/install/integrations.ts
 src/core/install/json-merge.ts
 src/core/install/jsonc.ts
 src/core/install/managed-block.ts
@@ -1259,6 +1296,7 @@ src/core/partner/codegraph-report.ts
 src/core/partner/codegraph.ts
 src/core/path-safety.ts
 src/core/platform-dirs.ts
+src/core/process/run-program.ts
 src/core/project-manifests.ts
 src/core/reconciliation-report.ts
 src/core/record-path.ts
@@ -1568,9 +1606,12 @@ src/core/store/read/pinned.ts
 src/core/store/read/preferences.ts
 src/core/store/read/protection-store.ts
 src/core/store/read/read-context.ts
+src/core/store/read/read-view.ts
+src/core/store/read/shards-from.ts
 src/core/store/read/signals.ts
 src/core/store/read/store-entities.ts
 src/core/store/read/stream-read.ts
+src/core/store/read/viewed-read.ts
 src/core/store/reader.ts
 src/core/store/reference-privacy.ts
 src/core/store/removal-backlog.ts
@@ -1606,14 +1647,9 @@ src/core/text/nearest-name.ts
 src/core/topics/actions.ts
 src/core/topics/candidates.ts
 src/core/topics/constants.ts
-src/core/topics/decide-asked.ts
 src/core/topics/decide-auto.ts
-src/core/topics/decide-history.ts
-src/core/topics/decide-items.ts
-src/core/topics/decide-route.ts
-src/core/topics/decide-same.ts
-src/core/topics/decide-shared.ts
-src/core/topics/decide.ts
+src/core/topics/decide-operations.ts
+src/core/topics/decide-produce.ts
 src/core/topics/decision-titles.ts
 src/core/topics/fold.ts
 src/core/topics/held-decisions.ts
@@ -1628,6 +1664,7 @@ src/core/topics/settings.ts
 src/core/topics/undo-fold.ts
 src/core/topics/verdict-writes.ts
 src/core/topics/verdicts.ts
+src/core/topics/wording-operation.ts
 src/core/topics/write.ts
 src/core/trust.ts
 src/core/types.ts
@@ -1754,6 +1791,7 @@ src/mcp/capabilities.ts
 src/mcp/coerce.ts
 src/mcp/decision-answerable.ts
 src/mcp/drain.ts
+src/mcp/dream-executor.ts
 src/mcp/error-redaction.ts
 src/mcp/frozen-refusal.ts
 src/mcp/http.ts

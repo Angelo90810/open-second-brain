@@ -112,6 +112,8 @@ import { resolveConfiguredStoreRoot } from "../store/store-paths.ts";
 import { viewWriterCheck } from "./doctor/view-writer-check.ts";
 import { dreamOwnerCheck } from "./doctor/dream-owner-check.ts";
 import { dreamQueueCheck } from "./doctor/dream-queue-check.ts";
+import { dreamTriggerCheck } from "./doctor/dream-trigger-check.ts";
+import { dreamReplayCheck } from "./doctor/dream-replay-check.ts";
 import { topicPlanCheck } from "./doctor/topic-plan-check.ts";
 import { gitTrackedStateCheck } from "./doctor/git-tracked-state-check.ts";
 import { secretsSyncExposureCheck } from "./doctor/secrets-sync-check.ts";
@@ -291,6 +293,10 @@ const DOCTOR_CHECKS: ReadonlyArray<DoctorCheck> = Object.freeze([
   dreamOwnerCheck,
   // The dream work queue: silent unless the brain is served from the store.
   dreamQueueCheck,
+  // The dream replay: silent unless the brain is served from the store.
+  dreamReplayCheck,
+  // The dream day (dream-session-trigger): silent unless a dream owner is bound.
+  dreamTriggerCheck,
   // Topic planning made nothing: the unassigned records name no project.
   topicPlanCheck,
   // The store migration (task 2.12): another device's entries in this

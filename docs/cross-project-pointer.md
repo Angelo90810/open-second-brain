@@ -13,14 +13,14 @@ Append the block below to one of the agent-prompt files your runtime
 reads on startup. Common targets:
 
 - `CLAUDE.md` — Claude Code.
-- `AGENTS.md` — Codex, Cursor, Aider, and other tools that follow the
+- `AGENTS.md` — Codex, opencode, Aider, and other tools that follow the
   `agents.md` convention.
 
 Pick one location per project. You can have Open Second Brain write
 and maintain this block for you instead of pasting it by hand:
 `o2b install --target <host> --apply` writes the managed block into the
 agent-instruction file your host reads at the vault root (AGENTS.md for
-codex, cursor, opencode and aider; GEMINI.md for gemini-cli), under an
+codex, opencode and aider; GEMINI.md for gemini-cli), under an
 explicit consent prompt, keeping every byte outside the block intact on
 every re-run. The installed block merges the usage content below with
 the memory write gate, and a later uninstall removes exactly the pair
@@ -130,10 +130,12 @@ the declared name as before.
 o2b brain set-primary --clear --vault <vault-path>
 ```
 
-clears the declaration. A vault initialised with `o2b brain init
+clears the declaration. On a legacy vault, `o2b brain init
 --primary-agent <name>` writes the value into the fresh `_brain.yaml`
 on the first run; on re-runs against an existing file `--primary-agent`
-is ignored — use `set-primary` instead.
+is ignored — use `set-primary` instead. A machine switched to the brain
+store refuses the flag: there the dream owner (`o2b dream owner`) is the
+role.
 
 ## 3. Multi-device through Syncthing
 

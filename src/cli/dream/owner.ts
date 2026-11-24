@@ -17,6 +17,15 @@
  * `o2b brain dream` is unchanged; this group holds the role's own verbs.
  */
 
+import { forgetDreamOwnerCheck } from "../../core/brain/dream-trigger/forget.ts";
+import {
+  describeReplayStatus,
+  replayStatus,
+  replayStatusJson,
+} from "../../core/brain/dream-replay/status-view.ts";
+import { cmdAgent, DREAM_AGENT_USAGE } from "./agent.ts";
+import { cmdRun, DREAM_RUN_USAGE } from "./run.ts";
+import { cmdStatus, DREAM_STATUS_USAGE } from "./status.ts";
 import { ConfigReadError, resolveVault } from "../../core/config.ts";
 import {
   releaseDreamOwner,
@@ -36,9 +45,12 @@ import { CliError, parseFlags } from "../argparse.ts";
 import { sortedReplacer } from "../helpers.ts";
 import { cmdQueue, DREAM_QUEUE_USAGE } from "./queue.ts";
 import {
+  describeDreamAgent,
   describeQueueStatus,
+  dreamAgentStatus,
   queueStatus,
   queueSummaryJson,
+  waitingByOperation,
 } from "../../core/brain/dream-queue/status-view.ts";
 
 const USAGE = [
@@ -46,6 +58,9 @@ const USAGE = [
   "       o2b dream owner --here [--agent <name>] [--force] [--vault <path>] [--config <file>] [--json]",
   "       o2b dream owner --release [--vault <path>] [--config <file>] [--json]",
   DREAM_QUEUE_USAGE.replace(/^usage: /, "       "),
+  DREAM_AGENT_USAGE.replace(/^usage: /, "       "),
+  DREAM_RUN_USAGE.replace(/^usage: /, "       "),
+  DREAM_STATUS_USAGE.replace(/^usage: /, "       "),
 ].join("\n");
 
 const DREAM_EXIT = Object.freeze({ ok: 0, refused: 1, usage: 2 } as const);
@@ -63,6 +78,12 @@ export async function handleDreamSubcommand(argv: ReadonlyArray<string>): Promis
         return cmdOwner(rest);
       case "queue":
         return cmdQueue(rest);
+      case "agent":
+        return await cmdAgent(rest);
+      case "run":
+        return await cmdRun(rest);
+      case "status":
+        return cmdStatus(rest);
       default:
         process.stderr.write(`error: unknown dream verb: ${verb}\n${USAGE}\n`);
         return DREAM_EXIT.usage;
@@ -132,10 +153,23 @@ function cmdOwner(argv: ReadonlyArray<string>): number {
   if (!here && !release) {
     const status = dreamOwnerStatus(vault, { ...configOpt, look: true });
     const queue = queueStatus(vault, configOpt);
+    const waiting = waitingByOperation(queue, configOpt);
+    const replay = replayStatus(vault, { ...configOpt, queue });
     if (json)
-      writeJson({ ok: true, ...dreamOwnerStatusJson(status), queue: queueSummaryJson(queue) });
+      writeJson({
+        ok: true,
+        ...dreamOwnerStatusJson(status),
+        queue: queueSummaryJson(queue, waiting),
+        replay: replayStatusJson(replay),
+        agent: dreamAgentStatus(configPath),
+      });
     else {
-      const lines = [...describeDreamOwnerStatus(status), ...describeQueueStatus(queue)];
+      const lines = [
+        ...describeDreamOwnerStatus(status),
+        ...describeQueueStatus(queue, waiting),
+        ...describeReplayStatus(replay),
+        ...describeDreamAgent(dreamAgentStatus(configPath)),
+      ];
       process.stdout.write(`${lines.join("\n")}\n`);
     }
     return DREAM_EXIT.ok;
@@ -168,6 +202,7 @@ function cmdOwner(argv: ReadonlyArray<string>): number {
         reason: "not-owner",
       });
     }
+    forgetDreamOwnerCheck(configPath);
     if (json) writeJson({ ok: true, status: "released", device: store.device });
     else {
       process.stdout.write(
@@ -188,6 +223,8 @@ function cmdOwner(argv: ReadonlyArray<string>): number {
     );
   }
   const result = takeDreamOwner(store, agent, { ...writer, force: flags["force"] === true });
+  // The day check of this machine looks at the role again today.
+  forgetDreamOwnerCheck(configPath);
   if (json) {
     writeJson({ ok: true, ...describeTake(result), device: store.device, agent });
   } else {
