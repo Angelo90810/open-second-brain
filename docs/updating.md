@@ -6,6 +6,16 @@ git marketplace snapshot). **An update must never break an existing install or
 the agent.** This document is the contract that guarantees it, for both
 operators and any agent that edits the plugin.
 
+## Upgrading to 2.0.2
+
+2.0.2 renames the folder the readable pages are written into: the vault's
+`o2b-memory/` folder is the default now, and the `brain-view/` folder of
+2.0.1 is renamed to it by the machine that writes the view, with no command
+to run and nothing to move by hand. A machine whose `view_target` names
+another folder keeps that folder, and a `brain-view/` folder that holds a
+file of your own keeps its name: the pages are written into `o2b-memory/`
+and one line says which file stayed where it was.
+
 ## Upgrading to 2.0.1
 
 2.0.1 finishes the move from 1.x by itself and makes the brain reach every
@@ -21,7 +31,9 @@ agent session on it. At a start, in the background, in this order:
    what it alone has.
 2. **The pages are written** into the vault's `brain-view/` folder
    (`about-me.md`, weekly history, decisions, topics), unless
-   `view_target` names another folder or `none`.
+   `view_target` names another folder or `none`. The folder was renamed
+   to `o2b-memory/` in 2.0.2; see
+   [Upgrading to 2.0.2](#upgrading-to-202).
 3. **The legacy tree leaves.** `Brain/` and `.open-second-brain/` move
    into a dated archive in the machine's device-local state, never
    deleted, as soon as every machine that wrote them has switched or is
@@ -146,7 +158,8 @@ update` runs the same migration when one is pending (skip it with
 in: [brain-store.md](brain-store.md#automatic-migration).
 
 From 2.0.1 the rest follows by itself too, with no command to run: the
-pages appear in the vault's `brain-view/` folder and the legacy tree leaves
+pages appear in the vault's view folder (`brain-view/` in 2.0.1,
+`o2b-memory/` since 2.0.2) and the legacy tree leaves
 once every machine has switched (see
 [Upgrading to 2.0.1](#upgrading-to-201) and
 [brain-store.md](brain-store.md#the-removal-without-a-command)).
@@ -1276,6 +1289,11 @@ codex plugin add open-second-brain@open-second-brain   # re-stage local marketpl
 # Hermes (server: the plugin dir is a symlink to the checkout)
 hermes plugins update open-second-brain
 ```
+
+Hermes scans the new tree before it keeps an update. Releases up to 2.0.2
+scan `caution` under Hermes 0.23, so their update asks for a confirmation
+(`--force` accepts it); later releases scan `safe` and need nothing. See
+[`install/hermes.md`](../install/hermes.md#update).
 
 A Codex marketplace add or upgrade replaces the clone wholesale, so the
 clone arrives without `node_modules`. No step follows: the first `o2b`

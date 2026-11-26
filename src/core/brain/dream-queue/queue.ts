@@ -18,18 +18,20 @@
  * rule).
  */
 
-import { join } from "node:path";
+import { mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
-import { appendRecord } from "../../store/appender.ts";
+import { appendRecord, appendRecords, type AppendInput } from "../../store/appender.ts";
 import { STORE_PARTITIONS, type StorePartition } from "../../store/constants.ts";
 import type { StoreRecord } from "../../store/envelope.ts";
 import { observeClock } from "../../store/clock-store.ts";
 import { compareRecords } from "../../store/envelope.ts";
 import { parseHlc } from "../../store/hlc.ts";
-import { isLockContention, withLocalLock } from "../../store/local-lock.ts";
+import { isLockContention } from "../../store/local-lock.ts";
+import { acquireProcessLock } from "../../store/process-lock.ts";
 import { lostHeldPartitions } from "../../store/held-ledger.ts";
-import { readStreamRecords } from "../../store/read/stream-read.ts";
+import { readStreamRecords, type ShardTails } from "../../store/read/stream-read.ts";
 import { isStoreOnly } from "../../store/store-only.ts";
 import { heldPartitions, type StoreHandle } from "../../store/store-open.ts";
 import { resolveConfiguredStoreRoot } from "../../store/store-paths.ts";
@@ -61,7 +63,12 @@ import {
   DREAM_WORK_STREAM,
 } from "./constants.ts";
 import { foldDreamWork, type DreamWorkItem, type DreamWorkState } from "./fold.ts";
-import { dreamWorkOperation, dreamWorkTraits, type DreamWorkContext } from "./operations.ts";
+import {
+  dreamWorkOperation,
+  dreamWorkTraits,
+  type DreamWorkContext,
+  type DreamWorkReads,
+} from "./operations.ts";
 import {
   dreamWorkInputHash,
   dreamWorkItemId,
@@ -121,6 +128,12 @@ export interface DreamQueue {
   readonly now?: () => number;
   /** Owner observed by the live pass; entry points still recheck under their lock. */
   readonly passOwner?: DreamOwner;
+  /**
+   * What the caller keeps between entry points (a session's server):
+   * an operation's reread of an item's input reads incrementally through
+   * it. Absent, every reread reads the store afresh.
+   */
+  readonly reads?: DreamWorkReads;
 }
 
 /** The queue of `store`; every write passes the owner gate. */
@@ -156,8 +169,28 @@ interface Snapshot {
   readonly partitions: ReadonlySet<StorePartition>;
 }
 
+/**
+ * The kept tails of one stream a caller's reads hold (`ShardTails`), as
+ * read options: with them a reread parses only what was appended since.
+ */
+function keptTails(
+  reads: DreamWorkReads | undefined,
+  root: string,
+  partition: StorePartition,
+  stream: string,
+): { readonly tails?: ShardTails } {
+  if (reads === undefined) return {};
+  return {
+    tails: reads.memo(`queue-tails:${root}:${partition}:${stream}`, (): ShardTails => new Map()),
+  };
+}
+
 /** Read the queue's records of `partitions` and the owner records, at `root`. */
-function readRecordsAt(root: string, partitions: ReadonlySet<StorePartition>): Snapshot {
+function readRecordsAt(
+  root: string,
+  partitions: ReadonlySet<StorePartition>,
+  reads?: DreamWorkReads,
+): Snapshot {
   const work: Snapshot["work"] = [];
   const owner: StoreRecord[] = [];
   const drafts: StoreRecord[] = [];
@@ -165,7 +198,12 @@ function readRecordsAt(root: string, partitions: ReadonlySet<StorePartition>): S
   const pending: string[] = [];
   for (const partition of STORE_PARTITIONS) {
     if (!partitions.has(partition)) continue;
-    const read = readStreamRecords(root, partition, { stream: DREAM_WORK_STREAM });
+    const read = readStreamRecords(
+      root,
+      partition,
+      { stream: DREAM_WORK_STREAM },
+      keptTails(reads, root, partition, DREAM_WORK_STREAM),
+    );
     for (const record of read.records) work.push({ partition, record });
     unreadable.push(...read.unreadable.map((rel) => `${partition}/${rel}`));
     for (const [kind, count] of read.pendingKinds) {
@@ -173,7 +211,12 @@ function readRecordsAt(root: string, partitions: ReadonlySet<StorePartition>): S
     }
   }
   if (partitions.has("shared")) {
-    const settings = readStreamRecords(root, "shared", { stream: "settings" });
+    const settings = readStreamRecords(
+      root,
+      "shared",
+      { stream: "settings" },
+      keptTails(reads, root, "shared", "settings"),
+    );
     for (const record of settings.records) {
       if (DREAM_OWNER_KINDS.has(record.kind)) owner.push(record);
       else if (record.body["key"] === DREAM_APPLY_DRAFTS_SETTING) drafts.push(record);
@@ -191,8 +234,12 @@ function readRecordsAt(root: string, partitions: ReadonlySet<StorePartition>): S
  * raises the local clock (the receive rule), so what this device writes
  * next folds after what it has seen.
  */
-function readSnapshot(store: StoreHandle, partitions: ReadonlySet<StorePartition>): Snapshot {
-  const snapshot = readRecordsAt(store.root, partitions);
+function readSnapshot(
+  store: StoreHandle,
+  partitions: ReadonlySet<StorePartition>,
+  reads?: DreamWorkReads,
+): Snapshot {
+  const snapshot = readRecordsAt(store.root, partitions, reads);
   let newest: StoreRecord | undefined;
   for (const { record } of snapshot.work) {
     if (newest === undefined || compareRecords(record, newest) > 0) newest = record;
@@ -218,10 +265,54 @@ function foldSnapshot(snapshot: Snapshot, now: number): DreamWorkState {
 /** The folded queue as this device holds it (no gate, no writes). */
 export function readDreamWork(
   store: StoreHandle,
-  options: { readonly now?: number } = {},
+  options: { readonly now?: number; readonly reads?: DreamWorkReads } = {},
 ): DreamWorkState & { readonly unreadable: ReadonlyArray<string> } {
-  const snapshot = readSnapshot(store, store.partitions);
+  const snapshot = readSnapshot(store, store.partitions, options.reads);
   return { ...foldSnapshot(snapshot, options.now ?? Date.now()), unreadable: snapshot.unreadable };
+}
+
+/**
+ * {@link readDreamWork} read now and folded on first use: what a reader
+ * that may not need the fold checks first (the read's completeness).
+ */
+export function readDreamWorkLater(
+  store: StoreHandle,
+  options: { readonly now?: number; readonly reads?: DreamWorkReads } = {},
+): {
+  readonly unreadable: ReadonlyArray<string>;
+  /**
+   * Changes whenever what the queue has finished can change: the applied
+   * records and the owner records read (their count and ids). Leases,
+   * answers, attempts and closes leave it as it is.
+   */
+  readonly finishedKey: string;
+  fold(): DreamWorkState;
+} {
+  const snapshot = readSnapshot(store, store.partitions, options.reads);
+  const now = options.now ?? Date.now();
+  let state: DreamWorkState | undefined;
+  return {
+    unreadable: snapshot.unreadable,
+    finishedKey: finishedKeyOf(snapshot),
+    fold: () => (state ??= foldSnapshot(snapshot, now)),
+  };
+}
+
+/** FNV-1a over the ids of the applied and owner records of a snapshot, with their count. */
+function finishedKeyOf(snapshot: Snapshot): string {
+  let hash = 0x811c9dc5;
+  let count = 0;
+  const mix = (id: string): void => {
+    count += 1;
+    for (let i = 0; i < id.length; i++) {
+      hash ^= id.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+  };
+  for (const { record } of snapshot.work)
+    if (record.kind === DREAM_WORK_APPLIED_KIND) mix(record.id);
+  for (const record of snapshot.owner) mix(record.id);
+  return `${count}:${hash.toString(16)}`;
 }
 
 /**
@@ -252,7 +343,7 @@ function entry<T>(
   const initialOwner = gate(queue);
   const target = join(queue.store.deviceStateDir, DREAM_QUEUE_STATE_DIR, DREAM_QUEUE_LOCK);
   const mutate = () =>
-    withLocalLock(
+    withQueueLock(
       target,
       () => {
         const owner = recheckDreamOwner(
@@ -264,7 +355,7 @@ function entry<T>(
           },
           queue.now,
         );
-        const snapshot = readSnapshot(queue.store, queue.store.partitions);
+        const snapshot = readSnapshot(queue.store, queue.store.partitions, queue.reads);
         if (snapshot.unreadable.length > 0) {
           throw new DreamQueueIncompleteSnapshotError(snapshot.unreadable);
         }
@@ -278,6 +369,27 @@ function entry<T>(
   return queue.passOwner !== undefined
     ? mutate()
     : withDreamPassLock(queue.store, mutate, queue.now !== undefined ? { now: queue.now } : {});
+}
+
+/**
+ * Run `fn` holding the queue's lock. The lock is judged by its holder's
+ * process (`process-lock.ts`), not by its age: a dream session's server
+ * killed in a call (a session ended at its budget) leaves a holder that is
+ * gone, and the worker's release of the session's leases, or the next
+ * pass, takes the lock over at once instead of waiting out the age rule.
+ */
+function withQueueLock<T>(target: string, fn: () => T, budgetMs: number): T {
+  mkdirSync(dirname(target), { recursive: true });
+  const release = acquireProcessLock(target, {
+    budgetMs,
+    label: "dream queue lock",
+    remedy: "retry once the other dream work finishes",
+  });
+  try {
+    return fn();
+  } finally {
+    release();
+  }
 }
 
 function gate(queue: DreamQueue): DreamOwner {
@@ -324,6 +436,7 @@ class Step {
       vault: this.#queue.vault,
       now: this.now,
       ...(this.#queue.configPath !== undefined ? { configPath: this.#queue.configPath } : {}),
+      ...(this.#queue.reads !== undefined ? { reads: this.#queue.reads } : {}),
     };
   }
 
@@ -351,22 +464,109 @@ class Step {
     );
     this.#snapshot.work.push({ partition, record: appended.record });
     this.#written.push(appended.record.id);
+    this.#writtenSinceReread = true;
     this.#state = null;
     return appended.record;
   }
 
+  /** Whether this step wrote since it last reread the store (or never reread). */
+  #writtenSinceReread = true;
+
+  /** Writes gathered by {@link gather}, appended as one batch at its end. */
+  #gathered: AppendInput[] | null = null;
+
+  /**
+   * Run `fn` with the writes it makes through {@link put} gathered and
+   * appended as one batch (one clock tick, one fsync per shard) when it
+   * ends, in the order made, whether it returns or throws.
+   */
+  gather<T>(fn: () => T): T {
+    this.#gathered = [];
+    try {
+      return fn();
+    } finally {
+      this.flushGathered();
+      this.#gathered = null;
+    }
+  }
+
+  /** Append what {@link gather} has gathered so far, so the fold sees it. */
+  flushGathered(): void {
+    if (this.#gathered === null || this.#gathered.length === 0) return;
+    const inputs = this.#gathered;
+    this.#gathered = [];
+    this.#appendAll(inputs);
+  }
+
+  /**
+   * {@link write} for a record whose envelope the caller does not read:
+   * gathered while {@link gather} runs, written at once otherwise.
+   */
+  put(partition: StorePartition, kind: string, body: Record<string, unknown>): void {
+    if (this.#gathered === null) {
+      this.write(partition, kind, body);
+      return;
+    }
+    const rejection = dreamWorkBodyRejection(kind, body);
+    if (rejection !== null) throw new DreamQueueValidationError(rejection);
+    this.#gathered.push({
+      partition,
+      stream: DREAM_WORK_STREAM,
+      kind,
+      agent: this.#queue.writer,
+      body,
+    });
+  }
+
+  /** Validate and append `entries` as one batch; their records, in order. */
+  writeAll(
+    entries: ReadonlyArray<{
+      readonly partition: StorePartition;
+      readonly kind: string;
+      readonly body: Record<string, unknown>;
+    }>,
+  ): StoreRecord[] {
+    const inputs: AppendInput[] = entries.map(({ partition, kind, body }) => {
+      const rejection = dreamWorkBodyRejection(kind, body);
+      if (rejection !== null) throw new DreamQueueValidationError(rejection);
+      return { partition, stream: DREAM_WORK_STREAM, kind, agent: this.#queue.writer, body };
+    });
+    return this.#appendAll(inputs);
+  }
+
+  #appendAll(inputs: ReadonlyArray<AppendInput>): StoreRecord[] {
+    if (inputs.length === 0) return [];
+    const appended = appendRecords(
+      this.#queue.store,
+      inputs,
+      this.#queue.now !== undefined ? { now: this.#queue.now } : {},
+    );
+    const records = appended.map((result, i) => {
+      this.#snapshot.work.push({ partition: inputs[i]!.partition, record: result.record });
+      this.#written.push(result.record.id);
+      return result.record;
+    });
+    this.#writtenSinceReread = true;
+    this.#state = null;
+    return records;
+  }
+
   /** Re-read the store: what another process wrote meanwhile becomes visible. */
   reread(): void {
-    const fresh = readSnapshot(this.#queue.store, this.#queue.store.partitions);
+    const fresh = readSnapshot(this.#queue.store, this.#queue.store.partitions, this.#queue.reads);
     if (fresh.unreadable.length > 0) throw new DreamQueueIncompleteSnapshotError(fresh.unreadable);
     this.#snapshot.work.splice(0, this.#snapshot.work.length, ...fresh.work);
     this.#snapshot.owner.splice(0, this.#snapshot.owner.length, ...fresh.owner);
+    this.#writtenSinceReread = false;
     this.#state = null;
   }
 
   confirm(): void {
     if (this.#written.length === 0) return;
-    this.reread();
+    // A reread made after the last write already holds what a new one
+    // would read: the step holds the queue lock, and nothing it wrote
+    // came after it.
+    if (this.#writtenSinceReread) this.reread();
     const ids = new Set(this.#snapshot.work.map(({ record }) => record.id));
     if (this.#written.some((id) => !ids.has(id))) {
       throw new DreamQueueIncompleteSnapshotError(["a queue append was not confirmed"]);
@@ -397,7 +597,7 @@ class Step {
     retryAt: string | null = null,
     inputHash?: string,
   ): void {
-    this.write(item.partition, DREAM_WORK_ATTEMPT_KIND, {
+    this.put(item.partition, DREAM_WORK_ATTEMPT_KIND, {
       item: item.id,
       generation,
       lease_token: leaseToken,
@@ -415,7 +615,7 @@ class Step {
     successor: string | null,
     authority: "human" | "agent",
   ): void {
-    this.write(item.partition, DREAM_WORK_CLOSED_KIND, {
+    this.put(item.partition, DREAM_WORK_CLOSED_KIND, {
       item: item.id,
       reason,
       note,
@@ -429,12 +629,48 @@ class Step {
 
   /** Write `body` as an item unless the fold already holds it. */
   produce(body: DreamWorkItemBody, partition: StorePartition): boolean {
-    if (this.#produced.has(body.id)) return false;
-    // The fold of the snapshot as read: items this step writes are known by id.
-    if ((this.#state ?? this.#base()).items.has(body.id)) return false;
+    if (!this.#producible(body)) return false;
     this.write(partition, DREAM_WORK_ITEM_KIND, { ...body });
     this.#produced.add(body.id);
     return true;
+  }
+
+  #producible(body: DreamWorkItemBody): boolean {
+    if (this.#produced.has(body.id)) return false;
+    // The fold of the snapshot as read: items this step writes are known by id.
+    return !(this.#state ?? this.#base()).items.has(body.id);
+  }
+
+  /**
+   * {@link produce} for many items: each that the fold does not hold yet
+   * is written, in order, as one batch append (one clock tick, one write
+   * and one fsync per shard) instead of one append per item. Returns, in
+   * order, whether each was written.
+   */
+  produceMany(
+    entries: ReadonlyArray<{
+      readonly body: DreamWorkItemBody;
+      readonly partition: StorePartition;
+    }>,
+  ): boolean[] {
+    const created = entries.map(({ body }) => {
+      if (!this.#producible(body)) return false;
+      const rejection = dreamWorkBodyRejection(DREAM_WORK_ITEM_KIND, { ...body });
+      if (rejection !== null) throw new DreamQueueValidationError(rejection);
+      this.#produced.add(body.id);
+      return true;
+    });
+    const inputs: AppendInput[] = entries
+      .filter((_, i) => created[i])
+      .map(({ body, partition }) => ({
+        partition,
+        stream: DREAM_WORK_STREAM,
+        kind: DREAM_WORK_ITEM_KIND,
+        agent: this.#queue.writer,
+        body: { ...body },
+      }));
+    this.#appendAll(inputs);
+    return created;
   }
 
   /** The fold of the snapshot as it was read, kept for producing. */
@@ -513,14 +749,19 @@ class Step {
       evidence: [...(input.evidence ?? item.body.evidence)],
       payload: { ...(input.payload ?? item.body.payload) },
     };
-    if (this.fold().items.get(successor.id)?.state === "closed") {
+    // The fold as last made (or as read): a recheck does not fold the
+    // queue again for what this step wrote, so closing many stale items
+    // in one take costs one fold, not one per item. What this step wrote
+    // as items is known by id.
+    const known = this.#state ?? this.#base();
+    if (known.items.get(successor.id)?.state === "closed") {
       for (let attempt = 1; ; attempt += 1) {
         const reopened = {
           ...identity,
           occurrence: `${item.body.occurrence}/return-${attempt}`,
         };
         const id = dreamWorkItemId(reopened);
-        if (!this.fold().items.has(id)) {
+        if (!known.items.has(id) && !this.#produced.has(id)) {
           successor = { ...successor, ...reopened, id };
           break;
         }
@@ -625,15 +866,24 @@ export function produceWorkBatch(
   return entry(queue, (step) => {
     const state = step.fold();
     const prior: PrivateBarrierItem[] = state.order.map((id) => state.items.get(id)!);
+    // Barriers are judged item by item, each against the private items
+    // before it (in the store or earlier in this batch), then the new
+    // items are written as one batch.
+    const seen = new Set<string>();
+    const planned = bodies.map(({ body, partition }) => {
+      const barriers = privateResourceBarriers(body, partition, prior);
+      const fresh = !seen.has(body.id) && !state.items.has(body.id);
+      seen.add(body.id);
+      if (partition === "private" && fresh) prior.push({ body, partition, state: "waiting" });
+      return { body: { ...body, private_resource_barriers: barriers }, partition };
+    });
+    const created = step.produceMany(planned);
     return {
-      items: bodies.map(({ body, partition }) => {
-        const barriers = privateResourceBarriers(body, partition, prior);
-        const created = step.produce({ ...body, private_resource_barriers: barriers }, partition);
-        if (partition === "private" && created) {
-          prior.push({ body, partition, state: "waiting" });
-        }
-        return { id: body.id, created, partition };
-      }),
+      items: planned.map(({ body, partition }, i) => ({
+        id: body.id,
+        created: created[i]!,
+        partition,
+      })),
     };
   });
 }
@@ -716,6 +966,140 @@ export function takeWork(
   }
 }
 
+/**
+ * {@link takeWork} for up to `max` items under one gate, one lock, one
+ * settle and one confirmation of the leases: each item is picked, its
+ * input rechecked and its lease written exactly as one take does, in
+ * queue order. The items are picked from one fold (a lease changes only
+ * its own item), folded again only after a recheck closed an item; a
+ * lease the confirming reread does not show as live is left out.
+ */
+export function takeWorkBatch(
+  queue: DreamQueue,
+  options: {
+    readonly run: string;
+    readonly max: number;
+    readonly budgetMs?: number;
+    readonly filter?: (item: DreamWorkItem) => boolean;
+  },
+): { readonly items: ReadonlyArray<TakenItem>; readonly reason: "empty" | "busy" | null } {
+  try {
+    return entry(
+      queue,
+      (step) => takeMany(step, options.run, options.filter, options.max),
+      options.budgetMs,
+    );
+  } catch (err) {
+    if (isLockContention(err)) return { items: [], reason: "busy" };
+    throw err;
+  }
+}
+
+function takeMany(
+  step: Step,
+  run: string,
+  filter: ((item: DreamWorkItem) => boolean) | undefined,
+  max: number,
+): { readonly items: ReadonlyArray<TakenItem>; readonly reason: "empty" | "busy" | null } {
+  step.settle();
+  const unavailable = new Set<string>();
+  const chosen = new Set<string>();
+  const picked: Array<{
+    readonly partition: StorePartition;
+    readonly body: Record<string, unknown>;
+    readonly item: TakenItem;
+  }> = [];
+  // One fold per round: an item a recheck closes is passed over and the
+  // scan goes on in the same fold (closing an item never makes another
+  // one ready in it: its successor, or the next item holding its
+  // resources, waits for the next round). Only when the round closed
+  // something and the batch is not full is the queue folded again.
+  const passed = new Set<string>();
+  pick: for (let guard = 0; picked.length < max && guard < 10_000; guard++) {
+    const state = step.fold();
+    const now = step.now;
+    let closedAny = false;
+    for (const id of state.order) {
+      if (picked.length >= max) break pick;
+      const next = state.items.get(id)!;
+      if (
+        chosen.has(id) ||
+        unavailable.has(id) ||
+        passed.has(id) ||
+        !next.ready ||
+        !takeEligible(next, step.store.partitions) ||
+        (next.retry_at !== null && Date.parse(next.retry_at) > now) ||
+        (filter !== undefined && !filter(next))
+      ) {
+        continue;
+      }
+      const checked = step.recheck(next);
+      if (checked.status === "unavailable") {
+        unavailable.add(id);
+        continue;
+      }
+      // A recheck that closed the item may have written its successor:
+      // it is offered in the next round's fold.
+      if (checked.status !== "current") {
+        passed.add(id);
+        closedAny = true;
+        continue;
+      }
+      chosen.add(id);
+      const generation = next.generation + 1;
+      const lease_token = randomUUID();
+      const expires = new Date(now + DREAM_WORK_LEASE_MS).toISOString();
+      picked.push({
+        partition: next.partition,
+        body: {
+          item: next.id,
+          generation,
+          lease_token,
+          run,
+          owner_revision: step.owner.revision,
+          expires_at: expires,
+        },
+        item: {
+          id: next.id,
+          operation: next.body.operation,
+          subject: next.body.subject,
+          partition: next.partition,
+          input_hash: next.body.input_hash,
+          answer_schema: next.body.answer_schema,
+          payload: next.body.payload,
+          evidence: next.body.evidence,
+          generation,
+          lease_token,
+          expires_at: expires,
+        },
+      });
+    }
+    if (!closedAny) break;
+  }
+  if (picked.length === 0) return { items: [], reason: "empty" };
+  // The leases as one batch append, then one reread confirms every lease,
+  // as a take confirms its one.
+  const records = step.writeAll(
+    picked.map(({ partition, body }) => ({ partition, kind: DREAM_WORK_LEASE_KIND, body })),
+  );
+  const leased = picked.map(({ item }, i) => ({ lease: records[i]!, item }));
+  step.reread();
+  const confirmed = step.fold();
+  const rejected = new Set(confirmed.rejected.map((r) => r.id));
+  const items = leased
+    .filter(({ lease, item }) => {
+      if (rejected.has(lease.id)) return false;
+      const now = confirmed.items.get(item.id);
+      return (
+        now?.lease_token === item.lease_token &&
+        now.lease !== null &&
+        Date.parse(now.lease.expires_at) > step.now
+      );
+    })
+    .map(({ item }) => item);
+  return { items, reason: items.length === 0 ? "busy" : null };
+}
+
 function take(
   step: Step,
   run: string,
@@ -723,26 +1107,44 @@ function take(
 ): TakeResult {
   step.settle();
   const unavailable = new Set<string>();
+  // One fold per round, as in a batch: an item a recheck closes is passed
+  // over in the same fold; the queue is folded again only after a round
+  // that closed something and found nothing to take.
+  const passed = new Set<string>();
   for (let guard = 0; guard < 10_000; guard++) {
     const state = step.fold();
     const now = step.now;
-    const next = state.order
-      .map((id) => state.items.get(id)!)
-      .find(
-        (item) =>
-          item.ready &&
-          !unavailable.has(item.id) &&
-          takeEligible(item, step.store.partitions) &&
-          (item.retry_at === null || Date.parse(item.retry_at) <= now) &&
-          (filter === undefined || filter(item)),
-      );
-    if (next === undefined) return { item: null, reason: "empty" };
-    const checked = step.recheck(next);
-    if (checked.status === "unavailable") {
-      unavailable.add(next.id);
-      continue;
+    let closedAny = false;
+    let next: DreamWorkItem | undefined;
+    for (const id of state.order) {
+      const item = state.items.get(id)!;
+      if (
+        !item.ready ||
+        unavailable.has(item.id) ||
+        passed.has(item.id) ||
+        !takeEligible(item, step.store.partitions) ||
+        (item.retry_at !== null && Date.parse(item.retry_at) > now) ||
+        (filter !== undefined && !filter(item))
+      ) {
+        continue;
+      }
+      const checked = step.recheck(item);
+      if (checked.status === "unavailable") {
+        unavailable.add(item.id);
+        continue;
+      }
+      if (checked.status !== "current") {
+        passed.add(item.id);
+        closedAny = true;
+        continue;
+      }
+      next = item;
+      break;
     }
-    if (checked.status !== "current") continue;
+    if (next === undefined) {
+      if (closedAny) continue;
+      return { item: null, reason: "empty" };
+    }
     const generation = next.generation + 1;
     const lease_token = randomUUID();
     const expires = new Date(now + DREAM_WORK_LEASE_MS).toISOString();
@@ -820,8 +1222,45 @@ export function answerWork(queue: DreamQueue, input: AnswerInput): AnswerResult 
   return entry(queue, (step) => answer(step, input));
 }
 
-function answer(step: Step, input: AnswerInput): AnswerResult {
-  const item = step.item(input.item);
+/**
+ * {@link answerWork} for several answers under one gate, one lock and one
+ * confirmation: each is checked, rechecked, validated and recorded exactly
+ * as one answer is, in order. An answer about an item this device does
+ * not hold is refused on its own. The items are read from one fold:
+ * an answer changes only its own item, and an item named twice is read
+ * again before its second answer.
+ */
+export function answerWorkBatch(
+  queue: DreamQueue,
+  inputs: ReadonlyArray<AnswerInput>,
+): AnswerResult[] {
+  if (inputs.length === 0) return [];
+  return entry(queue, (step) =>
+    // The answers' records are appended as one batch at the end; an item
+    // named again first gets the earlier answers written and folded.
+    step.gather(() => {
+      const state = step.fold();
+      const seen = new Set<string>();
+      return inputs.map((input) => {
+        const again = seen.has(input.item);
+        if (again) step.flushGathered();
+        const known = again ? undefined : state.items.get(input.item);
+        seen.add(input.item);
+        try {
+          return answer(step, input, known);
+        } catch (err) {
+          if (err instanceof DreamQueueItemError) {
+            return { status: "refused" as const, reason: err.message };
+          }
+          throw err;
+        }
+      });
+    }),
+  );
+}
+
+function answer(step: Step, input: AnswerInput, known?: DreamWorkItem): AnswerResult {
+  const item = known ?? step.item(input.item);
   const receipt = dreamWorkReceipt({
     item: item.id,
     generation: input.generation,
@@ -897,7 +1336,7 @@ function answer(step: Step, input: AnswerInput): AnswerResult {
   if (Date.parse(item.lease.expires_at) <= step.now) {
     return refuse("the lease expired before the answer was accepted");
   }
-  step.write(item.partition, DREAM_WORK_ANSWER_KIND, {
+  step.put(item.partition, DREAM_WORK_ANSWER_KIND, {
     item: item.id,
     generation: input.generation,
     lease_token: input.lease_token,
@@ -1151,6 +1590,60 @@ export function rejectWork(queue: DreamQueue, id: string, reason: string): void 
 }
 
 /** Close an item as cancelled (a person's call). */
+/**
+ * Close the open items that ask a question again: of every operation in
+ * `operations`, the waiting items about a subject (same question version)
+ * that has a newer open item are closed as superseded by the newest one,
+ * in one entry and one append. A take would close each of them when it
+ * reached it (its input changed); closing them at once keeps the queue's
+ * counts true and its takes short. An item out on a lease, answered, or
+ * set aside for its own input (`setAside`) is never closed here, and the
+ * newest open item is always kept. Returns how many were closed.
+ */
+export function closeDuplicateWork(
+  queue: DreamQueue,
+  operations: ReadonlySet<string>,
+  setAside: (item: DreamWorkItem) => boolean = () => false,
+): number {
+  return entry(queue, (step) => {
+    const state = step.fold();
+    const groups = new Map<string, DreamWorkItem[]>();
+    for (const id of state.order) {
+      const item = state.items.get(id)!;
+      if (!operations.has(item.body.operation)) continue;
+      if (!step.store.partitions.has(item.partition)) continue;
+      const open =
+        item.state === "waiting" ||
+        item.state === "leased" ||
+        item.state === "accepted" ||
+        item.state === "awaiting-review";
+      if (!open || setAside(item)) continue;
+      const key = [
+        item.body.operation,
+        item.body.subject,
+        item.body.prompt_version,
+        item.body.schema_version,
+      ].join("\u0000");
+      const group = groups.get(key);
+      if (group === undefined) groups.set(key, [item]);
+      else group.push(item);
+    }
+    let closed = 0;
+    step.gather(() => {
+      for (const group of groups.values()) {
+        if (group.length < 2) continue;
+        const newest = group.reduce((a, b) => (b.place > a.place ? b : a));
+        for (const item of group) {
+          if (item === newest || item.state !== "waiting" || item.lease !== null) continue;
+          step.close(item, "superseded", "asked again", newest.id, "agent");
+          closed += 1;
+        }
+      }
+    });
+    return closed;
+  });
+}
+
 export function cancelWork(queue: DreamQueue, id: string, reason: string): void {
   entry(queue, (step) => {
     const item = step.item(id);
