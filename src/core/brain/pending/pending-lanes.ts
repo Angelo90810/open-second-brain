@@ -87,6 +87,10 @@ import {
   removeLanePage,
   writeLaneText,
 } from "../../store/lane-pages.ts";
+import {
+  assertStagedTargetsAtReach as stagedTargetsAtReach,
+  type StagedEntryReads,
+} from "./staged-reach.ts";
 import { signalRawShape } from "../../store/dual-write-records.ts";
 
 // ----- Typed errors ---------------------------------------------------------
@@ -397,6 +401,9 @@ export function stageForReview(
       publishTarget,
     );
   }
+  // Below local reach the open entries are read on the fold of every
+  // partition too (the write rule): one held in `private` refuses here.
+  assertStagedTargetsAtReach(vault, lane, [publishTarget]);
   // One open entry per publish target. The comparison is on the DECODED
   // target, so it catches the two-day case (two ids, one target) as well
   // as the same-day one (one id, silently rewritten bytes); an unreadable
@@ -422,6 +429,26 @@ export function stageForReview(
   writeLaneText(vault, stagedPath, render());
   return { pendingId, path: stagedPath };
 }
+
+/**
+ * Below local reach, refuse with the fixed answer a staging for any of
+ * `targets` an open entry of `lane` held in `private` already holds
+ * (`pending/staged-reach.ts`), read from this queue.
+ */
+export function assertStagedTargetsAtReach(
+  vault: string,
+  lane: ReviewLane,
+  targets: ReadonlyArray<string>,
+): void {
+  stagedTargetsAtReach(vault, lane, targets, STAGED_READS);
+}
+
+/** The queue's reads the staging guard of `pending/staged-reach.ts` uses. */
+const STAGED_READS: StagedEntryReads = {
+  dir: (vault, lane) => pendingLaneDirIn(brainDirs(vault), lane),
+  files: laneDirFiles,
+  entry: readLaneEntry,
+};
 
 /** A trailing `.md` in any casing - the extension a note target ends in. */
 const MARKDOWN_SUFFIX_RE = /\.md$/i;

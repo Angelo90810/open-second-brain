@@ -36,6 +36,7 @@ import {
   setIntention,
   showIntention,
 } from "../../core/brain/intentions.ts";
+import { isAlreadyRecorded } from "../../core/brain/repeat-call.ts";
 import { resolveSessionScope } from "../../core/brain/session-scope.ts";
 import { INVALID_PARAMS, MCPError } from "../protocol.ts";
 import { TOOL_ERROR_CODE } from "../tool-error-codes.ts";
@@ -92,6 +93,7 @@ function toolBrainIntention(
       scope: chain.scope,
       version: chain.version,
       path: lanePath(ctx, chain.path),
+      ...(isAlreadyRecorded(chain) ? { already_recorded: true } : {}),
     };
   }
   if (operation === "show") {
@@ -186,6 +188,9 @@ function isTriggerTransition(operation: string): operation is TriggerAction {
 function triggerRefs(record: TriggerRecord): ReadonlyArray<string> {
   return [
     ...record.sourceArtifacts,
+    // The key may name an id the artifact list does not (a batch key
+    // adopted from a covering trigger): its segments count too.
+    ...record.cooldownKey.split(":"),
     ...extractWikilinkRichBodies(record.reason).map((b) => parseWikilinkRich(b).target),
   ];
 }

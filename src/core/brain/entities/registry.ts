@@ -17,11 +17,11 @@
  * frontmatter keys the operator may have added by hand.
  */
 
+import { entityBaseId } from "./batch-allocation.ts";
 import { join } from "node:path";
 import { statSync } from "node:fs";
 
 import type { FrontmatterMap } from "../../types.ts";
-import { titleKeySlug } from "../../vault.ts";
 import { isKnownRelation, normalizeRelation } from "../../graph/relation-vocab.ts";
 import { normalizeRelationTarget } from "../../graph/frontmatter-relations.ts";
 import { stampKey } from "../../fs-stamp.ts";
@@ -65,6 +65,12 @@ import {
   type EntityIndex,
 } from "./index-builder.ts";
 import { ENTITY_STATUS_SCOPE, entityStatusInScope } from "./status-scope.ts";
+import { writeLockedEntity } from "./locked-write.ts";
+import {
+  assertUpsertAtReach,
+  assertUpsertsAtReach as upsertsAtReach,
+  type EntityIdentityRules,
+} from "./upsert-reach.ts";
 import {
   INTAKE_TRUST,
   UNTRUSTED_SOURCE_FRONTMATTER_KEY,
@@ -72,7 +78,6 @@ import {
   untrustedSourceFrontmatter,
 } from "../trust/untrusted-provenance.ts";
 import {
-  BRAIN_ENTITY_ID_PREFIX,
   BRAIN_ENTITY_KIND,
   BRAIN_ENTITY_STATUS,
   type BrainEntity,
@@ -84,9 +89,11 @@ import {
   lanePageExists,
   lanePagesInStore,
   laneStoreStamp,
-  parseLanePage,
   writeLanePage,
+  type LaneEntrySnapshot,
 } from "../../store/lane-pages.ts";
+import { privateWithheld, withPrivateShown } from "../../store/caller-reach.ts";
+import { assertEntryShareableAtReach } from "../../store/lane-reach-guard.ts";
 
 export interface UpsertEntityInput {
   readonly category: string;
@@ -530,7 +537,7 @@ function resolveQuarantined(index: EntityIndex, ref: EntityRef): BrainEntity | n
  * joined only where a human is present: {@link archiveEntity}'s `restore`,
  * which refuses a release that would collide.
  */
-function resolveWriteTarget(
+export function resolveWriteTarget(
   index: EntityIndex,
   ref: EntityRef,
   untrustedOrigin: boolean,
@@ -604,7 +611,7 @@ function writeEntityFile(
   fields: FrontmatterMap,
   extras: FrontmatterMap,
   body: string,
-  opts: { overwrite: boolean },
+  opts: { overwrite: boolean; replaces?: LaneEntrySnapshot | null },
 ): void {
   const meta: FrontmatterMap = {};
   for (const key of ENTITY_FIELD_ORDER) {
@@ -614,9 +621,11 @@ function writeEntityFile(
   for (const [key, value] of Object.entries(extras)) {
     if (!ENTITY_OWN_FIELDS.has(key)) meta[key] = value;
   }
+  assertEntryShareableAtReach(vault, path, meta, body);
   writeLanePage(vault, path, meta, body, {
     overwrite: opts.overwrite,
     existsErrorKind: "entity",
+    replaces: opts.replaces ?? null,
   });
 }
 
@@ -662,6 +671,20 @@ function checkAliasClaims(
 }
 
 /**
+ * Below local reach, the upsert of each of `inputs` judged first, as one
+ * call (`entities/upsert-reach.ts`), with this registry's rules.
+ */
+export function assertUpsertsAtReach(
+  vault: string,
+  inputs: ReadonlyArray<UpsertEntityInput>,
+): string[] {
+  return upsertsAtReach(vault, inputs, IDENTITY_RULES);
+}
+
+/** The registry's rules the identity decision of `entities/upsert-reach.ts` uses. */
+const IDENTITY_RULES: EntityIdentityRules = { resolveWriteTarget, allocateEntityId };
+
+/**
  * Allocate an unused `ent-<category>-<slug>` id (suffix -2, -3, ... on
  * collision). The slug keeps letters of any script (`titleKeySlug`): an
  * older release minted "Иван Петров" as `ent-people-unnamed-<hash>`. Only
@@ -670,7 +693,7 @@ function checkAliasClaims(
  * so an entity minted under the old slug keeps its id and every link to it.
  */
 function allocateEntityId(index: EntityIndex, category: string, name: string): string {
-  const base = `${BRAIN_ENTITY_ID_PREFIX}${category}-${titleKeySlug(name)}`;
+  const base = entityBaseId(category, name);
   const taken = new Set(index.entities.map((e) => e.id));
   if (!taken.has(base)) return base;
   for (let i = 2; ; i++) {
@@ -784,6 +807,7 @@ export function upsertEntity(vault: string, input: UpsertEntityInput): UpsertEnt
   // pre-lexicon structural gate - it can never mis-reject.
   const lexicon = resolveEntityLexicon(vault);
   const name = assertValidEntityLabel(input.name, { denylist });
+  assertUpsertAtReach(vault, category, name, input, IDENTITY_RULES);
   const index = buildEntityIndex(vault);
   const stamp = isoSecond(input.now);
 
@@ -825,49 +849,44 @@ export function upsertEntity(vault: string, input: UpsertEntityInput): UpsertEnt
   );
 
   if (target !== null) {
-    const [meta, existingBody] = parseLanePage(vault, target.path);
-    const mergedAliases = [...target.aliases];
-    for (const alias of aliases) {
-      if (!mergedAliases.some((a) => normalizeEntityName(a) === normalizeEntityName(alias))) {
-        mergedAliases.push(alias);
-      }
-    }
-    const fields: FrontmatterMap = {
-      kind: BRAIN_ENTITY_KIND,
-      entity_id: target.id,
-      category: target.category,
-      name: target.name,
-      ...(mergedAliases.length > 0 ? { aliases: mergedAliases } : {}),
-      status: target.status,
-      source_agent: input.agent,
-      ...(input.confidence !== undefined
-        ? { confidence: input.confidence }
-        : target.confidence !== undefined
-          ? { confidence: target.confidence }
-          : {}),
-      created_at: target.created_at,
-      updated_at: stamp,
-      tags: ["brain", "brain/entity"],
-    };
-    // The target's status is carried forward, which is now safe by
-    // construction: the lane guarantees a trusted write never sees a
-    // quarantined target and an untrusted one never sees a canonical target.
-    // The marker is re-asserted on the untrusted lane rather than trusted to
-    // the frontmatter that was there, so status and marker cannot drift apart
-    // through a hand edit or a partial sync.
-    const extras: FrontmatterMap = {
-      ...meta,
-      ...(untrusted ? untrustedSourceFrontmatter(INTAKE_TRUST.untrusted) : {}),
-    };
-    writeEntityFile(vault, target.path, fields, extras, input.body ?? existingBody, {
-      overwrite: true,
-    });
+    // Built from the entity read again under its lock (`locked-write.ts`).
+    writeLockedEntity(
+      vault,
+      target,
+      stamp,
+      (draft) => {
+        const mergedAliases = [...draft.entity.aliases];
+        for (const alias of aliases) {
+          if (!mergedAliases.some((a) => normalizeEntityName(a) === normalizeEntityName(alias))) {
+            mergedAliases.push(alias);
+          }
+        }
+        if (mergedAliases.length > 0) draft.fields["aliases"] = mergedAliases;
+        draft.fields["source_agent"] = input.agent;
+        if (input.confidence !== undefined) draft.fields["confidence"] = input.confidence;
+        // The target's status is carried forward, which is now safe by
+        // construction: the lane guarantees a trusted write never sees a
+        // quarantined target and an untrusted one never sees a canonical target.
+        // The marker is re-asserted on the untrusted lane rather than trusted to
+        // the frontmatter that was there, so status and marker cannot drift apart
+        // through a hand edit or a partial sync.
+        if (untrusted)
+          Object.assign(draft.extras, untrustedSourceFrontmatter(INTAKE_TRUST.untrusted));
+        if (input.body !== undefined) draft.body = input.body;
+      },
+      (fields, extras, body, replaces) =>
+        writeEntityFile(vault, target.path, fields, extras, body, { overwrite: true, replaces }),
+    );
     const entity = parseEntityFile(target.path, vault);
     if (entity === null) throw new Error(`entity file unreadable after write: ${target.path}`);
     return { entity, created: false };
   }
 
-  const id = allocateEntityId(index, category, name);
+  // The free id is picked on the fold of every partition, as a local
+  // caller with the same store gets it (the write rule).
+  const id = privateWithheld()
+    ? withPrivateShown(() => allocateEntityId(buildEntityIndex(vault), category, name))
+    : allocateEntityId(index, category, name);
   const path = entityPath(vault, category, id);
   // Untrusted provenance decides two things about the new record: the status
   // it lands at, and the marker the retrieval gate reads. Both come from the
@@ -947,31 +966,25 @@ export function relateEntities(vault: string, input: RelateEntitiesInput): Brain
   if (to === null) throw new Error(missingEndpoint(index, input.to, untrusted));
   if (from.id === to.id) throw new Error("an entity cannot relate to itself");
 
-  const [meta, body] = parseLanePage(vault, from.path);
-  const existingRaw = meta[relation];
-  const targets: string[] = Array.isArray(existingRaw)
-    ? [...existingRaw]
-    : typeof existingRaw === "string" && existingRaw.trim().length > 0
-      ? [existingRaw]
-      : [];
-  const alreadyLinked = targets.some((t) => normalizeRelationTarget(String(t)) === to.id);
-  if (!alreadyLinked) targets.push(`[[${to.id}]]`);
-
-  const fields: FrontmatterMap = {
-    kind: BRAIN_ENTITY_KIND,
-    entity_id: from.id,
-    category: from.category,
-    name: from.name,
-    ...(from.aliases.length > 0 ? { aliases: [...from.aliases] } : {}),
-    status: from.status,
-    ...(from.source_agent !== undefined ? { source_agent: from.source_agent } : {}),
-    ...(from.confidence !== undefined ? { confidence: from.confidence } : {}),
-    created_at: from.created_at,
-    updated_at: isoSecond(input.now),
-    tags: ["brain", "brain/entity"],
-  };
-  const extras: FrontmatterMap = { ...meta, [relation]: targets };
-  writeEntityFile(vault, from.path, fields, extras, body, { overwrite: true });
+  // Built from the entity read again under its lock (`locked-write.ts`).
+  writeLockedEntity(
+    vault,
+    from,
+    isoSecond(input.now),
+    (draft) => {
+      const existingRaw = draft.extras[relation];
+      const targets: string[] = Array.isArray(existingRaw)
+        ? [...existingRaw]
+        : typeof existingRaw === "string" && existingRaw.trim().length > 0
+          ? [existingRaw]
+          : [];
+      const alreadyLinked = targets.some((t) => normalizeRelationTarget(String(t)) === to.id);
+      if (!alreadyLinked) targets.push(`[[${to.id}]]`);
+      draft.extras[relation] = targets;
+    },
+    (fields, extras, body, replaces) =>
+      writeEntityFile(vault, from.path, fields, extras, body, { overwrite: true, replaces }),
+  );
   const entity = parseEntityFile(from.path, vault);
   if (entity === null) throw new Error(`entity file unreadable after write: ${from.path}`);
   return entity;
@@ -1040,30 +1053,25 @@ export function archiveEntity(
     }
   }
 
-  const [meta, body] = parseLanePage(vault, target.path);
   const stamp = isoSecond(opts.now);
-  const fields: FrontmatterMap = {
-    kind: BRAIN_ENTITY_KIND,
-    entity_id: target.id,
-    category: target.category,
-    name: target.name,
-    ...(target.aliases.length > 0 ? { aliases: [...target.aliases] } : {}),
-    status: nextStatus,
-    ...(target.source_agent !== undefined ? { source_agent: target.source_agent } : {}),
-    ...(target.confidence !== undefined ? { confidence: target.confidence } : {}),
-    created_at: target.created_at,
-    updated_at: stamp,
-    ...(nextStatus === BRAIN_ENTITY_STATUS.archived ? { archived_at: stamp } : {}),
-    tags: ["brain", "brain/entity"],
-  };
-  // `archived_at` must disappear on restore: writeEntityFile only emits
-  // the keys present in `fields`, and extras never override own fields.
-  // The untrusted-source marker must disappear too, and it is an EXTRA, so
-  // it is dropped explicitly: a released record the retrieval gate still
-  // excluded would be a restore that reads as success without being one.
-  const extras: FrontmatterMap = { ...meta };
-  if (opts.restore) delete extras[UNTRUSTED_SOURCE_FRONTMATTER_KEY];
-  writeEntityFile(vault, target.path, fields, extras, body, { overwrite: true });
+  // Built from the entity read again under its lock (`locked-write.ts`).
+  writeLockedEntity(
+    vault,
+    target,
+    stamp,
+    (draft) => {
+      draft.fields["status"] = nextStatus;
+      if (nextStatus === BRAIN_ENTITY_STATUS.archived) draft.fields["archived_at"] = stamp;
+      // `archived_at` must disappear on restore: writeEntityFile only emits
+      // the keys present in `fields`, and extras never override own fields.
+      // The untrusted-source marker must disappear too, and it is an EXTRA, so
+      // it is dropped explicitly: a released record the retrieval gate still
+      // excluded would be a restore that reads as success without being one.
+      if (opts.restore) delete draft.extras[UNTRUSTED_SOURCE_FRONTMATTER_KEY];
+    },
+    (fields, extras, body, replaces) =>
+      writeEntityFile(vault, target.path, fields, extras, body, { overwrite: true, replaces }),
+  );
   const entity = parseEntityFile(target.path, vault);
   if (entity === null) throw new Error(`entity file unreadable after write: ${target.path}`);
   return entity;

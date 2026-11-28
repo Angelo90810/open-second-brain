@@ -33,6 +33,7 @@ import { sourcePagePath } from "../paths.ts";
 import { originChannelStamp } from "../../origin-channel.ts";
 import { CONTENT_CLASS_FIELD, contentClassCreationStamp } from "../provenance/content-class.ts";
 import {
+  assertIntakeAtReach,
   intakeExtraction,
   type ExtractionIntake,
   type IntakeRelation,
@@ -91,11 +92,11 @@ import {
 } from "./pre-extract.ts";
 import { REVIEW_LANE } from "../write-gate.ts";
 import {
+  assertStagedTargetsAtReach,
   listPendingLane,
-  resolveWriteDisposition,
   stageForReview,
 } from "../pending/pending-lanes.ts";
-import type { WriteSubject } from "../write-disposition.ts";
+import { decideWriteDisposition, type WriteSubject } from "../write-disposition.ts";
 import {
   MARKDOWN_NEUTRALIZE_MODE,
   neutralizeMarkdown,
@@ -109,6 +110,12 @@ import {
   readLaneText,
   writeLanePage,
 } from "../../store/lane-pages.ts";
+import { withPrivateShown } from "../../store/caller-reach.ts";
+import {
+  assertCreateMatchAtReach,
+  assertLaneWriteAtReach,
+  takenOnWholeFold,
+} from "../../store/lane-reach-guard.ts";
 
 /** Frontmatter `kind:` marker of an ingested source summary page. */
 export const BRAIN_SOURCE_KIND = "brain-source";
@@ -346,12 +353,26 @@ export function ingestSource(
   // the page selected, under either slug; one withheld is answered under
   // the path an absent page gets (the new slug), so the path itself does
   // not tell which page exists either.
-  const target = locateSuffixedTitleStem(
-    canonicalSource,
-    sourceHash.slice(0, 12),
-    (candidate) => lanePageExists(vault, sourcePagePath(vault, candidate)),
-    opts.readable !== undefined ? (candidate) => opts.readable!(relOf(candidate)) : undefined,
+  const locate = (readable: ((rel: string) => boolean) | undefined) =>
+    locateSuffixedTitleStem(
+      canonicalSource,
+      sourceHash.slice(0, 12),
+      (candidate) => lanePageExists(vault, sourcePagePath(vault, candidate)),
+      readable !== undefined ? (candidate) => readable(relOf(candidate)) : undefined,
+    );
+  // The summary page a re-ingest rewrites is found on the fold of every
+  // partition below local reach (the write rule): one held in `private`
+  // refuses the ingest before any write.
+  assertCreateMatchAtReach(
+    vault,
+    (readable) => {
+      const held = locate(readable);
+      const path = sourcePagePath(vault, held.stem);
+      return !held.withheld && lanePageExists(vault, path) ? [path] : [];
+    },
+    opts.readable,
   );
+  const target = locate(opts.readable);
   const absPath = sourcePagePath(vault, target.stem);
   const summaryPath = relOf(target.stem);
   // Write-time marker neutralization gate (t_c2ac4fc8), resolved beside the
@@ -364,22 +385,43 @@ export function ingestSource(
   // is decided at the summary write below (untrusted summaries, enforce
   // only); resolving it here only moves the refusal earlier.
   const gate = resolveMarkdownNeutralizeModeForProcess();
-  // Review disposition (write-side trust, Tasks 9 and 12), resolved BEFORE
+  // Review disposition (write-side trust, Tasks 9 and 12), decided BEFORE
   // the intake so a refusal lands before ANY write - no entity page, no
   // manifest row, no summary page. With no permissions document the ingest
   // lane's toggle decides (off = publish); with one, the document alone
-  // decides and a deny throws WriteRefusedError here, one ledger row behind
-  // it. The stage verdict is consumed at the page write below.
-  const disposition = resolveWriteDisposition(
+  // decides and a deny throws WriteRefusedError when it is recorded, one
+  // ledger row behind it. The stage verdict is consumed at the page write
+  // below. The row is recorded only after every reach check of the ingest
+  // has passed (change `lane-reach-residuals`, design R7): a call refused
+  // below local reach leaves no row.
+  const decided = decideWriteDisposition(
     vault,
     REVIEW_LANE.ingest,
     opts.subject ?? (opts.agent !== undefined ? { agent: opts.agent, via: "config" } : undefined),
     { target: summaryPath, ...(opts.now !== undefined ? { now: opts.now } : {}) },
   );
-  const preExtract =
-    opts.preExtract === true ? runPreExtract(vault, canonicalSource, opts.readable) : undefined;
+  // A first publish that stages meets the open review entry of its target,
+  // read on the fold of every partition below local reach (the write rule):
+  // one held in `private` refuses the ingest here, before any write.
+  if (decided.verdict === "stage" && !takenOnWholeFold(() => lanePageExists(vault, absPath))) {
+    assertStagedTargetsAtReach(vault, REVIEW_LANE.ingest, [summaryPath]);
+  }
   const sourceLink = `[[${canonicalSource}]]`;
   const provenance: Provenance = { level: "stated", sources: [sourceLink], premises: [] };
+  // The summary target's own reach (a fold that may miss a record, a key
+  // whose winning record is held in `private`) and every write of the
+  // intake, judged before the archive, the entity pages and the row.
+  if (!target.withheld) assertLaneWriteAtReach(vault, [absPath]);
+  assertIntakeAtReach(vault, input.extraction, {
+    agent: opts.agent,
+    now: opts.now,
+    provenance,
+    ...(opts.readable !== undefined ? { readable: opts.readable } : {}),
+    ...(decided.verdict === "stage" ? { disposition: "stage" as const } : {}),
+  });
+  const disposition = decided.record();
+  const preExtract =
+    opts.preExtract === true ? runPreExtract(vault, canonicalSource, opts.readable) : undefined;
 
   // The intake classifies the cited source itself and reports the lane back.
   // It used to be classified here as well and handed down as an argument,
@@ -787,7 +829,10 @@ function captureTrustedSourceArchive(
     // failed capture - so neither stamp nor refusal (absence stays
     // absence; see `sourceArchiveRefusal`'s contract).
     if (origin.bytes === undefined) return {};
-    const put = putSourceArchive(vault, origin.bytes);
+    // The archive is the machine's own content-addressed store: its dedup
+    // and repair read the fold of every partition, whatever the caller's
+    // reach, as a local ingest does (the write rule).
+    const put = withPrivateShown(() => putSourceArchive(vault, origin.bytes!));
     return { hash: put.hash, bytes: put.bytes };
   } catch (error) {
     return { refusal: archiveRefusalMessage(error) };

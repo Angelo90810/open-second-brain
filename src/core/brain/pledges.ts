@@ -87,7 +87,20 @@ import {
   readLaneText,
   removeLanePage,
   writeLaneText,
+  readLaneBase,
 } from "../store/lane-pages.ts";
+import {
+  pledgeCreateMatches as createMatchesOf,
+  slotReservedAtReach,
+  titleClaimAtReach,
+  type PledgeIdentityReads,
+} from "./pledge-create-reach.ts";
+import {
+  assertCreateMatchAtReach,
+  LaneEntryWithheldError,
+  takenOnWholeFold,
+  withheldPrivateKey,
+} from "../store/lane-reach-guard.ts";
 
 export class PledgeError extends Error {
   constructor(message: string) {
@@ -643,6 +656,14 @@ export function createPledgePage(vault: string, input: CreatePledgePageInput): P
     notes: (input.notes ?? "").trim(),
   };
   const candidates = pledgeSlugCandidates(input.title, input.due, input.source);
+  // The identity decision is taken on the fold of every partition (the
+  // write rule): below local reach a pledge held in `private` that a local
+  // create would be refused for refuses this one, naming nothing.
+  assertCreateMatchAtReach(
+    vault,
+    (readable) => pledgeCreateMatches(vault, input.title, input.due, input.source, readable),
+    input.readable,
+  );
   const duplicate = findPledgeByIdentity(
     vault,
     input.title,
@@ -656,12 +677,40 @@ export function createPledgePage(vault: string, input: CreatePledgePageInput): P
   // A title that is another pledge's listed slug would make that slug
   // name two promises: refused. A base slot that is another pledge's own
   // new slug (its exact title, filed elsewhere) is held by that pledge.
-  const claim = pledgeTitleClaim(vault, input.title, input.readable);
-  if (claim?.kind === "refuse") throw titleNamesSlugError(claim.slug);
+  // The claims and reservations of the ladder are read on the fold of
+  // every partition, as for a local caller (the write rule); one that only
+  // a pledge held in `private` makes leaves the caller the fixed refusal.
+  // The caller's identity rule is widened to every pledge held in `private`
+  // (`pledge-create-reach.ts`): a claim only such a pledge makes sets the
+  // private hold, and its refusal is the fixed one.
+  const decided = titleClaimAtReach(vault, input.readable, (readable) =>
+    pledgeTitleClaim(vault, input.title, readable),
+  );
+  const claim = decided.value;
+  if (claim?.kind === "refuse") {
+    if (decided.privateOnly) throw new LaneEntryWithheldError();
+    throw titleNamesSlugError(claim.slug);
+  }
+  let heldInPrivate = claim?.kind === "base" && decided.privateOnly;
   for (const slug of candidates) {
-    if (claim?.kind === "base" && slug === claim.slug) continue;
-    if (pledgeSlotReserved(vault, slug, candidates[0]!, input.readable)) continue;
+    if (claim?.kind === "base" && slug === claim.slug) {
+      heldInPrivate ||= withheldPrivateKey(vault, pledgePath(vault, claim.slug));
+      continue;
+    }
+    const reserved = slotReservedAtReach(vault, input.readable, (readable) =>
+      pledgeSlotReserved(vault, slug, candidates[0]!, readable),
+    );
+    if (reserved.value) {
+      heldInPrivate ||= reserved.privateOnly;
+      continue;
+    }
     const path = pledgePath(vault, slug);
+    // A slot another promise holds in `private` is taken, read on the fold
+    // of every partition, as for a local caller (the write rule).
+    if (withheldPrivateKey(vault, path)) {
+      heldInPrivate = true;
+      continue;
+    }
     const handle = acquireLaneLock(vault, path);
     try {
       if (lanePageExists(vault, path)) {
@@ -688,11 +737,37 @@ export function createPledgePage(vault: string, input: CreatePledgePageInput): P
     }
   }
   // Every candidate is held by another pledge: the title slug and its
-  // identity suffix both name different promises.
+  // identity suffix both name different promises. Below local reach a slot
+  // held in `private` is not named: the caller gets the fixed refusal.
+  if (heldInPrivate) throw new LaneEntryWithheldError();
   throw new PledgeError(
     `pledge already exists: ${candidates[candidates.length - 1]} (remove it first to recreate)`,
   );
 }
+
+/**
+ * The pledge pages a create of `(title, due, source)` would be refused for
+ * (`pledge-create-reach.ts`), read from this folder.
+ */
+export function pledgeCreateMatches(
+  vault: string,
+  title: string,
+  due: string,
+  source: string,
+  readable?: (rel: string) => boolean,
+): string[] {
+  return createMatchesOf(vault, title, due, source, readable, IDENTITY_READS);
+}
+
+/** The folder's reads the identity decisions of `pledge-create-reach.ts` use. */
+const IDENTITY_READS: PledgeIdentityReads = {
+  identity: pledgeIdentity,
+  findByIdentity: findPledgeByIdentity,
+  titleClaim: pledgeTitleClaim,
+  slugCandidates: pledgeSlugCandidates,
+  path: pledgePath,
+  parse: parsePage,
+};
 
 /**
  * True when `slot`, an identity-suffixed candidate beyond the `base`
@@ -790,6 +865,8 @@ export function fulfillPledge(vault: string, input: FulfillPledgeInput): PledgeP
   // writer's edit.
   const handle = acquireLaneLock(vault, path);
   try {
+    // The base before the read the stamp is computed from (`replaces`).
+    const base = readLaneBase(vault, path);
     const prior = parsePage(vault, slug);
     if (prior === null) throw noPledgeError(slug);
     if (prior.fulfilled !== null) {
@@ -803,6 +880,7 @@ export function fulfillPledge(vault: string, input: FulfillPledgeInput): PledgeP
       rewritePledgeFrontmatter(vault, prior, (meta) => {
         meta["fulfilled"] = date;
       }),
+      { replaces: base },
     );
     return Object.freeze({ ...prior, fulfilled: date });
   } finally {
@@ -947,7 +1025,9 @@ export function removePledge(vault: string, input: RemovePledgeInput): RemovePle
     if (!lanePageExists(vault, activePath)) throw noPledgeError(normalized);
     const archiveDir = pledgesArchiveDir(vault);
     let archivePath = join(archiveDir, `${normalized}.md`);
-    for (let suffix = 2; lanePageExists(vault, archivePath); suffix++) {
+    // The free archive slot is picked on the fold of every partition, as a
+    // local caller with the same store gets it (the write rule).
+    for (let suffix = 2; takenOnWholeFold(() => lanePageExists(vault, archivePath)); suffix++) {
       archivePath = join(archiveDir, `${normalized}-${suffix}.md`);
     }
     try {

@@ -92,6 +92,10 @@ import { stringArrayField, wikilinkTarget } from "./source-links.ts";
 import { BRAIN_SNAPSHOT_REASON } from "./types.ts";
 import { refuseDocumentDeny, type WriteSubject } from "./write-disposition.ts";
 import { REVIEW_LANE } from "./write-gate.ts";
+import {
+  assertCleanupMembersAtReach,
+  removeCleanupLaneMembersAtReach,
+} from "./source-cleanup-reach.ts";
 
 /** How a page was found to trace back to the source. */
 export type SourceCleanupMatch = "source_path" | "session_ref" | "wikilink" | "evidenced_by";
@@ -878,6 +882,14 @@ export function deleteBySource(
     });
   }
 
+  // Below local reach a cleanup lists its derived entries and memory records
+  // on the fold of every partition first (the write rule): one held in
+  // `private` refuses the whole cleanup before the first removal, so no
+  // source is left half cleaned, and its dry run gives the same answer
+  // (`source-cleanup-reach.ts`).
+  assertCleanupMembersAtReach(vault, () =>
+    traceReferences(vault, identity).derived.map((entry) => entry.path),
+  );
   // A page or a source the caller may not read is planned, counted and
   // left on disk exactly as an absent one: a remote caller can neither
   // learn of a reserved summary page nor delete it.
@@ -998,6 +1010,19 @@ export function deleteBySource(
   // gate so every confirmed cleanup has a pre-deletion recovery point.
   const runDeletion = (): void => {
     try {
+      // Below local reach the derived lane entries go in one store write
+      // judged again as it is built (`source-cleanup-reach.ts`). They are
+      // removed once their removals are appended, so they are named as
+      // removed before the read-back: a read-back that could not be made
+      // (`LaneWriteUnverifiedError`) reaches the audit below with them; one
+      // that says the store did not apply a removal
+      // (`LaneWriteNotAppliedError`) drops that entry from them first.
+      const atReach = removeCleanupLaneMembersAtReach(
+        vault,
+        derived.map((entry) => entry.path),
+      );
+      deleted.push(...atReach.removed);
+      atReach.readBack(deleted);
       for (const entry of derived) removeCollecting(entry.path);
       if (includeOriginals) {
         for (const original of originals) removeCollecting(original);

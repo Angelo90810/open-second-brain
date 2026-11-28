@@ -13,6 +13,8 @@
  * target (default `Brain/decisions/panels/panel-<date>-<topic>.md`).
  */
 
+import { join } from "node:path";
+
 import {
   WriteSessionRequestError,
   commitArtifact,
@@ -28,7 +30,11 @@ import { createWriteSession, saveWriteSession } from "./store.ts";
 import { loadPersonas } from "./personas.ts";
 import { inspectExistingTarget, validateTargetPath } from "./validate.ts";
 import { formatFrontmatter } from "../../vault.ts";
-import { heldLegacyPanelName, heldPanelDefaultName, panelDefaultNames } from "./panel-target.ts";
+import {
+  heldLegacyPanelName,
+  heldPanelDefaultNameAtReach,
+  panelDefaultNames,
+} from "./panel-target.ts";
 import {
   deterministicPrefix,
   emitPromptPrefixMetric,
@@ -36,6 +42,7 @@ import {
   type PromptPrefix,
 } from "../prompt-prefix.ts";
 import { isoSecond } from "../time.ts";
+import { assertCreateMatchAtReach, assertLaneWriteAtReach } from "../../store/lane-reach-guard.ts";
 import type {
   WriteSessionEnvelope,
   WriteSessionError,
@@ -80,6 +87,9 @@ export function openPanelSession(
       targetErrors,
     );
   }
+  // Below local reach a session is never opened on a target the store
+  // holds in `private`, as for an artifact session (`engine.ts`).
+  assertLaneWriteAtReach(vault, [join(vault, targetPath)]);
   const first = personas[0]!;
   const expiresAt = new Date(Date.parse(now) + (input.ttlMs ?? DEFAULT_TTL_MS)).toISOString();
   const record = createWriteSession(vault, now, (id) =>
@@ -121,6 +131,13 @@ export function openPanelSession(
  * A different topic that once shared the old slug does not hold the name.
  */
 function defaultPanelTarget(vault: string, topic: string, day: string): string {
+  // The day's panel of this topic is looked up on the fold of every
+  // partition below local reach (the write rule): one held in `private`
+  // refuses the call with the fixed answer.
+  assertCreateMatchAtReach(vault, () => {
+    const held = heldLegacyPanelName(vault, topic, day);
+    return held === null ? [] : [join(vault, held)];
+  });
   return heldLegacyPanelName(vault, topic, day) ?? panelDefaultNames(topic, day).fresh;
 }
 
@@ -148,6 +165,11 @@ export function submitToPanelSession(
       `session ${session.id} is an '${session.kind}' session - use the artifact submit surface`,
     );
   }
+  // Below local reach a target the store holds in `private` (it may have
+  // become one since the open) refuses with the fixed answer before
+  // anything of this submit - the step, a failed attempt, the metric, the
+  // parked record - is written, as `submitToSession` does.
+  assertLaneWriteAtReach(vault, [join(vault, session.targetPath)]);
   const errors = validateStepText(input.text);
   if (errors.length > 0) {
     return recordFailedAttempt(vault, session, errors, now);
@@ -162,7 +184,9 @@ export function submitToPanelSession(
     // silent overwrite.
     // A same-topic panel of the day under the other default name (an older
     // release's session published it meanwhile) holds the day too.
-    const held = heldPanelDefaultName(vault, session.topic, session.targetPath);
+    // Read on the fold of every partition below local reach: a private
+    // same-topic panel of the day refuses with the fixed answer.
+    const held = heldPanelDefaultNameAtReach(vault, session.topic, session.targetPath);
     if (inspectExistingTarget(vault, session.targetPath) !== null || held !== null) {
       return recordFailedAttempt(
         vault,

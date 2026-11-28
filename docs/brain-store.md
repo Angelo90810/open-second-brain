@@ -43,6 +43,12 @@ the commands should exit; a Markdown viewer does not show it.
   macOS it is `${XDG_STATE_HOME:-~/.local/state}/open-second-brain/stores/<store id>`,
   on Windows `%LOCALAPPDATA%\open-second-brain\stores\<store id>`. It must
   never be synced: two machines sharing it would share clocks and locks.
+  Its `verified-prefixes-*.json` remembers, per shard, the bytes this
+  machine has already verified (their length, sha256 and file stamp), so
+  the hooks check only what changed since and finish inside the host's
+  time limit on a large store. Only the `active-inject` and `view-render`
+  hooks use it: `o2b doctor` and every other command check every record.
+  Deleting the file only costs the next hook one full read.
 - **The human view** is the only part meant for people. It is written by one
   machine, the view writer, and can live inside your vault or anywhere else.
 
@@ -620,6 +626,10 @@ falls back to the `scripts/o2b` launcher, which looks Bun up on `PATH`
 and in `~/.bun/bin`. The worker is detached on every platform: it leads a
 session of its own on Linux and macOS and is not ended with its parent on
 Windows, so it outlives the hook process and the terminal that started it.
+Unlike the other background workers it stays a child of the start that
+launched it, which watches its exit: a host that ends a hook past its time
+limit together with the processes it started ends this worker too, and
+the next start takes its claim over.
 Its log goes to a small device-local file beside its state
 (`<state dir>/open-second-brain/stores/auto-migration/<vault key>.worker.log`:
 one timed line when it starts, one per step of the migration (each new
@@ -1769,6 +1779,36 @@ still on disk (the store is the truth there):
   `o2b brain standing-rules show` prints them, `clear` removes them, and
   `--project <name>`, `--harness <id>` or `--host <device id>` names one
   scoped rule file instead. No agent tool writes them.
+- **Who wrote a Brain page, and what a write may answer.** Each stored
+  version of a Brain page carries the standing of whoever decided it: you
+  (a command, or a tool call made on your explicit request), an agent, or
+  a decision model; between two versions written apart the stronger
+  standing wins, then the later one. When a tool or a command rewrites,
+  removes or moves a page it has read (an obligation completed, a pledge
+  fulfilled or re-anchored, an intention set, an entity updated, a
+  handoff note derived again), or adds one again where it read a removal,
+  the new version keeps the standing of the one it replaces. So an
+  agent's completion of an obligation you added is kept, as on a machine
+  that has not switched, instead of losing silently to your earlier
+  version. A version kept at a stronger standing than its writer's own
+  names the writer's own in `acted_by`. Every such write is read back,
+  which costs one more read of the stored Brain pages, and a tool or a
+  verb may answer one of these errors:
+  - `... changed since it was read; nothing was written; read it again`
+    (or `was removed since it was read`): another version arrived
+    between the read and the write. Read the page again and repeat the
+    call if it still applies.
+  - `the lane store could not be read in full; nothing was written`: run
+    `o2b brain doctor`, which lists the shards it could not read and the
+    blobs that have not arrived, with the remedy of each, then repeat.
+  - `... was not changed: the store keeps a version (or a removal)
+    written at authority ...`: the store kept another version, for
+    example one stamped ahead of this machine's clock. Read the page
+    again; nothing of yours holds there.
+  - `... was written and could not be verified: read the entry before
+    repeating the call`: the write was made, and reading it back failed.
+    Read the page first: repeating a call that adds to a list would add
+    twice.
 - **Forgetting.** `o2b brain forget-source` and `brain_delete_by_source`
   find the derived signals, preferences and lane entries in the store and
   remove them with the store's own removal records (`signal-removed`,

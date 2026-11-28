@@ -33,10 +33,12 @@ import { appendLogEvent } from "../log.ts";
 import { loadSchemaPack } from "../schema-pack.ts";
 import { BRAIN_LOG_EVENT_KIND } from "../types.ts";
 import { createWriteSession, readWriteSession, saveWriteSession } from "./store.ts";
-import { heldPanelDefaultName } from "./panel-target.ts";
+import { heldPanelDefaultNameAtReach } from "./panel-target.ts";
 import {
   buildCorrectionPrompt,
   inspectExistingTarget,
+  storeTargetNeverHeld,
+  storeTargetText,
   validateArtifact,
   validateTargetPath,
   writeSessionLaneRefusal,
@@ -50,6 +52,7 @@ import {
   type WriteSessionRecord,
 } from "./types.ts";
 import { assertVaultIdentityForWrite } from "../vault-identity.ts";
+import { assertLaneWriteAtReach } from "../../store/lane-reach-guard.ts";
 
 export const DEFAULT_RETRY_CAP = 3;
 export const DEFAULT_TTL_MS = 24 * 3600 * 1000;
@@ -108,6 +111,9 @@ export function openArtifactSession(
       targetErrors,
     );
   }
+  // Below local reach a session is never opened on a target the store
+  // holds in `private`: refused with the fixed answer before it exists.
+  assertLaneWriteAtReach(vault, [join(vault, input.targetPath)]);
   const now = resolveNow(input.now);
   const schemaType = input.schemaType?.trim() || null;
   const expiresAt = new Date(Date.parse(now) + normalizeTtlMs(input.ttlMs)).toISOString();
@@ -159,6 +165,11 @@ export function submitToSession(vault: string, input: SubmitToSessionInput): Wri
       `session ${session.id} is a '${session.kind}' session - submit through its kind-specific surface`,
     );
   }
+
+  // Below local reach a target the store holds in `private` (it may have
+  // become one since the open) refuses with the fixed answer before any
+  // record of this submit - a failed attempt or the parked step - is saved.
+  assertLaneWriteAtReach(vault, [join(vault, session.targetPath)]);
 
   // Collision guard runs at COMMIT time, not just open time: the target
   // may have appeared between open and submit (another device, another
@@ -375,6 +386,10 @@ export function commitArtifact(
   // whose ancestor links out - is rejected before any mkdir/read/write.
   const absolute = ensureInsideVault(join(vault, session.targetPath), vault);
   assertCommitTargetGoverned(vault, session.targetPath);
+  // Below local reach a target the store holds in `private` (or any lane
+  // target while the store cannot be read whole) is refused with the
+  // fixed answer, again at commit: it may have become one since the open.
+  assertLaneWriteAtReach(vault, [absolute]);
   // Last-line-of-defense collision guard: submit-time checks cannot
   // cover the window between a needs-review park and the operator's
   // approve - if the target appeared meanwhile, `create` must still
@@ -383,7 +398,7 @@ export function commitArtifact(
   // holds the day as well, after an operator's review too.
   const heldPanel =
     session.kind === "panel" && session.intent === "create"
-      ? heldPanelDefaultName(vault, session.topic, session.targetPath)
+      ? heldPanelDefaultNameAtReach(vault, session.topic, session.targetPath)
       : null;
   if (heldPanel !== null) {
     return recordFailedAttempt(
@@ -399,7 +414,16 @@ export function commitArtifact(
       now,
     );
   }
-  if (session.intent === "create" && existsSync(absolute)) {
+  // A target the store holds is occupied by its store entry, never by a
+  // file left at its path, and a merge reads that entry's text (design R3).
+  // A target the store never held is judged by the file at its path, as
+  // before (code review of packages 1 to 5, finding 8).
+  const read = storeTargetText(vault, absolute);
+  const stored = read === null && storeTargetNeverHeld(vault, absolute) ? undefined : read;
+  if (
+    session.intent === "create" &&
+    (stored === undefined ? existsSync(absolute) : stored !== null)
+  ) {
     return recordFailedAttempt(
       vault,
       session,
@@ -417,8 +441,16 @@ export function commitArtifact(
   }
   const body = artifact.endsWith("\n") ? artifact : `${artifact}\n`;
   mkdirSync(dirname(absolute), { recursive: true });
-  if (session.intent === "merge" && existsSync(absolute)) {
-    const existing = readFileSync(absolute, "utf8").replace(/\s+$/u, "");
+  const mergedOnto =
+    session.intent !== "merge"
+      ? null
+      : stored !== undefined
+        ? stored
+        : existsSync(absolute)
+          ? readFileSync(absolute, "utf8")
+          : null;
+  if (mergedOnto !== null) {
+    const existing = mergedOnto.replace(/\s+$/u, "");
     const merged = `${existing}\n\n<!-- o2b:ws-merge ${session.id} -->\n\n${body}`;
     atomicWriteFileSync(absolute, merged);
   } else {

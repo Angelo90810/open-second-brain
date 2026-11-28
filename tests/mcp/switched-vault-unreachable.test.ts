@@ -16,6 +16,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, existsSync, renameSync } from "node:fs";
 
 import { writePreference } from "../../src/core/brain/preference.ts";
+import { indexVault, resolveSearchConfig } from "../../src/core/search/index.ts";
 import { MCPServer } from "../../src/mcp/index.ts";
 import { partitionRecords, switchDevice } from "../core/brain/store-only/fixtures.ts";
 import { makeStoreEnv, type StoreEnv } from "../core/store/fixtures/store-env.ts";
@@ -226,6 +227,18 @@ for (const { shape, skip, cutOff } of UNREACHABLE)
         cutOff(e.vault);
         // A scratchpad with content, written while the vault is gone, so the
         // read below hands out stored text.
+        if (reach === "remote") {
+          // Below local reach the pinned register is `shared` (change
+          // `lane-reach-residuals`, requirement "A machine register and the
+          // receipt ledger follow the lane rule below local reach"): the
+          // remote caller's own text, written before the `private` register
+          // holds a record, lands there and is what its read below hands out.
+          const shared = await call(server, "brain_pinned_context", {
+            operation: "write",
+            content: "Heron rota.",
+          });
+          expect(errorCode(shared)).toBeNull();
+        }
         const local = new MCPServer(
           { vault: e.vault, configPath: e.configPath },
           { reach: "local" },
@@ -257,10 +270,23 @@ for (const { shape, skip, cutOff } of UNREACHABLE)
         expect(scoped.error?.data?.code ?? errorCode(scoped.result!)).toBeNull();
         expect(text(scoped.result!)).toContain(RULE);
         const pinned = text(await call(server, "brain_pinned_context", { operation: "read" }));
-        expect(pinned).toContain("Otter rota.");
         if (reach === "remote") {
+          // The remote read answers the `shared` register, and names
+          // nothing of the pin the local writer put into `private`, in the
+          // scratchpad or in the session context that embeds it; a local
+          // read still returns that pin.
+          expect(pinned).toContain("Heron rota.");
+          expect(pinned).toContain("store:shared/pinned");
+          expect(pinned).not.toContain("Otter rota.");
+          expect(pinned).not.toContain("store:private/pinned");
+          expect(context).toContain("Heron rota.");
+          expect(context).not.toContain("Otter rota.");
+          const own = text(await call(local, "brain_pinned_context", { operation: "read" }));
+          expect(own).toContain("Otter rota.");
           // Absent provenance is fenced at remote reach, never delivered bare.
           expect(pinned).toContain("unverified provenance (no derivable stamps)");
+        } else {
+          expect(pinned).toContain("Otter rota.");
         }
         // Nothing recreated a folder that is gone.
         if (shape === "gone") expect(existsSync(e.vault)).toBe(false);
@@ -349,6 +375,11 @@ for (const { shape, skip, cutOff } of UNREACHABLE) {
       async () => {
         const { env: e, server } = switchedMachine(`osb-mcp-switched-handle-${shape}-`);
         manyOtters(e.vault);
+        // With the vault there the search reads its index: built here, so the
+        // search does not race the detached build a first search starts.
+        if (parkedWhile === "there") {
+          await indexVault(resolveSearchConfig({ vault: e.vault, configPath: e.configPath }));
+        }
         if (parkedWhile === "out of reach") cutOff(e.vault);
         const search = await call(server, "brain_search", { query: "otters", limit: 30 });
         expect(errorCode(search)).toBeNull();

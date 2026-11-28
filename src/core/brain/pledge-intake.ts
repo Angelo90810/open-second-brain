@@ -64,6 +64,7 @@ import {
   storedLegacyPledgeSlugs,
   pledgeExists,
   pledgeSlotReserved,
+  pledgeCreateMatches,
   pledgeTitleClaim,
   titleNamesSlugError,
   pledgeIdentity,
@@ -82,9 +83,11 @@ import { normalizeForQuoteComparison, quoteHaystack, spanOccursIn } from "./dist
 import {
   acquireLaneLock,
   assertLaneWrite,
+  readLaneBase,
   removeLanePage,
   writeLaneText,
 } from "../store/lane-pages.ts";
+import { assertCreateMatchAtReach } from "../store/lane-reach-guard.ts";
 
 /** A pledge-intake payload or anchor failed validation; nothing was written. */
 export class PledgeIntakeError extends Error {
@@ -502,6 +505,17 @@ export function intakePledges(
     if (matches.length !== 1) unanchoredCounterparties.push(name);
   }
 
+  // Below local reach each item's identity decision is also taken on the
+  // fold of every partition (the write rule): an item that meets a pledge
+  // held in `private` refuses the whole intake here, before any write.
+  for (const prep of prepared) {
+    assertCreateMatchAtReach(
+      vault,
+      (readable) => pledgeCreateMatches(vault, prep.title, prep.due, source, readable),
+      opts.readable,
+    );
+  }
+
   // --- Write pass: nothing above wrote; everything below is decided. ---
   const created: string[] = [];
   const createdPages: PledgePage[] = [];
@@ -614,12 +628,15 @@ function rewritePledgeCounterparties(
   // fulfill (or a second re-anchor) must never overwrite either edit.
   const handle = acquireLaneLock(vault, page.path);
   try {
+    // The base before the read the rewrite is computed from (`replaces`).
+    const base = readLaneBase(vault, page.path);
     writeLaneText(
       vault,
       page.path,
       rewritePledgeFrontmatter(vault, page, (meta) => {
         meta[PROMISED_TO_RELATION] = [...counterparties];
       }),
+      { replaces: base },
     );
   } finally {
     handle.release();

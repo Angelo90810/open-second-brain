@@ -38,7 +38,6 @@ import { requireNextStep } from "./next-step.ts";
 import {
   clearSkillAcceptJournal,
   listSkillAcceptJournals,
-  readSkillAcceptJournals,
   removeSkillAcceptJournalFile,
   writeSkillAcceptJournal,
   type SkillAcceptJournalEntry,
@@ -66,7 +65,10 @@ import {
 import type { ContinuityPayload } from "./continuity/types.ts";
 import { routeWrite } from "../store/store-write.ts";
 import { DUAL_WRITE_LEDGERS, ledgerRowRecord } from "../store/dual-write-records.ts";
-import { rowNamesPrivatePage } from "../store/reference-privacy.ts";
+import { withPrivateShown } from "../store/caller-reach.ts";
+import { assertLaneWriteAtReach, journalWithheldAtReach } from "../store/lane-reach-guard.ts";
+import { discardableAcceptJournalPaths, recoverableAcceptJournals } from "./skill-accept-reach.ts";
+import { continuityPrivacyJudge, verifierRejectionIsPrivate } from "./skill-learn-reach.ts";
 import {
   assertLaneWrite,
   lanePageExists,
@@ -158,6 +160,26 @@ export type SkillProposalPhase = (typeof PROPOSAL_PHASES)[number];
 export interface SkillProposalLearnOptions {
   readonly now?: Date;
   readonly minSupport?: number;
+  /**
+   * Told of each candidate the verifier rejects: the proposal id and
+   * whether the rejection's ledger row goes to `private` (a row drawn
+   * from private turns, or naming a private page). A caller that narrows
+   * the answer for a remote reach judges the id with it.
+   */
+  readonly onVerifierRejection?: (rejection: { id: string; private: boolean }) => void;
+  /**
+   * Told once, before any candidate is judged, of the continuity records
+   * the learn read (`records`) and of those past its watermark that it
+   * scans (`scanned`, oldest first), with the learn's own verdict on
+   * whether one of them goes to `private` (`isPrivate`). A caller that
+   * narrows the answer for a remote reach counts and dates the scan with
+   * them.
+   */
+  readonly onScanned?: (scan: {
+    readonly records: ReadonlyArray<ContinuityRecord>;
+    readonly scanned: ReadonlyArray<ContinuityRecord>;
+    readonly isPrivate: (record: ContinuityRecord) => boolean;
+  }) => void;
 }
 
 export interface SkillProposalLearnResult {
@@ -313,7 +335,8 @@ export function learnSkillProposals(
   const minSupport = Math.max(2, opts.minSupport ?? DEFAULT_MIN_SUPPORT);
 
   const watermark = readWatermark(vault);
-  const records = listContinuityRecords(vault)
+  const read = listContinuityRecords(vault);
+  const records = read
     .filter((record) => {
       if (watermark.lastCreatedAt === null) return true;
       if (record.createdAt > watermark.lastCreatedAt) return true;
@@ -325,6 +348,7 @@ export function learnSkillProposals(
       (left, right) =>
         left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
     );
+  opts.onScanned?.({ records: read, scanned: records, isPrivate: continuityPrivacyJudge(vault) });
 
   if (records.length === 0) {
     return {
@@ -367,16 +391,21 @@ export function learnSkillProposals(
       { minEvidence: minSupport },
     );
     if (!verdict.accepted) {
-      appendVerifierRejection(
+      const entryForRejection = {
+        id: proposalId,
+        name_key: nameKey,
+        reason: verdict.reason,
+        at: now.toISOString(),
+      };
+      // Judged once per rejected candidate: the ledger row and the
+      // callback share one verdict.
+      const rejectedPrivate = verifierRejectionIsPrivate(
         vault,
-        {
-          id: proposalId,
-          name_key: nameKey,
-          reason: verdict.reason,
-          at: now.toISOString(),
-        },
+        entryForRejection,
         candidate.supportingRecords,
       );
+      appendVerifierRejection(vault, entryForRejection, rejectedPrivate);
+      opts.onVerifierRejection?.({ id: proposalId, private: rejectedPrivate });
       verifierRejected.push(proposalId);
       continue;
     }
@@ -1012,7 +1041,7 @@ interface DeclaredSkillProposalPlan {
  * write throw an untyped `EEXIST` later - the same two guards the mined
  * path carries in `learnSkillProposals`, in the same order.
  */
-function planDeclaredSkillProposal(
+export function planDeclaredSkillProposal(
   vault: string,
   input: DeclaredSkillProposalInput,
   patternKind: SkillProposalPatternKind = DECLARED_MARKER_PATTERN_KIND,
@@ -1139,7 +1168,7 @@ export function acceptSkillProposal(
 
   const lock = acquireAcceptLock(vault);
   try {
-    resolveOutstandingAccepts(vault);
+    resolveOutstandingAccepts(vault, recoverableAcceptJournals(vault));
 
     const pendingPath = skillProposalPendingPath(vault, slug);
     if (!lanePageExists(vault, pendingPath)) {
@@ -1179,6 +1208,10 @@ export function acceptSkillProposal(
         ? procedurePath(vault, slug)
         : join(skillsRoot, skillDraft.name, SKILL_FILE_NAME);
 
+    // Judged by the fold of every partition before the journal: a target
+    // held in `private` is refused below local reach, and the rollback
+    // flags never come from a narrowed read (lane-private-partition-reach).
+    assertLaneWriteAtReach(vault, [acceptedPath, materializedPath]);
     let journal: SkillAcceptJournalEntry = {
       slug,
       id,
@@ -1186,8 +1219,8 @@ export function acceptSkillProposal(
       startedAt: now,
       // Captured up front so a rollback never deletes a file this
       // sequence did not create.
-      acceptedExisted: lanePageExists(vault, acceptedPath),
-      materializedExisted: lanePageExists(vault, materializedPath),
+      acceptedExisted: withPrivateShown(() => lanePageExists(vault, acceptedPath)),
+      materializedExisted: withPrivateShown(() => lanePageExists(vault, materializedPath)),
       materializedPath,
       // Procedure materializations never consult the skills tree, so they
       // record no root and recovery keeps its default resolution for them.
@@ -1328,7 +1361,7 @@ export function recoverSkillProposalAccepts(vault: string): ReadonlyArray<SkillA
   assertLaneWrite(vault);
   const lock = acquireAcceptLock(vault);
   try {
-    return Object.freeze(resolveOutstandingAccepts(vault));
+    return Object.freeze(resolveOutstandingAccepts(vault, recoverableAcceptJournals(vault)));
   } finally {
     lock.release();
   }
@@ -1352,7 +1385,7 @@ export function discardUnreadableSkillAcceptJournals(vault: string): ReadonlyArr
   assertLaneWrite(vault);
   const lock = acquireAcceptLock(vault);
   try {
-    const discarded = readSkillAcceptJournals(vault).unreadable.map((entry) => entry.path);
+    const discarded = discardableAcceptJournalPaths(vault);
     for (const path of discarded) removeSkillAcceptJournalFile(vault, path);
     return Object.freeze(discarded);
   } finally {
@@ -1423,12 +1456,29 @@ function acceptLockTarget(vault: string): string {
   return machineStatePath(vault, BRAIN_SKILL_PROPOSALS_REL, ACCEPT_LOCK_NAME);
 }
 
-/** Caller must already hold {@link acceptLockTarget}. */
-function resolveOutstandingAccepts(vault: string): SkillAcceptRecovery[] {
-  return listSkillAcceptJournals(vault).map((journal) => ({
-    slug: journal.slug,
-    action: resolveSkillAccept(vault, journal),
-  }));
+/** Caller must already hold {@link acceptLockTarget}. `journals`: the markers to resolve. */
+function resolveOutstandingAccepts(
+  vault: string,
+  journals: ReadonlyArray<SkillAcceptJournalEntry> = listSkillAcceptJournals(vault),
+): SkillAcceptRecovery[] {
+  // Below local reach a journal whose proposal, archive or materialized
+  // page is held in `private` (or any journal while the whole fold may
+  // miss a record) is left for a local caller, unread and unnamed; one it
+  // does resolve is judged by the whole fold (lane-private-partition-reach).
+  return journals.flatMap((journal) =>
+    journalWithheldAtReach(vault, [
+      skillProposalPendingPath(vault, journal.slug),
+      skillProposalAcceptedPath(vault, journal.slug),
+      journal.materializedPath ?? procedurePath(vault, journal.slug),
+    ])
+      ? []
+      : [
+          {
+            slug: journal.slug,
+            action: withPrivateShown(() => resolveSkillAccept(vault, journal)),
+          },
+        ],
+  );
 }
 
 /**
@@ -1571,7 +1621,9 @@ function compensateSkillAccept(
 ): never {
   let repairFailure: unknown = null;
   try {
-    resolveSkillAccept(vault, journal);
+    // On the whole fold: an archive this accept wrote into `private` is
+    // its own write, removed like any other (lane-private-partition-reach).
+    withPrivateShown(() => resolveSkillAccept(vault, journal));
   } catch (repairError) {
     repairFailure = repairError;
   }
@@ -2332,14 +2384,14 @@ export function verifierRejectionLedgerPath(vault: string): string {
 function appendVerifierRejection(
   vault: string,
   entry: { id: string; name_key: string; reason: string; at: string },
-  sources: ReadonlyArray<ContinuityRecord>,
+  isPrivate: boolean,
 ): void {
   // One `verifier-rejections` ledger row on a store-only machine (design
   // D14 item 1), this device's rejection ledger line plus the dual write
   // otherwise. The proposal's name is drawn from session turns: a row
   // whose turns are flagged private, or that names a private or
   // unjudgeable page (in the row or in those turns), goes to `private`
-  // only.
+  // only (`isPrivate`, the caller's one verdict).
   routeWrite({
     legacy: () => {
       const path = verifierRejectionLedgerPath(vault);
@@ -2350,10 +2402,7 @@ function appendVerifierRejection(
       ledgerRowRecord(
         DUAL_WRITE_LEDGERS.verifierRejections,
         entry,
-        sources.some((record) => record.private === true) ||
-          rowNamesPrivatePage(vault, [entry, sources])
-          ? "private"
-          : "shared",
+        isPrivate ? "private" : "shared",
       ),
     context: { vault },
   });

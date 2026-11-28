@@ -45,10 +45,15 @@ import {
   listLaneFiles,
   moveLanePage,
   parseLanePage,
+  readLaneBase,
   readLaneFile,
   removeLanePage,
   writeLaneText,
 } from "../store/lane-pages.ts";
+import { privateWithheld } from "../store/caller-reach.ts";
+import { assertCreateMatchAtReach, takenOnWholeFold } from "../store/lane-reach-guard.ts";
+import { alreadyRecorded, completionRepeated } from "./repeat-call.ts";
+import { addMatches, slotPlanOf, type ObligationIdentityReads } from "./obligation-create-reach.ts";
 
 /**
  * Supported cadences. Day-based cadences add a fixed number of days;
@@ -352,6 +357,14 @@ export function addObligation(vault: string, input: AddObligationInput): Obligat
   const now = input.now ?? new Date();
   const today = isoDate(now);
   const anchor = input.anchor ? requireIsoDate(input.anchor, "anchor") : today;
+  // The identity decision is taken on the fold of every partition (the
+  // write rule): below local reach an obligation held in `private` that a
+  // local add would be refused for refuses this add, naming nothing.
+  assertCreateMatchAtReach(
+    vault,
+    (readable) => addMatches(vault, title, input.slot, readable, IDENTITY_READS),
+    input.readable,
+  );
   let slug = titleSlug(title);
   if (input.slot !== undefined && input.slot !== slug) {
     // A planned identity-suffixed slot: refused unless it is one of this
@@ -544,11 +557,14 @@ export function completeObligation(vault: string, input: CompleteObligationInput
   const lockPath = obligationPath(vault, target.stem);
   const handle = acquireLaneLock(vault, lockPath);
   try {
+    // The base before the read the completion is computed from (`replaces`).
+    const base = readLaneBase(vault, lockPath);
     assertLaneWrite(vault);
     const { slug, page: prior } = targetPage(vault, target);
     if (prior === null) throw noObligationError(slug);
     const now = input.now ?? new Date();
     const date = input.date ? requireIsoDate(input.date, "date") : isoDate(now);
+    if (completionRepeated(prior.completions, date)) return alreadyRecorded(prior);
     const page = {
       slug: prior.slug,
       title: prior.title,
@@ -561,7 +577,7 @@ export function completeObligation(vault: string, input: CompleteObligationInput
       completions: Object.freeze([date, ...prior.completions]),
       notes: prior.notes,
     };
-    writeLaneText(vault, prior.path, render(page));
+    writeLaneText(vault, prior.path, render(page), { replaces: base });
     return Object.freeze({ ...page, path: prior.path });
   } finally {
     handle.release();
@@ -650,27 +666,30 @@ export function obligationSlotPlan(
   title: string,
   readable?: ObligationReadable,
 ): { readonly slug: string; readonly existing: boolean } | null {
-  const located = locateEntry(vault, title, readable);
-  if (located.page !== null && titleIdentity(located.page.title) === titleIdentity(title)) {
-    // Reused only when it is an obligation `list`, `show` and `done` can
-    // act on: a page that stores the title but whose cadence cannot be read
-    // would answer a decision's review that never comes due.
-    if (located.page.page === null) throw unreadableObligationError(located.slug);
-    return { slug: located.slug, existing: true };
-  }
-  if (existingObligationSlug(vault, title, readable) === null) {
-    return { slug: titleSlug(title.trim()), existing: false };
-  }
-  for (const slot of suffixedObligationSlots(title)) {
-    if (
-      !lanePageExists(vault, obligationPath(vault, slot)) &&
-      !exactTitleReservation(vault, slot, readable)
-    ) {
-      return { slug: slot, existing: false };
-    }
-  }
-  return null;
+  if (!privateWithheld()) return slotPlanOf(vault, title, readable, IDENTITY_READS);
+  // Below local reach the plan is made on the fold of every partition (the
+  // write rule): the obligation it reuses, when held in `private`, refuses
+  // the caller, and a free slot is free in every partition.
+  let plan: ReturnType<typeof slotPlanOf> = null;
+  assertCreateMatchAtReach(
+    vault,
+    (wide) => {
+      plan = slotPlanOf(vault, title, wide, IDENTITY_READS);
+      return plan?.existing === true ? [obligationPath(vault, plan.slug)] : [];
+    },
+    readable,
+  );
+  return plan;
 }
+
+/** The folder's reads the identity decisions of `obligation-create-reach.ts` use. */
+const IDENTITY_READS: ObligationIdentityReads = {
+  locate: locateEntry,
+  existingSlug: existingObligationSlug,
+  reserved: exactTitleReservation,
+  suffixedSlots: suffixedObligationSlots,
+  unreadable: unreadableObligationError,
+};
 
 /** True when an active obligation page already exists for `title` ({@link existingObligationSlug}). */
 export function obligationExists(vault: string, title: string): boolean {
@@ -728,7 +747,9 @@ export function removeObligation(
     if (page === null) throw noObligationError(normalized);
     const archiveDir = obligationsArchiveDir(vault);
     let archivePath = join(archiveDir, `${normalized}.md`);
-    for (let suffix = 2; lanePageExists(vault, archivePath); suffix++) {
+    // The free archive slot is picked on the fold of every partition, as a
+    // local caller with the same store gets it (the write rule).
+    for (let suffix = 2; takenOnWholeFold(() => lanePageExists(vault, archivePath)); suffix++) {
       archivePath = join(archiveDir, `${normalized}-${suffix}.md`);
     }
     try {

@@ -71,17 +71,19 @@ import { isAbsolute, join, relative, sep } from "node:path";
 
 import { BRAIN_ROOT_REL } from "../brain/path-constants.ts";
 import { containedRecordPath } from "../record-path.ts";
-import type { StorePartition } from "./constants.ts";
+import type { Authority, StorePartition } from "./constants.ts";
 import { dualWrite, type DualWriteContext, type DualWriteRecord } from "./dual-write.ts";
 import {
   brainRelOf,
   entryRecord,
+  holderAuthority,
   insideBrain,
   isPrivateEntry,
   storeEntries,
   tombstoneOf,
 } from "./lane-entry-store.ts";
-import { laneFoldIncomplete, laneStoreFold, type LaneFolded } from "./lane-fold-cache.ts";
+import { strongerAuthority } from "./lane-authority.ts";
+import { laneFoldIncomplete, wholeLaneStoreFold, type LaneFolded } from "./lane-fold-cache.ts";
 import { brainRelOfEntry, lanePlaceOf } from "./lane-paths.ts";
 import { laneTextParts, rawToKeep } from "./lane-raw.ts";
 import { laneEntryKey, type LaneEntryValue } from "./lane-records.ts";
@@ -91,13 +93,21 @@ import { openRegularFileForRead } from "./safe-fs.ts";
 /**
  * The absolute paths of every live store entry below `dir`, at any depth,
  * sorted, whatever the machine's mode (the store has no directories; a
- * folder is a path prefix). A path outside `Brain/` is never listed.
+ * folder is a path prefix). A path outside `Brain/` is never listed. The
+ * caller's fold by default (a read); `whole`: the fold of every
+ * partition, for the removal records of an unswitched machine's folder.
  */
-export function storedLanePathsBelow(vault: string, dir: string, ext: string): string[] {
+export function storedLanePathsBelow(
+  vault: string,
+  dir: string,
+  ext: string,
+  whole = false,
+): string[] {
   const prefix = brainRelOf(vault, dir);
   const brain = join(vault, BRAIN_ROOT_REL);
   const out: string[] = [];
-  for (const value of storeEntries().values()) {
+  const entries = whole ? wholeLaneStoreFold().entries : storeEntries();
+  for (const value of entries.values()) {
     const rel = brainRelOfEntry(value.lane, value.entry);
     if (!rel.startsWith(prefix === "" ? "" : `${prefix}/`) || !rel.endsWith(ext)) continue;
     // The fold already refuses an entry id that is no record path; this
@@ -124,7 +134,7 @@ function laneKeyAt(vault: string, path: string): string | null {
 }
 
 /** The live entry of `fold` at the lane path `path`, or `null`. */
-function foldedAt(fold: LaneFolded, vault: string, path: string): FoldedEntry | null {
+export function foldedAt(fold: LaneFolded, vault: string, path: string): FoldedEntry | null {
   const key = laneKeyAt(vault, path);
   if (key === null) return null;
   const value = fold.entries.get(key);
@@ -243,6 +253,10 @@ function movedFile(vault: string, to: string): MovedContent | null {
  * that entry is (see the module docblock), with `sourcePrivate` carrying
  * the moved entry's own partition; or, when nothing the store would import
  * is there, the held entry's tombstone, as a removal of it.
+ * `sourceAuthority` is the authority of the moved entry's record: the new
+ * entry keeps the stronger of it and the destination holder's (a live
+ * entry or a removal), a replaced destination's tombstone keeps that
+ * holder's (`lane-standing.ts`).
  */
 function destinationRecords(
   vault: string,
@@ -250,10 +264,12 @@ function destinationRecords(
   move: LaneMove,
   moved: MovedContent | null,
   sourcePrivate: boolean,
+  sourceAuthority: Authority | null,
 ): DualWriteRecord[] {
   const replaced = foldedAt(fold, vault, move.to);
+  const held = holderAuthority(vault, fold, move.to);
   if (moved === null) {
-    return replaced === null ? [] : [tombstoneOf(replaced.value, false, replaced.partition)];
+    return replaced === null ? [] : [tombstoneOf(replaced.value, false, replaced.partition, held)];
   }
   const isPrivate =
     sourcePrivate ||
@@ -264,10 +280,20 @@ function destinationRecords(
   const partition: StorePartition = isPrivate ? "private" : "shared";
   return [
     ...(isPrivate && replaced?.partition === "shared"
-      ? [tombstoneOf(replaced.value, false, "shared")]
+      ? [tombstoneOf(replaced.value, false, "shared", held)]
       : []),
     {
-      ...entryRecord(vault, move.to, moved.fields, moved.text, isPrivate, "located", moved.raw),
+      ...entryRecord(
+        vault,
+        move.to,
+        moved.fields,
+        moved.text,
+        isPrivate,
+        "located",
+        moved.raw,
+        undefined,
+        strongerAuthority(sourceAuthority, held),
+      ),
       located: { partition, content: true },
     },
   ];
@@ -291,10 +317,14 @@ export function laneMoveRecords(
   if (source === null) return [];
   const target = laneKeyAt(vault, move.to);
   if (target === source.key) return [];
-  const gone = tombstoneOf(source.value, false, source.partition);
+  const sourceAuthority = fold.authorities.get(source.key) ?? null;
+  const gone = tombstoneOf(source.value, false, source.partition, sourceAuthority);
   if (target === null) return [gone];
   const sourcePrivate = source.partition === "private";
-  return [...destinationRecords(vault, fold, move, content(source.value), sourcePrivate), gone];
+  return [
+    ...destinationRecords(vault, fold, move, content(source.value), sourcePrivate, sourceAuthority),
+    gone,
+  ];
 }
 
 /**
@@ -308,10 +338,13 @@ function dualMoveRecords(vault: string, fold: LaneFolded, move: LaneMove): DualW
     return laneMoveRecords(vault, fold, move, () => movedFile(vault, move.to));
   }
   if (foldedAt(fold, vault, move.to) === null) return [];
-  return destinationRecords(vault, fold, move, movedFile(vault, move.to), false);
+  return destinationRecords(vault, fold, move, movedFile(vault, move.to), false, null);
 }
 
-/** The tombstones of the live entries of `fold` at `paths`, each where its entry lives. */
+/**
+ * The tombstones of the live entries of `fold` at `paths`, each where its
+ * entry lives and at the standing of its record (`lane-standing.ts`).
+ */
 export function laneRemovalRecords(
   vault: string,
   fold: LaneFolded,
@@ -319,7 +352,9 @@ export function laneRemovalRecords(
 ): DualWriteRecord[] {
   return paths.flatMap((path) => {
     const entry = foldedAt(fold, vault, path);
-    return entry === null ? [] : [tombstoneOf(entry.value, false, entry.partition)];
+    return entry === null
+      ? []
+      : [tombstoneOf(entry.value, false, entry.partition, fold.authorities.get(entry.key))];
   });
 }
 
@@ -329,12 +364,12 @@ export function dualWriteLaneRemoval(
   paths: () => ReadonlyArray<string>,
   context: DualWriteContext,
 ): void {
-  dualWrite(() => laneRemovalRecords(vault, laneStoreFold(), paths()), context);
+  dualWrite(() => laneRemovalRecords(vault, wholeLaneStoreFold(), paths()), context);
 }
 
 /** Dual-write an unswitched rename of one lane page. */
 export function dualWriteLaneMove(vault: string, move: LaneMove, context: DualWriteContext): void {
-  dualWrite(() => dualMoveRecords(vault, laneStoreFold(), move), context);
+  dualWrite(() => dualMoveRecords(vault, wholeLaneStoreFold(), move), context);
 }
 
 /**
@@ -365,7 +400,7 @@ export function dualWriteLaneTreeMove(
   context: DualWriteContext,
 ): void {
   dualWrite(() => {
-    const fold = laneStoreFold();
+    const fold = wholeLaneStoreFold();
     const below = new Set([...foldedBelow(fold, vault, from), ...foldedBelow(fold, vault, to)]);
     return [...below]
       .toSorted()

@@ -37,6 +37,7 @@ import * as o2bCommand from "../../../../src/core/maintenance/o2b-command.ts";
 import * as streamRead from "../../../../src/core/store/read/stream-read.ts";
 import * as storeOpen from "../../../../src/core/store/store-open.ts";
 import { STORE_ROOT_ENV } from "../../../../src/core/store/constants.ts";
+import { defaultStoreRoot } from "../../../../src/core/store/store-paths.ts";
 import { CHMOD_CANNOT_DENY, homeEnv } from "../../../helpers/platform.ts";
 import { startDreamPassHolder } from "../../../helpers/dream-pass-holder.ts";
 import { CLI_SPAWN_BUDGET_MS } from "../../../helpers/cli-timeout.ts";
@@ -54,11 +55,15 @@ let spawns: Array<ReadonlyArray<string>>;
 let spawnSpy: ReturnType<typeof spyOn>;
 
 beforeEach(() => {
-  f = makeTriggerFixture();
+  // The default layout of a machine with a vault: the store in the vault's
+  // folder and no store root named anywhere (the 2.0.5 trigger missed it).
+  f = makeTriggerFixture({ layout: "vault" });
   spawns = [];
-  spawnSpy = spyOn(o2bCommand, "spawnSelfDetached").mockImplementation(((argv: string[]) => {
+  spawnSpy = spyOn(o2bCommand, "spawnSelfDetached").mockImplementation(((
+    argv: ReadonlyArray<string>,
+  ) => {
     spawns.push([...argv]);
-    return { pid: 0, unref: () => {} } as unknown as ReturnType<typeof Bun.spawn>;
+    return { pid: 0 };
   }) as typeof o2bCommand.spawnSelfDetached);
 });
 
@@ -406,6 +411,30 @@ describe("the claim", () => {
     expect(f.record()?.last_run?.outcome).toBe("lost");
   });
 
+  test("a lost worker after a closed day leaves that day closed and opens its own day", async () => {
+    // The previous day closed by a pass run by hand; today's worker, started
+    // by the first session of the day, ended without recording an outcome.
+    seed({
+      day: "2026-11-19",
+      closed: true,
+      owner: MINE,
+      last_run: {
+        started_at: new Date(NOW - GRACE - 1000).toISOString(),
+        ended_at: null,
+        outcome: null,
+        by: "worker",
+      },
+    });
+    writeClaim(NOW - GRACE - 1000, { worker_pid: await deadPid() });
+    expect(run().started).toBe(false);
+    const r = f.record()!;
+    expect(r.last_run?.outcome).toBe("lost");
+    // The day the attempt was made is the one left open, never the closed one.
+    expect(r.day).toBe(TODAY);
+    expect(r.closed).toBe(false);
+    expect(r.reason).toBe("the dream worker ended without recording an outcome");
+  });
+
   test("a claim no worker proved, whose maker is gone, is abandoned without a failure", async () => {
     const pid = await deadPid();
     // Within the start window a worker may still be starting.
@@ -431,10 +460,10 @@ describe("the claim", () => {
       order.push("claim");
       return original(path, at);
     });
-    spawnSpy.mockImplementation(((argv: string[]) => {
+    spawnSpy.mockImplementation(((argv: ReadonlyArray<string>) => {
       order.push("spawn");
       spawns.push([...argv]);
-      return { pid: 0, unref: () => {} } as unknown as ReturnType<typeof Bun.spawn>;
+      return { pid: 0 };
     }) as typeof o2bCommand.spawnSelfDetached);
     try {
       expect(run().started).toBe(true);
@@ -588,7 +617,7 @@ describe("the claim", () => {
 
   test("the attempt is recorded before the worker starts, and the worker's outcome stands", () => {
     const atSpawn: Array<record.DreamTriggerRecord["last_run"]> = [];
-    spawnSpy.mockImplementation(((argv: string[]) => {
+    spawnSpy.mockImplementation(((argv: ReadonlyArray<string>) => {
       spawns.push([...argv]);
       atSpawn.push(f.record()!.last_run);
       // A worker that ends before the check returns writes its outcome.
@@ -603,7 +632,7 @@ describe("the claim", () => {
           by: "worker",
         },
       });
-      return { pid: 0, unref: () => {} } as unknown as ReturnType<typeof Bun.spawn>;
+      return { pid: 0 };
     }) as typeof o2bCommand.spawnSelfDetached);
     expect(run().started).toBe(true);
     expect(atSpawn).toEqual([
@@ -621,7 +650,11 @@ describe("the claim", () => {
         'import { discoverConfig } from "./src/core/config.ts";',
         'import { dreamDayCheck } from "./src/core/brain/dream-trigger/check.ts";',
         "let spawned = 0;",
-        // The child's own spawn: counted, never run.
+        // The child's own spawn: counted, never run. The worker is started
+        // through the launcher that reparents it (`spawnSelfDetached`), a
+        // synchronous spawn whose environment carries the worker's argv.
+        "const spawnSync = Bun.spawnSync;",
+        "Bun.spawnSync = (o) => { if (o?.env?.O2B_REPARENT_PAYLOAD === undefined) return spawnSync(o); spawned += 1; return { exitCode: 0, stdout: Buffer.from('pid:0') }; };",
         "Bun.spawn = () => { spawned += 1; return { pid: 0, unref() {} }; };",
         'process.stdout.write("ready\\n");',
         "while (!existsSync(Bun.argv[1])) await Bun.sleep(5);",
@@ -804,5 +837,86 @@ describe("a claim this process failed to give back", () => {
     writeFileSync(path, held);
     // Readable again: the next claim gives the queued one back first.
     expect(claim.createClaim(path, NOW)).not.toBeNull();
+  });
+});
+
+// Open Second Brain 2.0.5 keyed the record by the root resolved as if
+// no vault were configured: the per-user default, which holds no store.
+const legacyRoot = (): string => defaultStoreRoot();
+const legacyPath = (): string => record.dreamTriggerRecordPath(legacyRoot());
+
+function seedLegacy(over: Partial<record.DreamTriggerRecord>): void {
+  writeDreamTriggerRecord(legacyPath(), { ...emptyDreamTriggerRecord(legacyRoot()), ...over });
+}
+
+describe("a record an earlier install wrote under the old key", () => {
+  test("a day it closed stays closed: nothing is started, and the record moves to the right key", () => {
+    expect(f.vault).not.toBeNull();
+    expect(legacyPath()).not.toBe(f.recordPath);
+    seedLegacy({ closed: true, day: TODAY, owner: MINE });
+    expect(run().started).toBe(false);
+    expect(spawns).toEqual([]);
+    expect(f.record()).toMatchObject({ store_root: f.storeRoot, closed: true, day: TODAY });
+    expect(existsSync(legacyPath())).toBe(false);
+  });
+
+  test("its retry time and failure count hold", () => {
+    const retryAt = new Date(NOW + HOUR).toISOString();
+    seedLegacy({ day: TODAY, failures: 3, retry_at: retryAt, owner: MINE });
+    expect(run().started).toBe(false);
+    expect(spawns).toEqual([]);
+    expect(f.record()).toMatchObject({ failures: 3, retry_at: retryAt });
+    expect(existsSync(legacyPath())).toBe(false);
+  });
+
+  test("a day it closed before today is due: one worker starts, the failure count carried", () => {
+    seedLegacy({ closed: true, day: "2026-11-19", failures: 1, owner: MINE });
+    expect(run().started).toBe(true);
+    expect(spawns).toHaveLength(1);
+    expect(f.record()).toMatchObject({ failures: 1, owner_checked_day: TODAY });
+  });
+
+  test("a record already under the right key wins, and the old file is not read", () => {
+    seed({ closed: true, day: TODAY, owner: MINE });
+    seedLegacy({ day: "2026-11-19", failures: 5 });
+    expect(run().started).toBe(false);
+    expect(f.record()).toMatchObject({ closed: true, day: TODAY, failures: 0 });
+    // The right key held a record: the old file is left as it is, unread.
+    expect(existsSync(legacyPath())).toBe(true);
+  });
+
+  test("a session on another vault (VAULT_DIR) leaves it to the configured vault, which keeps its closed day", () => {
+    seedLegacy({ closed: true, day: TODAY, owner: MINE });
+    const other = join(f.tmp, "other-vault");
+    mkdirSync(other, { recursive: true });
+    process.env["VAULT_DIR"] = other;
+    try {
+      const there = record.dreamTriggerLocation(f.config());
+      expect(there.storeRoot).not.toBe(f.storeRoot);
+      expect(existsSync(there.recordPath)).toBe(false);
+      expect(existsSync(legacyPath())).toBe(true);
+    } finally {
+      delete process.env["VAULT_DIR"];
+    }
+    // The first session on the configured vault carries it: no second pass today.
+    expect(run().started).toBe(false);
+    expect(spawns).toEqual([]);
+    expect(f.record()).toMatchObject({ store_root: f.storeRoot, closed: true, day: TODAY });
+    expect(existsSync(legacyPath())).toBe(false);
+  });
+
+  test("while the old key's claim stands, both files are left; once it is gone the record is carried", () => {
+    const retryAt = new Date(NOW + HOUR).toISOString();
+    seedLegacy({ day: TODAY, failures: 2, retry_at: retryAt, owner: MINE });
+    const legacyClaim = dreamTriggerClaimPath(legacyPath());
+    writeFileSync(legacyClaim, "{}\n");
+    record.dreamTriggerLocation(f.config());
+    expect(existsSync(f.recordPath)).toBe(false);
+    expect(existsSync(legacyPath())).toBe(true);
+    expect(existsSync(legacyClaim)).toBe(true);
+    rmSync(legacyClaim);
+    record.dreamTriggerLocation(f.config());
+    expect(f.record()).toMatchObject({ store_root: f.storeRoot, failures: 2, retry_at: retryAt });
+    expect(existsSync(legacyPath())).toBe(false);
   });
 });
